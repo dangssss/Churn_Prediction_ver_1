@@ -102,11 +102,11 @@ x-airflow-common:
     # Bien SOURCE_CODE_DIR duoc cau hinh trong file .env (VD: /home/dmst_ai/ds_churn_v1.1)
 
     # Mount Core Code keo du lieu tu CSDL
-    - ${SOURCE_CODE_DIR}/Ingestion:/churn_source/ingestion
+    - ./src/ingestion:/churn_source/ingestion
     # Mount Core Code bien doi, sinh feature (Sliding Windows, Baseline)
-    - ${SOURCE_CODE_DIR}/Preprocess:/churn_source/preprocessing
+    - ./src/preprocessing:/churn_source/preprocessing
     # Mount Core Code Model huan luyen va xuat diem rui ro roi bo
-    - ${SOURCE_CODE_DIR}/Modeling:/churn_source/modeling
+    - ./scr/modeling:/churn_source/modeling
 
     # --------------------------------------------------------------------------------------
     # [3] MAP DATA GIAO TIEP VOI TEAM DE & LOG UNG DUNG
