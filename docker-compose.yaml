@@ -45,16 +45,15 @@
 # Feel free to modify this file to suit your needs.
 ---
 x-airflow-common:
-  &airflow-common
   # In order to add custom dependencies or upgrade provider distributions you can use your extended image.
   # Comment the image line, place your Dockerfile in the directory where you placed the docker-compose.yaml
   # and uncomment the "build" line below, Then run `docker-compose build` to build the images.
+  &airflow-common
   image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.1.7}
   # build: .
   env_file:
     - ${ENV_FILE_PATH:-.env}
-  environment:
-    &airflow-common-env
+  environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
@@ -75,26 +74,51 @@ x-airflow-common:
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
     # The following line can be used to set a custom config file, stored in the local config folder
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
-    # App Config DB
+
+    # App Config DB (Truyền biến môi trường DB của ứng dụng vào Airflow)
     PG_HOST: ${PG_HOST}
     PG_PORT: ${PG_PORT}
     PG_DB: ${PG_DB}
     PG_USER: ${PG_USER}
     PG_PW: ${PG_PW}
+
   volumes:
+    # --------------------------------------------------------------------------------------
+    # [1] CAC THU MUC COT LOI CUA AIRFLOW (DO SEP SETUP TU TRUOC)
+    # --------------------------------------------------------------------------------------
+    # Noi chua cac file DAG dinh nghia kich ban lap lich (ds_churn_ingest.py, ds_churn_features.py...)
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    # Noi chua log thuc thi mac dinh cua Airflow (log cac Task tren web)
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    # Noi chua file config moi truong noi bo Airflow
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    # Noi chua custom plugins mo rong
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
-    - ../dags:/dags
-    - ../ingestion:/churn_source/ingestion
-    - ../modeling:/churn_source/modeling
-    - ../preprocessing:/churn_source/preprocessing
+
+    # --------------------------------------------------------------------------------------
+    # [2] MA NGUON PYTHON THUC THI LOGIC (SOURCE CODE DIR)
+    # --------------------------------------------------------------------------------------
+    # Day cac thu muc code tu Host vao Container de BashOperator cua Airflow co the goi chay.
+    # Bien SOURCE_CODE_DIR duoc cau hinh trong file .env (VD: /home/dmst_ai/ds_churn_v1.1)
+
+    # Mount Core Code keo du lieu tu CSDL
+    - ${SOURCE_CODE_DIR}/Ingestion:/churn_source/ingestion
+    # Mount Core Code bien doi, sinh feature (Sliding Windows, Baseline)
+    - ${SOURCE_CODE_DIR}/Preprocess:/churn_source/preprocessing
+    # Mount Core Code Model huan luyen va xuat diem rui ro roi bo
+    - ${SOURCE_CODE_DIR}/Modeling:/churn_source/modeling
+
+    # --------------------------------------------------------------------------------------
+    # [3] MAP DATA GIAO TIEP VOI TEAM DE & LOG UNG DUNG
+    # --------------------------------------------------------------------------------------
+    # Nap du lieu dau vao (File Zip tu DE) va noi luu File ket qua (churn_de, saved_data...)
     - ${DATA_DIR}:/churn_data
+    # Noi luu giu toan bo File text logs trong qua trinh tien xu ly
     - ${LOGS_DIR}:/logs/ingest
+    # --------------------------------------------------------------------------------------
 
   user: "${AIRFLOW_UID:-50000}:0"
-  depends_on:
-    &airflow-common-depends-on
+  depends_on: &airflow-common-depends-on
     redis:
       condition: service_healthy
     postgres:
@@ -111,7 +135,7 @@ services:
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "airflow"]
+      test: [ "CMD", "pg_isready", "-U", "airflow" ]
       interval: 10s
       retries: 5
       start_period: 5s
@@ -125,7 +149,7 @@ services:
     expose:
       - 6379
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 30s
       retries: 50
@@ -139,7 +163,7 @@ services:
     ports:
       - "10000:8080"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      test: [ "CMD", "curl", "--fail", "http://localhost:8080/api/v2/version" ]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -155,7 +179,7 @@ services:
     container_name: airflow-churn-scheduler
     command: scheduler
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      test: [ "CMD", "curl", "--fail", "http://localhost:8974/health" ]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -171,7 +195,7 @@ services:
     container_name: airflow-churn-dag-processor
     command: dag-processor
     healthcheck:
-      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      test: [ "CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"' ]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -213,7 +237,7 @@ services:
     container_name: airflow-churn-triggerer
     command: triggerer
     healthcheck:
-      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      test: [ "CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"' ]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -345,7 +369,7 @@ services:
     ports:
       - "5555:5555"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      test: [ "CMD", "curl", "--fail", "http://localhost:5555/" ]
       interval: 30s
       timeout: 10s
       retries: 5
