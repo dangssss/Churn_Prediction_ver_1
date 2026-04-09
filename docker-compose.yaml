@@ -75,6 +75,12 @@ x-airflow-common:
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
     # The following line can be used to set a custom config file, stored in the local config folder
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+    # App Config DB
+    PG_HOST: ${PG_HOST}
+    PG_PORT: ${PG_PORT}
+    PG_DB: ${PG_DB}
+    PG_USER: ${PG_USER}
+    PG_PW: ${PG_PW}
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
@@ -83,7 +89,8 @@ x-airflow-common:
     - ../ingestion:/churn_source/ingestion
     - ../modeling:/churn_source/modeling
     - ../preprocessing:/churn_source/preprocessing
-    - /data/churn_prediction/ftp_churn:/churn_data
+    - ${DATA_DIR}:/churn_data
+    - ${LOGS_DIR}:/logs/ingest
 
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
