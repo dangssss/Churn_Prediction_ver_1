@@ -57,8 +57,6 @@ x-airflow-common:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
-    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
@@ -99,22 +97,21 @@ x-airflow-common:
     # [2] MA NGUON PYTHON THUC THI LOGIC (SOURCE CODE DIR)
     # --------------------------------------------------------------------------------------
     # Day cac thu muc code tu Host vao Container de BashOperator cua Airflow co the goi chay.
-    # Bien SOURCE_CODE_DIR duoc cau hinh trong file .env (VD: /home/dmst_ai/ds_churn_v1.1)
 
     # Mount Core Code keo du lieu tu CSDL
-    - ${SOURCE_CODE_DIR}/Ingestion:/churn_source/ingestion
+    - /home/dmst_ai/ds_churn/churn.deployment/src/ingestion:/churn_source/ingestion
     # Mount Core Code bien doi, sinh feature (Sliding Windows, Baseline)
-    - ${SOURCE_CODE_DIR}/Preprocess:/churn_source/preprocessing
+    - /home/dmst_ai/ds_churn/churn.deployment/src/preprocessing:/churn_source/preprocessing
     # Mount Core Code Model huan luyen va xuat diem rui ro roi bo
-    - ${SOURCE_CODE_DIR}/Modeling:/churn_source/modeling
+    - /home/dmst_ai/ds_churn/churn.deployment/src/modeling:/churn_source/modeling
 
     # --------------------------------------------------------------------------------------
     # [3] MAP DATA GIAO TIEP VOI TEAM DE & LOG UNG DUNG
     # --------------------------------------------------------------------------------------
     # Nap du lieu dau vao (File Zip tu DE) va noi luu File ket qua (churn_de, saved_data...)
-    - ${DATA_DIR}:/churn_data
+    - /data/churn_prediction/ftp_churn:/churn_data
     # Noi luu giu toan bo File text logs trong qua trinh tien xu ly
-    - ${LOGS_DIR}:/logs/ingest
+    - /data/churn_prediction/churn_logs:/logs
     # --------------------------------------------------------------------------------------
 
   user: "${AIRFLOW_UID:-50000}:0"
