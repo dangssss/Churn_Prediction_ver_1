@@ -22,4 +22,3 @@
  Thêm biến: 
 
 ```AIRFLOW_IMAGE_NAME=dockerhub.vnpost.vn/airflow-churn:1.0.0```
-...
