@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+from typing import Optional, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+from sqlalchemy.engine import Engine
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score,
+    precision_recall_curve,
+    f1_score, precision_score, recall_score
+)
+
+from preprocess.dataset import build_dataset_for_k
+from preprocess.static_features import attach_static
+
+def select_feature_cols_mixed(df: pd.DataFrame, label_col: str):
+    drop_cols = {
+        "cms_code_enc", "window_size", "window_start", "window_end",
+        "source_table_t", "source_table_t_plus_h",
+        "is_active_now", "is_churned_now", "gate_group",
+        label_col
+    }
+    num_cols, cat_cols = [], []
+    for c in df.columns:
+        if c in drop_cols:
+            continue
+        if pd.api.types.is_numeric_dtype(df[c]):
+            num_cols.append(c)
+        elif df[c].dtype == "object":
+            cat_cols.append(c)
+        elif "datetime" in str(df[c].dtype).lower():
+            # drop datetime columns
+            continue
+        else:
+            # treat others as categorical
+            cat_cols.append(c)
+    return num_cols, cat_cols
+
+def make_preprocess(num_cols, cat_cols):
+    num_pipe = Pipeline(steps=[
+        ("imp", SimpleImputer(strategy="median")),
+        ("sc", StandardScaler(with_mean=False)),
+    ])
+    cat_pipe = Pipeline(steps=[
+        ("imp", SimpleImputer(strategy="most_frequent")),
+        ("oh", OneHotEncoder(handle_unknown="ignore")),
+    ])
+    pre = ColumnTransformer(
+        transformers=[
+            ("num", num_pipe, num_cols),
+            ("cat", cat_pipe, cat_cols),
+        ],
+        remainder="drop",
+        sparse_threshold=0.3
+    )
+    return pre
+
+def best_threshold_by_f1(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    prec, rec, thr = precision_recall_curve(y_true, y_prob)
+    # thr length = len(prec)-1
+    f1s = (2 * prec[:-1] * rec[:-1]) / (prec[:-1] + rec[:-1] + 1e-9)
+    if len(f1s) == 0:
+        return 0.5
+    return float(thr[int(np.argmax(f1s))])
+
+def time_split_train_val_last_month(df: pd.DataFrame, time_col: str = "window_end"):
+    df2 = df.copy()
+    df2[time_col] = df2[time_col].astype(int)
+    months = sorted(df2[time_col].unique())
+    if len(months) < 2:
+        return None, None, None
+    val_month = months[-1]
+    df_tr = df2[df2[time_col] < val_month].copy()
+    df_va = df2[df2[time_col] == val_month].copy()
+    return df_tr, df_va, val_month
+
+def eval_one_k_train_val(
+    engine: Engine,
+    k: int,
+    horizon: int,
+    df_static: Optional[pd.DataFrame] = None,
+    use_static: bool = False,
+    limit_rows_each: Optional[int] = None,
+) -> Optional[Dict]:
+    label_col = f"y_churn_t_plus_{horizon}"
+    df_k = build_dataset_for_k(engine, k, horizon=horizon, limit_rows_each=limit_rows_each)
+    if df_k.empty or label_col not in df_k.columns:
+        return None
+
+    # train churn-risk chỉ trên active_now + có label
+    df_k = df_k[df_k["is_active_now"] == 1].dropna(subset=[label_col]).copy()
+    if df_k.empty or df_k[label_col].nunique() < 2:
+        return None
+
+    if use_static:
+        if df_static is None:
+            raise ValueError("use_static=True nhưng df_static=None")
+        df_k = attach_static(df_k, df_static)
+
+    df_tr, df_va, val_month = time_split_train_val_last_month(df_k, time_col="window_end")
+    if df_tr is None or df_tr.empty or df_va.empty:
+        return None
+
+    num_cols, cat_cols = select_feature_cols_mixed(df_k, label_col=label_col)
+    X_tr = df_tr[num_cols + cat_cols]
+    y_tr = df_tr[label_col].astype(int)
+    X_va = df_va[num_cols + cat_cols]
+    y_va = df_va[label_col].astype(int)
+
+    n_pos = int((y_tr == 1).sum())
+    n_neg = int((y_tr == 0).sum())
+    spw = (n_neg / max(n_pos, 1))
+
+    pre = make_preprocess(num_cols, cat_cols)
+    clf = LogisticRegression(
+        max_iter=5000,
+        solver="lbfgs",
+        class_weight={0: 1.0, 1: spw},
+    )
+    pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
+    pipe.fit(X_tr, y_tr)
+
+    va_prob = pipe.predict_proba(X_va)[:, 1]
+
+    pr_auc  = average_precision_score(y_va, va_prob)
+    roc_auc = roc_auc_score(y_va, va_prob)
+
+    thr = best_threshold_by_f1(y_va.to_numpy(), va_prob)
+    yhat = (va_prob >= thr).astype(int)
+
+    return {
+        "K": int(k),
+        "H": int(horizon),
+        "use_static": bool(use_static),
+        "val_month": int(val_month),
+        "n_rows": int(len(df_k)),
+        "n_months": int(df_k["window_end"].nunique()),
+        "spw_used": float(spw),
+        "n_num": int(len(num_cols)),
+        "n_cat": int(len(cat_cols)),
+        "PR_AUC_val": float(pr_auc),
+        "ROC_AUC_val": float(roc_auc),
+        "best_threshold": float(thr),
+        "precision": float(precision_score(y_va, yhat, zero_division=0)),
+        "recall": float(recall_score(y_va, yhat, zero_division=0)),
+        "f1": float(f1_score(y_va, yhat, zero_division=0)),
+    }

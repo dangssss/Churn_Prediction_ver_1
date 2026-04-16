@@ -1,0 +1,32 @@
+CREATE_SQL = """
+CREATE SCHEMA IF NOT EXISTS data_static;
+
+CREATE TABLE IF NOT EXISTS data_static.model_best_config (
+    as_of_month       INT NOT NULL,
+    horizon           INT NOT NULL,
+
+    best_k            INT NOT NULL,
+    use_static        BOOLEAN NOT NULL,
+
+    best_threshold    DOUBLE PRECISION NOT NULL,
+    best_spw          DOUBLE PRECISION NOT NULL,
+
+    metric_f1_val     DOUBLE PRECISION,
+    metric_pr_auc_val DOUBLE PRECISION,
+    val_month         INT,
+
+    target_month      INT,
+    created_at        TIMESTAMPTZ DEFAULT now(),
+    notes             TEXT,
+
+    PRIMARY KEY (as_of_month, horizon)
+);
+"""
+
+with engine.begin() as conn:
+    for stmt in CREATE_SQL.strip().split(";"):
+        s = stmt.strip()
+        if s:
+            conn.execute(text(s))
+
+print("OK: data_static.model_best_config ready")

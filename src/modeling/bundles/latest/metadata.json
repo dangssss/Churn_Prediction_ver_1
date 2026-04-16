@@ -1,0 +1,4794 @@
+{
+  "cfg": {
+    "as_of_month": 2604,
+    "horizon": 2,
+    "best_k": 13,
+    "use_static": true,
+    "best_threshold": 0.3939758784595548,
+    "best_spw": 5.004661879755653,
+    "metric_f1_val": 0.7642891313757204,
+    "metric_pr_auc_val": 0.8643246636225902,
+    "val_month": 2602,
+    "target_month": 2606,
+    "created_at": "2026-04-14 17:56:28.029951",
+    "notes": "picked by F1 then PR_AUC; sweep K window_only then static ablation",
+    "is_accepted": true,
+    "prev_accepted_f1": null,
+    "accept_rule": "accepted_no_prev",
+    "accepted_at": "2026-04-14 17:56:28.028202"
+  },
+  "main_report": {
+    "K": 13,
+    "H": 2,
+    "use_static": true,
+    "val_month": 2602,
+    "train_rows": 112059,
+    "val_rows": 100329,
+    "spw_used": 5.004661879755653,
+    "used_mode": "native_categorical",
+    "AP_val": 0.8711489335428512,
+    "xgb_es_rounds": 200,
+    "xgb_best_iteration": 872,
+    "xgb_best_score": 0.871146703590674,
+    "val_prevalence": 0.25363553907643854,
+    "dummy_ap_const0": 0.25363553907643854,
+    "dummy_ap_random": 0.2530870111987632,
+    "dummy_ap_simple2": 0.6256135446788053,
+    "dummy_simple2_features": "lifetime_months_active,avg_lastday",
+    "guardrail_warning": null,
+    "thr_baseline": 0.3939758784595548,
+    "precision@baseline_thr": 0.9218775202967405,
+    "recall@baseline_thr": 0.673792588517284,
+    "f1@baseline_thr": 0.7785496975550057,
+    "thr_main_opt": 0.27530648931763746,
+    "precision@main_thr": 0.8753755208837641,
+    "recall@main_thr": 0.7099461626124608,
+    "f1@main_thr": 0.7840295101921849
+  },
+  "feat_cols": [
+    "item_12m_ago",
+    "revenue_12m_ago",
+    "complaint_12m_ago",
+    "delay_12m_ago",
+    "nodone_12m_ago",
+    "order_score_12m_ago",
+    "satisfaction_12m_ago",
+    "item_11m_ago",
+    "revenue_11m_ago",
+    "complaint_11m_ago",
+    "delay_11m_ago",
+    "nodone_11m_ago",
+    "order_score_11m_ago",
+    "satisfaction_11m_ago",
+    "item_10m_ago",
+    "revenue_10m_ago",
+    "complaint_10m_ago",
+    "delay_10m_ago",
+    "nodone_10m_ago",
+    "order_score_10m_ago",
+    "satisfaction_10m_ago",
+    "item_9m_ago",
+    "revenue_9m_ago",
+    "complaint_9m_ago",
+    "delay_9m_ago",
+    "nodone_9m_ago",
+    "order_score_9m_ago",
+    "satisfaction_9m_ago",
+    "item_8m_ago",
+    "revenue_8m_ago",
+    "complaint_8m_ago",
+    "delay_8m_ago",
+    "nodone_8m_ago",
+    "order_score_8m_ago",
+    "satisfaction_8m_ago",
+    "item_7m_ago",
+    "revenue_7m_ago",
+    "complaint_7m_ago",
+    "delay_7m_ago",
+    "nodone_7m_ago",
+    "order_score_7m_ago",
+    "satisfaction_7m_ago",
+    "item_6m_ago",
+    "revenue_6m_ago",
+    "complaint_6m_ago",
+    "delay_6m_ago",
+    "nodone_6m_ago",
+    "order_score_6m_ago",
+    "satisfaction_6m_ago",
+    "item_5m_ago",
+    "revenue_5m_ago",
+    "complaint_5m_ago",
+    "delay_5m_ago",
+    "nodone_5m_ago",
+    "order_score_5m_ago",
+    "satisfaction_5m_ago",
+    "item_4m_ago",
+    "revenue_4m_ago",
+    "complaint_4m_ago",
+    "delay_4m_ago",
+    "nodone_4m_ago",
+    "order_score_4m_ago",
+    "satisfaction_4m_ago",
+    "item_3m_ago",
+    "revenue_3m_ago",
+    "complaint_3m_ago",
+    "delay_3m_ago",
+    "nodone_3m_ago",
+    "order_score_3m_ago",
+    "satisfaction_3m_ago",
+    "item_2m_ago",
+    "revenue_2m_ago",
+    "complaint_2m_ago",
+    "delay_2m_ago",
+    "nodone_2m_ago",
+    "order_score_2m_ago",
+    "satisfaction_2m_ago",
+    "item_1m_ago",
+    "revenue_1m_ago",
+    "complaint_1m_ago",
+    "delay_1m_ago",
+    "nodone_1m_ago",
+    "order_score_1m_ago",
+    "satisfaction_1m_ago",
+    "item_last",
+    "revenue_last",
+    "complaint_last",
+    "delay_last",
+    "nodone_last",
+    "order_score_last",
+    "satisfaction_last",
+    "item_sum",
+    "item_avg",
+    "item_std",
+    "item_min_month",
+    "item_max_month",
+    "item_median",
+    "revenue_sum",
+    "revenue_avg",
+    "revenue_std",
+    "revenue_min_month",
+    "revenue_max_month",
+    "revenue_median",
+    "complaint_sum",
+    "complaint_avg",
+    "complaint_std",
+    "complaint_min_month",
+    "complaint_max_month",
+    "complaint_median",
+    "complaint_diversity",
+    "most_common_complaint",
+    "weight_sum",
+    "weight_avg",
+    "weight_std",
+    "avg_revenue_per_item",
+    "avg_weight_per_item",
+    "pct_delay",
+    "pct_refund",
+    "pct_noaccepted",
+    "pct_lost_order",
+    "pct_complaint",
+    "pct_complaint_per_item",
+    "pct_successful_item",
+    "pct_intra_province",
+    "pct_international",
+    "avg_delayday",
+    "order_score_avg",
+    "order_score_std",
+    "order_min_month",
+    "order_max_month",
+    "satisfaction_avg",
+    "satisfaction_std",
+    "satisfaction_min_month",
+    "satisfaction_max_month",
+    "active_months",
+    "inactive_months",
+    "active_days",
+    "inactive_days",
+    "avg_noservice_days",
+    "max_consecutive_inactive",
+    "avg_lastday",
+    "item_slope",
+    "revenue_slope",
+    "satisfy_slope",
+    "complaint_slope",
+    "cv_item",
+    "cv_revenue",
+    "item_range",
+    "revenue_range",
+    "service_types_used",
+    "dominant_service",
+    "dominant_service_ratio",
+    "ser_c_sum",
+    "ser_e_sum",
+    "ser_m_sum",
+    "ser_p_sum",
+    "ser_r_sum",
+    "ser_u_sum",
+    "ser_l_sum",
+    "ser_q_sum",
+    "recency",
+    "frequency",
+    "monetary",
+    "is_corporate",
+    "contract_classify",
+    "contract_service",
+    "custype",
+    "contract_sig_first",
+    "tenure",
+    "contract_mgr_org",
+    "cus_poscode",
+    "cus_province",
+    "lifetime_total_items",
+    "lifetime_total_revenue",
+    "lifetime_total_weight",
+    "lifetime_total_complaint",
+    "lifetime_avg_revenue_per_item",
+    "lifetime_avg_weight_per_item",
+    "lifetime_months_active",
+    "lifetime_days_active",
+    "lifetime_pct_delay",
+    "lifetime_pct_refund",
+    "lifetime_pct_noaccepted",
+    "lifetime_pct_lost_order",
+    "lifetime_pct_complaint",
+    "lifetime_pct_complaint_per_item",
+    "lifetime_pct_successful_item",
+    "lifetime_avg_delayday",
+    "lifetime_avg_order_score",
+    "lifetime_avg_satisfaction",
+    "lifetime_service_types_count",
+    "lifetime_dominant_service",
+    "lifetime_pct_international",
+    "lifetime_pct_intra_province",
+    "most_common_rec_province",
+    "most_common_rec_district",
+    "most_common_rec_commune",
+    "most_common_region",
+    "ratio_item_last__lifetime_total_items",
+    "ratio_revenue_last__lifetime_total_revenue",
+    "ratio_complaint_last__lifetime_total_complaint",
+    "ratio_delay_last__lifetime_pct_delay_x_total_items",
+    "ratio_nodone_last__lifetime_nodone_items",
+    "ratio_order_score_last__lifetime_avg_order_score",
+    "ratio_satisfaction_last__lifetime_avg_satisfaction",
+    "ratio_satisfation_last__lifetime_avg_satisfation"
+  ],
+  "cat_cols": [
+    "dominant_service",
+    "contract_sig_first",
+    "lifetime_dominant_service",
+    "most_common_region"
+  ],
+  "feature_name_map": {
+    "item_12m_ago": "item_12m_ago",
+    "revenue_12m_ago": "revenue_12m_ago",
+    "complaint_12m_ago": "complaint_12m_ago",
+    "delay_12m_ago": "delay_12m_ago",
+    "nodone_12m_ago": "nodone_12m_ago",
+    "order_score_12m_ago": "order_score_12m_ago",
+    "satisfaction_12m_ago": "satisfaction_12m_ago",
+    "item_11m_ago": "item_11m_ago",
+    "revenue_11m_ago": "revenue_11m_ago",
+    "complaint_11m_ago": "complaint_11m_ago",
+    "delay_11m_ago": "delay_11m_ago",
+    "nodone_11m_ago": "nodone_11m_ago",
+    "order_score_11m_ago": "order_score_11m_ago",
+    "satisfaction_11m_ago": "satisfaction_11m_ago",
+    "item_10m_ago": "item_10m_ago",
+    "revenue_10m_ago": "revenue_10m_ago",
+    "complaint_10m_ago": "complaint_10m_ago",
+    "delay_10m_ago": "delay_10m_ago",
+    "nodone_10m_ago": "nodone_10m_ago",
+    "order_score_10m_ago": "order_score_10m_ago",
+    "satisfaction_10m_ago": "satisfaction_10m_ago",
+    "item_9m_ago": "item_9m_ago",
+    "revenue_9m_ago": "revenue_9m_ago",
+    "complaint_9m_ago": "complaint_9m_ago",
+    "delay_9m_ago": "delay_9m_ago",
+    "nodone_9m_ago": "nodone_9m_ago",
+    "order_score_9m_ago": "order_score_9m_ago",
+    "satisfaction_9m_ago": "satisfaction_9m_ago",
+    "item_8m_ago": "item_8m_ago",
+    "revenue_8m_ago": "revenue_8m_ago",
+    "complaint_8m_ago": "complaint_8m_ago",
+    "delay_8m_ago": "delay_8m_ago",
+    "nodone_8m_ago": "nodone_8m_ago",
+    "order_score_8m_ago": "order_score_8m_ago",
+    "satisfaction_8m_ago": "satisfaction_8m_ago",
+    "item_7m_ago": "item_7m_ago",
+    "revenue_7m_ago": "revenue_7m_ago",
+    "complaint_7m_ago": "complaint_7m_ago",
+    "delay_7m_ago": "delay_7m_ago",
+    "nodone_7m_ago": "nodone_7m_ago",
+    "order_score_7m_ago": "order_score_7m_ago",
+    "satisfaction_7m_ago": "satisfaction_7m_ago",
+    "item_6m_ago": "item_6m_ago",
+    "revenue_6m_ago": "revenue_6m_ago",
+    "complaint_6m_ago": "complaint_6m_ago",
+    "delay_6m_ago": "delay_6m_ago",
+    "nodone_6m_ago": "nodone_6m_ago",
+    "order_score_6m_ago": "order_score_6m_ago",
+    "satisfaction_6m_ago": "satisfaction_6m_ago",
+    "item_5m_ago": "item_5m_ago",
+    "revenue_5m_ago": "revenue_5m_ago",
+    "complaint_5m_ago": "complaint_5m_ago",
+    "delay_5m_ago": "delay_5m_ago",
+    "nodone_5m_ago": "nodone_5m_ago",
+    "order_score_5m_ago": "order_score_5m_ago",
+    "satisfaction_5m_ago": "satisfaction_5m_ago",
+    "item_4m_ago": "item_4m_ago",
+    "revenue_4m_ago": "revenue_4m_ago",
+    "complaint_4m_ago": "complaint_4m_ago",
+    "delay_4m_ago": "delay_4m_ago",
+    "nodone_4m_ago": "nodone_4m_ago",
+    "order_score_4m_ago": "order_score_4m_ago",
+    "satisfaction_4m_ago": "satisfaction_4m_ago",
+    "item_3m_ago": "item_3m_ago",
+    "revenue_3m_ago": "revenue_3m_ago",
+    "complaint_3m_ago": "complaint_3m_ago",
+    "delay_3m_ago": "delay_3m_ago",
+    "nodone_3m_ago": "nodone_3m_ago",
+    "order_score_3m_ago": "order_score_3m_ago",
+    "satisfaction_3m_ago": "satisfaction_3m_ago",
+    "item_2m_ago": "item_2m_ago",
+    "revenue_2m_ago": "revenue_2m_ago",
+    "complaint_2m_ago": "complaint_2m_ago",
+    "delay_2m_ago": "delay_2m_ago",
+    "nodone_2m_ago": "nodone_2m_ago",
+    "order_score_2m_ago": "order_score_2m_ago",
+    "satisfaction_2m_ago": "satisfaction_2m_ago",
+    "item_1m_ago": "item_1m_ago",
+    "revenue_1m_ago": "revenue_1m_ago",
+    "complaint_1m_ago": "complaint_1m_ago",
+    "delay_1m_ago": "delay_1m_ago",
+    "nodone_1m_ago": "nodone_1m_ago",
+    "order_score_1m_ago": "order_score_1m_ago",
+    "satisfaction_1m_ago": "satisfaction_1m_ago",
+    "item_last": "item_last",
+    "revenue_last": "revenue_last",
+    "complaint_last": "complaint_last",
+    "delay_last": "delay_last",
+    "nodone_last": "nodone_last",
+    "order_score_last": "order_score_last",
+    "satisfaction_last": "satisfaction_last",
+    "item_sum": "item_sum",
+    "item_avg": "item_avg",
+    "item_std": "item_std",
+    "item_min_month": "item_min_month",
+    "item_max_month": "item_max_month",
+    "item_median": "item_median",
+    "revenue_sum": "revenue_sum",
+    "revenue_avg": "revenue_avg",
+    "revenue_std": "revenue_std",
+    "revenue_min_month": "revenue_min_month",
+    "revenue_max_month": "revenue_max_month",
+    "revenue_median": "revenue_median",
+    "complaint_sum": "complaint_sum",
+    "complaint_avg": "complaint_avg",
+    "complaint_std": "complaint_std",
+    "complaint_min_month": "complaint_min_month",
+    "complaint_max_month": "complaint_max_month",
+    "complaint_median": "complaint_median",
+    "complaint_diversity": "complaint_diversity",
+    "most_common_complaint": "most_common_complaint",
+    "weight_sum": "weight_sum",
+    "weight_avg": "weight_avg",
+    "weight_std": "weight_std",
+    "avg_revenue_per_item": "avg_revenue_per_item",
+    "avg_weight_per_item": "avg_weight_per_item",
+    "pct_delay": "pct_delay",
+    "pct_refund": "pct_refund",
+    "pct_noaccepted": "pct_noaccepted",
+    "pct_lost_order": "pct_lost_order",
+    "pct_complaint": "pct_complaint",
+    "pct_complaint_per_item": "pct_complaint_per_item",
+    "pct_successful_item": "pct_successful_item",
+    "pct_intra_province": "pct_intra_province",
+    "pct_international": "pct_international",
+    "avg_delayday": "avg_delayday",
+    "order_score_avg": "order_score_avg",
+    "order_score_std": "order_score_std",
+    "order_min_month": "order_min_month",
+    "order_max_month": "order_max_month",
+    "satisfaction_avg": "satisfaction_avg",
+    "satisfaction_std": "satisfaction_std",
+    "satisfaction_min_month": "satisfaction_min_month",
+    "satisfaction_max_month": "satisfaction_max_month",
+    "active_months": "active_months",
+    "inactive_months": "inactive_months",
+    "active_days": "active_days",
+    "inactive_days": "inactive_days",
+    "avg_noservice_days": "avg_noservice_days",
+    "max_consecutive_inactive": "max_consecutive_inactive",
+    "avg_lastday": "avg_lastday",
+    "item_slope": "item_slope",
+    "revenue_slope": "revenue_slope",
+    "satisfy_slope": "satisfy_slope",
+    "complaint_slope": "complaint_slope",
+    "cv_item": "cv_item",
+    "cv_revenue": "cv_revenue",
+    "item_range": "item_range",
+    "revenue_range": "revenue_range",
+    "service_types_used": "service_types_used",
+    "dominant_service": "dominant_service",
+    "dominant_service_ratio": "dominant_service_ratio",
+    "ser_c_sum": "ser_c_sum",
+    "ser_e_sum": "ser_e_sum",
+    "ser_m_sum": "ser_m_sum",
+    "ser_p_sum": "ser_p_sum",
+    "ser_r_sum": "ser_r_sum",
+    "ser_u_sum": "ser_u_sum",
+    "ser_l_sum": "ser_l_sum",
+    "ser_q_sum": "ser_q_sum",
+    "recency": "recency",
+    "frequency": "frequency",
+    "monetary": "monetary",
+    "is_corporate": "is_corporate",
+    "contract_classify": "contract_classify",
+    "contract_service": "contract_service",
+    "custype": "custype",
+    "contract_sig_first": "contract_sig_first",
+    "tenure": "tenure",
+    "contract_mgr_org": "contract_mgr_org",
+    "cus_poscode": "cus_poscode",
+    "cus_province": "cus_province",
+    "lifetime_total_items": "lifetime_total_items",
+    "lifetime_total_revenue": "lifetime_total_revenue",
+    "lifetime_total_weight": "lifetime_total_weight",
+    "lifetime_total_complaint": "lifetime_total_complaint",
+    "lifetime_avg_revenue_per_item": "lifetime_avg_revenue_per_item",
+    "lifetime_avg_weight_per_item": "lifetime_avg_weight_per_item",
+    "lifetime_months_active": "lifetime_months_active",
+    "lifetime_days_active": "lifetime_days_active",
+    "lifetime_pct_delay": "lifetime_pct_delay",
+    "lifetime_pct_refund": "lifetime_pct_refund",
+    "lifetime_pct_noaccepted": "lifetime_pct_noaccepted",
+    "lifetime_pct_lost_order": "lifetime_pct_lost_order",
+    "lifetime_pct_complaint": "lifetime_pct_complaint",
+    "lifetime_pct_complaint_per_item": "lifetime_pct_complaint_per_item",
+    "lifetime_pct_successful_item": "lifetime_pct_successful_item",
+    "lifetime_avg_delayday": "lifetime_avg_delayday",
+    "lifetime_avg_order_score": "lifetime_avg_order_score",
+    "lifetime_avg_satisfaction": "lifetime_avg_satisfaction",
+    "lifetime_service_types_count": "lifetime_service_types_count",
+    "lifetime_dominant_service": "lifetime_dominant_service",
+    "lifetime_pct_international": "lifetime_pct_international",
+    "lifetime_pct_intra_province": "lifetime_pct_intra_province",
+    "most_common_rec_province": "most_common_rec_province",
+    "most_common_rec_district": "most_common_rec_district",
+    "most_common_rec_commune": "most_common_rec_commune",
+    "most_common_region": "most_common_region",
+    "ratio_item_last__lifetime_total_items": "ratio_item_last__lifetime_total_items",
+    "ratio_revenue_last__lifetime_total_revenue": "ratio_revenue_last__lifetime_total_revenue",
+    "ratio_complaint_last__lifetime_total_complaint": "ratio_complaint_last__lifetime_total_complaint",
+    "ratio_delay_last__lifetime_pct_delay_x_total_items": "ratio_delay_last__lifetime_pct_delay_x_total_items",
+    "ratio_nodone_last__lifetime_nodone_items": "ratio_nodone_last__lifetime_nodone_items",
+    "ratio_order_score_last__lifetime_avg_order_score": "ratio_order_score_last__lifetime_avg_order_score",
+    "ratio_satisfaction_last__lifetime_avg_satisfaction": "ratio_satisfaction_last__lifetime_avg_satisfaction",
+    "ratio_satisfation_last__lifetime_avg_satisfation": "ratio_satisfation_last__lifetime_avg_satisfation"
+  },
+  "feature_profile": {
+    "numeric": {
+      "item_12m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          4.0,
+          8.0,
+          16.0,
+          31.0,
+          80.0,
+          646428.0
+        ],
+        "train_counts": [
+          44127,
+          11122,
+          10474,
+          12485,
+          11047,
+          11574,
+          11230
+        ],
+        "n": 112059
+      },
+      "revenue_12m_ago": {
+        "bin_edges": [
+          0.0,
+          12312.0,
+          97848.0,
+          224640.0,
+          453600.0,
+          961263.2000000001,
+          2595032.999999998,
+          19095972637.0
+        ],
+        "train_counts": [
+          44732,
+          11287,
+          11209,
+          11209,
+          11210,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_12m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2848.0
+        ],
+        "train_counts": [
+          100604,
+          11455
+        ],
+        "n": 112059
+      },
+      "delay_12m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          6.0,
+          66178.0
+        ],
+        "train_counts": [
+          74492,
+          12028,
+          13737,
+          11802
+        ],
+        "n": 112059
+      },
+      "nodone_12m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          36876.0
+        ],
+        "train_counts": [
+          88742,
+          9497,
+          13820
+        ],
+        "n": 112059
+      },
+      "order_score_12m_ago": {
+        "bin_edges": [
+          0.0,
+          7.337200000000005,
+          10.0,
+          10.375,
+          10.614,
+          10.8,
+          11.0,
+          12.0
+        ],
+        "train_counts": [
+          44824,
+          10162,
+          12103,
+          11337,
+          10417,
+          8981,
+          14235
+        ],
+        "n": 112059
+      },
+      "satisfaction_12m_ago": {
+        "bin_edges": [
+          0.0,
+          0.825,
+          5.583,
+          6.819,
+          7.3,
+          7.575,
+          7.761,
+          10.0
+        ],
+        "train_counts": [
+          44821,
+          10909,
+          11401,
+          11220,
+          11202,
+          11282,
+          11224
+        ],
+        "n": 112059
+      },
+      "item_11m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          4.0,
+          9.0,
+          17.0,
+          34.0,
+          87.0,
+          464442.0
+        ],
+        "train_counts": [
+          43505,
+          11399,
+          12007,
+          11186,
+          11334,
+          11409,
+          11219
+        ],
+        "n": 112059
+      },
+      "revenue_11m_ago": {
+        "bin_edges": [
+          0.0,
+          17690.0,
+          99144.0,
+          228160.40000000002,
+          466023.0,
+          1004101.4000000001,
+          2774960.4,
+          48859067745.0
+        ],
+        "train_counts": [
+          44815,
+          11201,
+          11219,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_11m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2463.0
+        ],
+        "train_counts": [
+          100154,
+          11905
+        ],
+        "n": 112059
+      },
+      "delay_11m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          5.0,
+          45231.0
+        ],
+        "train_counts": [
+          77460,
+          11638,
+          10716,
+          12245
+        ],
+        "n": 112059
+      },
+      "nodone_11m_ago": {
+        "bin_edges": [
+          0.0,
+          2.0,
+          24899.0
+        ],
+        "train_counts": [
+          98745,
+          13314
+        ],
+        "n": 112059
+      },
+      "order_score_11m_ago": {
+        "bin_edges": [
+          0.0,
+          8.647400000000008,
+          10.176,
+          10.5,
+          10.722,
+          10.889,
+          11.0,
+          12.0
+        ],
+        "train_counts": [
+          44824,
+          11192,
+          9542,
+          12804,
+          11013,
+          5156,
+          17528
+        ],
+        "n": 112059
+      },
+      "satisfaction_11m_ago": {
+        "bin_edges": [
+          0.0,
+          2.313600000000013,
+          6.042,
+          7.25,
+          7.375,
+          7.75,
+          7.875,
+          10.0
+        ],
+        "train_counts": [
+          44824,
+          11122,
+          11263,
+          10455,
+          11073,
+          11651,
+          11671
+        ],
+        "n": 112059
+      },
+      "item_10m_ago": {
+        "bin_edges": [
+          0.0,
+          2.0,
+          5.0,
+          11.0,
+          20.0,
+          39.0,
+          97.0,
+          454017.0
+        ],
+        "train_counts": [
+          44542,
+          9610,
+          12905,
+          11106,
+          11332,
+          11313,
+          11251
+        ],
+        "n": 112059
+      },
+      "revenue_10m_ago": {
+        "bin_edges": [
+          0.0,
+          38297.0,
+          134784.0,
+          287820.0,
+          568419.0000000003,
+          1191240.0,
+          3239654.9999999986,
+          67440198587.0
+        ],
+        "train_counts": [
+          44822,
+          11194,
+          11217,
+          11208,
+          11204,
+          11208,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_10m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3487.0
+        ],
+        "train_counts": [
+          99386,
+          12673
+        ],
+        "n": 112059
+      },
+      "delay_10m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          5.0,
+          57907.0
+        ],
+        "train_counts": [
+          77544,
+          12031,
+          10673,
+          11811
+        ],
+        "n": 112059
+      },
+      "nodone_10m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          33195.0
+        ],
+        "train_counts": [
+          87936,
+          9629,
+          14494
+        ],
+        "n": 112059
+      },
+      "order_score_10m_ago": {
+        "bin_edges": [
+          0.0,
+          9.719,
+          10.38,
+          10.636,
+          10.8,
+          10.953,
+          11.0,
+          12.0
+        ],
+        "train_counts": [
+          44823,
+          11201,
+          11143,
+          10535,
+          11938,
+          1589,
+          20830
+        ],
+        "n": 112059
+      },
+      "satisfaction_10m_ago": {
+        "bin_edges": [
+          0.0,
+          4.45,
+          6.586,
+          7.265,
+          7.419,
+          7.75,
+          7.945,
+          10.0
+        ],
+        "train_counts": [
+          44822,
+          11206,
+          11175,
+          11163,
+          7580,
+          14902,
+          11211
+        ],
+        "n": 112059
+      },
+      "item_9m_ago": {
+        "bin_edges": [
+          0.0,
+          2.0,
+          5.0,
+          10.0,
+          20.0,
+          38.0,
+          96.0,
+          465946.0
+        ],
+        "train_counts": [
+          43934,
+          10175,
+          11624,
+          12655,
+          11037,
+          11360,
+          11274
+        ],
+        "n": 112059
+      },
+      "revenue_9m_ago": {
+        "bin_edges": [
+          0.0,
+          42444.0,
+          134784.0,
+          282375.40000000014,
+          554222.8000000005,
+          1176919.200000001,
+          3213079.999999999,
+          39703488954.0
+        ],
+        "train_counts": [
+          44823,
+          11191,
+          11221,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_9m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3537.0
+        ],
+        "train_counts": [
+          99582,
+          12477
+        ],
+        "n": 112059
+      },
+      "delay_9m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          7.0,
+          43912.0
+        ],
+        "train_counts": [
+          71647,
+          12777,
+          16309,
+          11326
+        ],
+        "n": 112059
+      },
+      "nodone_9m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          26744.0
+        ],
+        "train_counts": [
+          88090,
+          9512,
+          14457
+        ],
+        "n": 112059
+      },
+      "order_score_9m_ago": {
+        "bin_edges": [
+          0.0,
+          9.75,
+          10.333,
+          10.593,
+          10.76,
+          10.919,
+          11.0,
+          12.0
+        ],
+        "train_counts": [
+          44699,
+          10769,
+          11760,
+          11146,
+          11271,
+          3138,
+          19276
+        ],
+        "n": 112059
+      },
+      "satisfaction_9m_ago": {
+        "bin_edges": [
+          0.0,
+          4.471,
+          6.342,
+          7.25,
+          7.375,
+          7.75,
+          7.87,
+          10.0
+        ],
+        "train_counts": [
+          44822,
+          11177,
+          10964,
+          10544,
+          11530,
+          11814,
+          11208
+        ],
+        "n": 112059
+      },
+      "item_8m_ago": {
+        "bin_edges": [
+          0.0,
+          2.0,
+          6.0,
+          11.0,
+          20.0,
+          39.0,
+          98.0,
+          478099.0
+        ],
+        "train_counts": [
+          42091,
+          13323,
+          10902,
+          11584,
+          11472,
+          11437,
+          11250
+        ],
+        "n": 112059
+      },
+      "revenue_8m_ago": {
+        "bin_edges": [
+          0.0,
+          54972.0,
+          149727.0,
+          301968.0,
+          589019.2000000002,
+          1228611.6,
+          3324354.7999999984,
+          90237651455.0
+        ],
+        "train_counts": [
+          44821,
+          11208,
+          11199,
+          11213,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_8m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3025.0
+        ],
+        "train_counts": [
+          98918,
+          13141
+        ],
+        "n": 112059
+      },
+      "delay_8m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          5.0,
+          33759.0
+        ],
+        "train_counts": [
+          77900,
+          22811,
+          11348
+        ],
+        "n": 112059
+      },
+      "nodone_8m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          24660.0
+        ],
+        "train_counts": [
+          88078,
+          9756,
+          14225
+        ],
+        "n": 112059
+      },
+      "order_score_8m_ago": {
+        "bin_edges": [
+          0.0,
+          10.0,
+          10.5,
+          10.697,
+          10.848,
+          11.0,
+          11.018,
+          12.0
+        ],
+        "train_counts": [
+          43709,
+          12153,
+          11366,
+          11150,
+          10066,
+          12399,
+          11216
+        ],
+        "n": 112059
+      },
+      "satisfaction_8m_ago": {
+        "bin_edges": [
+          0.0,
+          5.351,
+          6.849,
+          7.298,
+          7.467,
+          7.75,
+          7.972199999999997,
+          10.0
+        ],
+        "train_counts": [
+          44822,
+          11130,
+          11169,
+          11254,
+          5594,
+          16884,
+          11206
+        ],
+        "n": 112059
+      },
+      "item_7m_ago": {
+        "bin_edges": [
+          0.0,
+          2.0,
+          6.0,
+          11.0,
+          20.0,
+          39.0,
+          99.0,
+          424838.0
+        ],
+        "train_counts": [
+          40922,
+          13802,
+          11150,
+          11740,
+          11655,
+          11495,
+          11295
+        ],
+        "n": 112059
+      },
+      "revenue_7m_ago": {
+        "bin_edges": [
+          0.0,
+          61788.80000000028,
+          158085.0,
+          313723.4000000001,
+          606882.4000000001,
+          1257379.200000001,
+          3440050.5999999996,
+          44094431016.0
+        ],
+        "train_counts": [
+          44824,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_7m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2849.0
+        ],
+        "train_counts": [
+          98352,
+          13707
+        ],
+        "n": 112059
+      },
+      "delay_7m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          5.0,
+          33632.0
+        ],
+        "train_counts": [
+          77859,
+          22766,
+          11434
+        ],
+        "n": 112059
+      },
+      "nodone_7m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          24341.0
+        ],
+        "train_counts": [
+          87637,
+          9707,
+          14715
+        ],
+        "n": 112059
+      },
+      "order_score_7m_ago": {
+        "bin_edges": [
+          0.0,
+          10.083,
+          10.5,
+          10.733,
+          10.875,
+          11.0,
+          11.063,
+          12.0
+        ],
+        "train_counts": [
+          44770,
+          9321,
+          13073,
+          10786,
+          8136,
+          14662,
+          11311
+        ],
+        "n": 112059
+      },
+      "satisfaction_7m_ago": {
+        "bin_edges": [
+          0.0,
+          5.583,
+          6.979,
+          7.317,
+          7.497,
+          7.75,
+          7.976,
+          10.0
+        ],
+        "train_counts": [
+          44617,
+          11369,
+          10775,
+          11672,
+          4616,
+          17797,
+          11213
+        ],
+        "n": 112059
+      },
+      "item_6m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3.0,
+          7.0,
+          13.0,
+          23.0,
+          44.0,
+          108.0,
+          499390.0
+        ],
+        "train_counts": [
+          31983,
+          9495,
+          13011,
+          12200,
+          11427,
+          11471,
+          11202,
+          11270
+        ],
+        "n": 112059
+      },
+      "revenue_6m_ago": {
+        "bin_edges": [
+          0.0,
+          17496.0,
+          86033.80000000006,
+          189000.0,
+          357696.0,
+          671760.0,
+          1389441.600000003,
+          3723319.9999999995,
+          61324037051.0
+        ],
+        "train_counts": [
+          33561,
+          11263,
+          11200,
+          11209,
+          11207,
+          11207,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_6m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3832.0
+        ],
+        "train_counts": [
+          96542,
+          15517
+        ],
+        "n": 112059
+      },
+      "delay_6m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          6.0,
+          40599.0
+        ],
+        "train_counts": [
+          73235,
+          13564,
+          13702,
+          11558
+        ],
+        "n": 112059
+      },
+      "nodone_6m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3.0,
+          29032.0
+        ],
+        "train_counts": [
+          84194,
+          15433,
+          12432
+        ],
+        "n": 112059
+      },
+      "order_score_6m_ago": {
+        "bin_edges": [
+          0.0,
+          8.786,
+          10.217,
+          10.542,
+          10.741,
+          10.878,
+          11.0,
+          11.055,
+          12.0
+        ],
+        "train_counts": [
+          33617,
+          11195,
+          11200,
+          11220,
+          11204,
+          7586,
+          14828,
+          11209
+        ],
+        "n": 112059
+      },
+      "satisfaction_6m_ago": {
+        "bin_edges": [
+          0.0,
+          2.32,
+          5.995,
+          7.06,
+          7.317,
+          7.51,
+          7.75,
+          7.958,
+          10.0
+        ],
+        "train_counts": [
+          33617,
+          11196,
+          11209,
+          10213,
+          12180,
+          4509,
+          17914,
+          11221
+        ],
+        "n": 112059
+      },
+      "item_5m_ago": {
+        "bin_edges": [
+          0.0,
+          2.0,
+          4.0,
+          8.0,
+          15.0,
+          25.0,
+          47.0,
+          116.0,
+          586851.0
+        ],
+        "train_counts": [
+          32822,
+          8486,
+          12544,
+          13359,
+          10805,
+          11469,
+          11343,
+          11231
+        ],
+        "n": 112059
+      },
+      "revenue_5m_ago": {
+        "bin_edges": [
+          0.0,
+          41040.0,
+          115344.0,
+          225899.0,
+          407799.4,
+          751100.2000000004,
+          1513028.0000000007,
+          4029247.1999999946,
+          115208555359.0
+        ],
+        "train_counts": [
+          33552,
+          11269,
+          11208,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_5m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          6650.0
+        ],
+        "train_counts": [
+          95121,
+          16938
+        ],
+        "n": 112059
+      },
+      "delay_5m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3.0,
+          9.0,
+          62098.0
+        ],
+        "train_counts": [
+          63246,
+          23111,
+          14268,
+          11434
+        ],
+        "n": 112059
+      },
+      "nodone_5m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          4.0,
+          37790.0
+        ],
+        "train_counts": [
+          78771,
+          21088,
+          12200
+        ],
+        "n": 112059
+      },
+      "order_score_5m_ago": {
+        "bin_edges": [
+          0.0,
+          9.5,
+          10.163,
+          10.462,
+          10.645,
+          10.8,
+          10.957,
+          11.0,
+          12.0
+        ],
+        "train_counts": [
+          33511,
+          11301,
+          11185,
+          11206,
+          11228,
+          11164,
+          1032,
+          21432
+        ],
+        "n": 112059
+      },
+      "satisfaction_5m_ago": {
+        "bin_edges": [
+          0.0,
+          3.917,
+          5.846,
+          6.736,
+          7.253,
+          7.394,
+          7.75,
+          7.868,
+          10.0
+        ],
+        "train_counts": [
+          33615,
+          11143,
+          11271,
+          11094,
+          11293,
+          9103,
+          13330,
+          11210
+        ],
+        "n": 112059
+      },
+      "item_4m_ago": {
+        "bin_edges": [
+          0.0,
+          2.0,
+          5.0,
+          9.0,
+          15.0,
+          25.0,
+          47.0,
+          113.0,
+          461558.0
+        ],
+        "train_counts": [
+          30624,
+          13038,
+          11846,
+          11465,
+          11067,
+          11600,
+          11185,
+          11234
+        ],
+        "n": 112059
+      },
+      "revenue_4m_ago": {
+        "bin_edges": [
+          0.0,
+          52377.0,
+          127440.0,
+          237905.0,
+          419904.0,
+          759455.6,
+          1514025.600000002,
+          4047012.199999999,
+          236947499869.0
+        ],
+        "train_counts": [
+          33610,
+          11206,
+          11213,
+          11204,
+          11208,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_4m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          6756.0
+        ],
+        "train_counts": [
+          95147,
+          16912
+        ],
+        "n": 112059
+      },
+      "delay_4m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3.0,
+          8.0,
+          71130.0
+        ],
+        "train_counts": [
+          66124,
+          22647,
+          11843,
+          11445
+        ],
+        "n": 112059
+      },
+      "nodone_4m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          4.0,
+          37462.0
+        ],
+        "train_counts": [
+          78781,
+          21256,
+          12022
+        ],
+        "n": 112059
+      },
+      "order_score_4m_ago": {
+        "bin_edges": [
+          0.0,
+          9.765,
+          10.25,
+          10.5,
+          10.682,
+          10.833,
+          11.0,
+          12.0
+        ],
+        "train_counts": [
+          33598,
+          11040,
+          9594,
+          12968,
+          10836,
+          10250,
+          23773
+        ],
+        "n": 112059
+      },
+      "satisfaction_4m_ago": {
+        "bin_edges": [
+          0.0,
+          4.663,
+          6.186,
+          7.054,
+          7.298,
+          7.443600000000005,
+          7.75,
+          7.892,
+          10.0
+        ],
+        "train_counts": [
+          33607,
+          11213,
+          11183,
+          11031,
+          11407,
+          6268,
+          16136,
+          11214
+        ],
+        "n": 112059
+      },
+      "item_3m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3.0,
+          6.0,
+          10.0,
+          17.0,
+          29.0,
+          54.0,
+          129.1999999999971,
+          482834.0
+        ],
+        "train_counts": [
+          21642,
+          10177,
+          11321,
+          10924,
+          12302,
+          11612,
+          11605,
+          11270,
+          11206
+        ],
+        "n": 112059
+      },
+      "revenue_3m_ago": {
+        "bin_edges": [
+          0.0,
+          12096.0,
+          75600.0,
+          160466.00000000006,
+          286000.0,
+          493771.80000000005,
+          878032.0000000001,
+          1730341.200000004,
+          4652476.799999999,
+          122469633780.0
+        ],
+        "train_counts": [
+          22307,
+          11304,
+          11213,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_3m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          7088.0
+        ],
+        "train_counts": [
+          94687,
+          17372
+        ],
+        "n": 112059
+      },
+      "delay_3m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3.0,
+          8.0,
+          49727.0
+        ],
+        "train_counts": [
+          65716,
+          22683,
+          11797,
+          11863
+        ],
+        "n": 112059
+      },
+      "nodone_3m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          4.0,
+          29789.0
+        ],
+        "train_counts": [
+          80427,
+          19748,
+          11884
+        ],
+        "n": 112059
+      },
+      "order_score_3m_ago": {
+        "bin_edges": [
+          0.0,
+          7.455,
+          10.0,
+          10.397,
+          10.6,
+          10.75,
+          10.875,
+          11.0,
+          11.051,
+          12.0
+        ],
+        "train_counts": [
+          22411,
+          9385,
+          13014,
+          10964,
+          10702,
+          11504,
+          8388,
+          14482,
+          11209
+        ],
+        "n": 112059
+      },
+      "satisfaction_3m_ago": {
+        "bin_edges": [
+          0.0,
+          0.8184000000000087,
+          5.5,
+          6.606,
+          7.25,
+          7.375,
+          7.587,
+          7.75,
+          8.0,
+          10.0
+        ],
+        "train_counts": [
+          22412,
+          11180,
+          11046,
+          8879,
+          13177,
+          11742,
+          3084,
+          19332,
+          11207
+        ],
+        "n": 112059
+      },
+      "item_2m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3.0,
+          6.0,
+          11.0,
+          17.0,
+          29.0,
+          53.0,
+          127.0,
+          692254.0
+        ],
+        "train_counts": [
+          18857,
+          10786,
+          12278,
+          13776,
+          10701,
+          11704,
+          11479,
+          11248,
+          11230
+        ],
+        "n": 112059
+      },
+      "revenue_2m_ago": {
+        "bin_edges": [
+          0.0,
+          26000.0,
+          87048.0,
+          169344.0,
+          294417.0,
+          501917.00000000006,
+          894448.0000000001,
+          1774985.6000000003,
+          4765537.799999995,
+          68080670728.0
+        ],
+        "train_counts": [
+          22406,
+          11211,
+          11200,
+          11212,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_2m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          9915.0
+        ],
+        "train_counts": [
+          94317,
+          17742
+        ],
+        "n": 112059
+      },
+      "delay_2m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3.0,
+          9.0,
+          76522.0
+        ],
+        "train_counts": [
+          64740,
+          23003,
+          13065,
+          11251
+        ],
+        "n": 112059
+      },
+      "nodone_2m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          4.0,
+          47771.0
+        ],
+        "train_counts": [
+          79365,
+          20434,
+          12260
+        ],
+        "n": 112059
+      },
+      "order_score_2m_ago": {
+        "bin_edges": [
+          0.0,
+          9.0,
+          10.042,
+          10.4,
+          10.6,
+          10.75,
+          10.875,
+          11.0,
+          11.039,
+          12.0
+        ],
+        "train_counts": [
+          22028,
+          11572,
+          10955,
+          11048,
+          11130,
+          11472,
+          7974,
+          14660,
+          11220
+        ],
+        "n": 112059
+      },
+      "satisfaction_2m_ago": {
+        "bin_edges": [
+          0.0,
+          3.18,
+          5.65,
+          6.661,
+          7.25,
+          7.375,
+          7.575,
+          7.75,
+          7.967,
+          10.0
+        ],
+        "train_counts": [
+          22409,
+          11150,
+          11148,
+          8298,
+          13801,
+          11352,
+          3537,
+          19155,
+          11209
+        ],
+        "n": 112059
+      },
+      "item_1m_ago": {
+        "bin_edges": [
+          0.0,
+          2.0,
+          5.0,
+          9.0,
+          14.0,
+          22.0,
+          36.0,
+          64.0,
+          155.0,
+          789258.0
+        ],
+        "train_counts": [
+          18947,
+          13262,
+          12609,
+          10858,
+          11362,
+          11360,
+          11063,
+          11390,
+          11208
+        ],
+        "n": 112059
+      },
+      "revenue_1m_ago": {
+        "bin_edges": [
+          0.0,
+          54969.60000000001,
+          129600.0,
+          233586.2000000001,
+          390811.0,
+          649232.4,
+          1140270.6,
+          2239853.8000000003,
+          6073631.999999999,
+          80106879123.0
+        ],
+        "train_counts": [
+          22412,
+          11176,
+          11236,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_1m_ago": {
+        "bin_edges": [
+          0.0,
+          2.0,
+          5372.0
+        ],
+        "train_counts": [
+          100527,
+          11532
+        ],
+        "n": 112059
+      },
+      "delay_1m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          4.0,
+          12.0,
+          102169.0
+        ],
+        "train_counts": [
+          55309,
+          17308,
+          14178,
+          13733,
+          11531
+        ],
+        "n": 112059
+      },
+      "nodone_1m_ago": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          6.0,
+          60164.0
+        ],
+        "train_counts": [
+          70197,
+          15574,
+          14705,
+          11583
+        ],
+        "n": 112059
+      },
+      "order_score_1m_ago": {
+        "bin_edges": [
+          0.0,
+          9.592,
+          10.08,
+          10.354,
+          10.528,
+          10.67,
+          10.81,
+          10.977,
+          11.0,
+          12.0
+        ],
+        "train_counts": [
+          22410,
+          11201,
+          11209,
+          11203,
+          11182,
+          11196,
+          11234,
+          356,
+          22068
+        ],
+        "n": 112059
+      },
+      "satisfaction_1m_ago": {
+        "bin_edges": [
+          0.0,
+          4.393,
+          5.848,
+          6.617,
+          7.25,
+          7.327,
+          7.5,
+          7.75,
+          7.944,
+          10.0
+        ],
+        "train_counts": [
+          22361,
+          11254,
+          11208,
+          11155,
+          11256,
+          11180,
+          5541,
+          16893,
+          11211
+        ],
+        "n": 112059
+      },
+      "item_last": {
+        "bin_edges": [
+          1.0,
+          2.0,
+          3.0,
+          6.0,
+          9.0,
+          15.0,
+          23.0,
+          38.0,
+          68.0,
+          161.0,
+          839278.0
+        ],
+        "train_counts": [
+          10714,
+          7304,
+          14406,
+          9893,
+          13360,
+          10774,
+          11714,
+          11285,
+          11351,
+          11258
+        ],
+        "n": 112059
+      },
+      "revenue_last": {
+        "bin_edges": [
+          0.0,
+          41580.0,
+          92988.0,
+          168067.60000000006,
+          278928.80000000016,
+          451138.0,
+          732381.4,
+          1267392.8,
+          2465452.6,
+          6538393.6,
+          90554890936.0
+        ],
+        "train_counts": [
+          11189,
+          11216,
+          11213,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_last": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          5590.0
+        ],
+        "train_counts": [
+          88862,
+          10017,
+          13180
+        ],
+        "n": 112059
+      },
+      "delay_last": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          5.0,
+          14.0,
+          133129.0
+        ],
+        "train_counts": [
+          51392,
+          18701,
+          18227,
+          12185,
+          11554
+        ],
+        "n": 112059
+      },
+      "nodone_last": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3.0,
+          7.0,
+          81299.0
+        ],
+        "train_counts": [
+          65346,
+          24247,
+          10302,
+          12164
+        ],
+        "n": 112059
+      },
+      "order_score_last": {
+        "bin_edges": [
+          0.0,
+          9.304,
+          9.903,
+          10.115,
+          10.333,
+          10.5,
+          10.667,
+          10.8,
+          11.0,
+          12.0
+        ],
+        "train_counts": [
+          11202,
+          11201,
+          11208,
+          9877,
+          9713,
+          13307,
+          11091,
+          11279,
+          23181
+        ],
+        "n": 112059
+      },
+      "satisfaction_last": {
+        "bin_edges": [
+          0.0,
+          3.954,
+          5.499600000000002,
+          6.339,
+          6.962,
+          7.26,
+          7.38,
+          7.72,
+          7.75,
+          7.915,
+          10.0
+        ],
+        "train_counts": [
+          11205,
+          11207,
+          11198,
+          11195,
+          10540,
+          11835,
+          11258,
+          358,
+          22050,
+          11213
+        ],
+        "n": 112059
+      },
+      "item_sum": {
+        "bin_edges": [
+          1.0,
+          13.0,
+          33.0,
+          60.0,
+          97.0,
+          152.0,
+          235.0,
+          383.0,
+          675.0,
+          1590.0,
+          6826762.0
+        ],
+        "train_counts": [
+          10717,
+          11358,
+          11399,
+          11129,
+          11425,
+          11160,
+          11192,
+          11242,
+          11229,
+          11208
+        ],
+        "n": 112059
+      },
+      "item_avg": {
+        "bin_edges": [
+          1.0,
+          2.5833333333333335,
+          4.555555555555555,
+          7.166666666666667,
+          10.76923076923077,
+          16.0,
+          24.0,
+          37.76923076923077,
+          65.76923076923077,
+          153.0,
+          525135.5384615385
+        ],
+        "train_counts": [
+          11145,
+          11246,
+          11219,
+          11127,
+          11282,
+          11110,
+          11309,
+          11204,
+          11207,
+          11210
+        ],
+        "n": 112059
+      },
+      "item_std": {
+        "bin_edges": [
+          0.0,
+          0.8624393618641034,
+          2.0548046676563256,
+          3.281650616569468,
+          4.809999446419533,
+          7.045078856526345,
+          10.565098285162705,
+          16.72335936017018,
+          29.80932997866255,
+          70.80701332562103,
+          173426.61946666
+        ],
+        "train_counts": [
+          11192,
+          11198,
+          11221,
+          11212,
+          11198,
+          11211,
+          11209,
+          11206,
+          11205,
+          11207
+        ],
+        "n": 112059
+      },
+      "item_min_month": {
+        "bin_edges": [
+          2501.0,
+          2503.0,
+          2505.0,
+          2507.0,
+          2508.0,
+          2510.0,
+          2511.0,
+          2512.0,
+          2601.0
+        ],
+        "train_counts": [
+          19660,
+          10795,
+          12341,
+          7904,
+          16212,
+          7304,
+          10124,
+          27719
+        ],
+        "n": 112059
+      },
+      "item_max_month": {
+        "bin_edges": [
+          2501.0,
+          2502.0,
+          2504.0,
+          2506.0,
+          2508.0,
+          2510.0,
+          2511.0,
+          2512.0,
+          2601.0
+        ],
+        "train_counts": [
+          6195,
+          12966,
+          10551,
+          10928,
+          12198,
+          8532,
+          7469,
+          43220
+        ],
+        "n": 112059
+      },
+      "item_median": {
+        "bin_edges": [
+          1.0,
+          2.0,
+          4.0,
+          6.0,
+          9.0,
+          14.0,
+          21.0,
+          33.0,
+          58.0,
+          136.0,
+          482834.0
+        ],
+        "train_counts": [
+          7077,
+          14118,
+          10511,
+          11294,
+          12964,
+          11081,
+          11147,
+          11449,
+          11138,
+          11280
+        ],
+        "n": 112059
+      },
+      "revenue_sum": {
+        "bin_edges": [
+          0.0,
+          403807.2,
+          993293.8000000003,
+          1785110.0,
+          2942599.400000001,
+          4707806.0,
+          7552907.600000002,
+          12798307.400000004,
+          24326516.800000012,
+          61742746.39999997,
+          1064345310384.0
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11205,
+          11207,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "revenue_avg": {
+        "bin_edges": [
+          0.0,
+          72107.86,
+          131411.42857142858,
+          211523.22307692308,
+          325657.00769230776,
+          498656.76923076925,
+          783918.8153846154,
+          1311382.7538461538,
+          2465801.8615384623,
+          6307194.019230769,
+          81872716183.38461
+        ],
+        "train_counts": [
+          11206,
+          11205,
+          11207,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "revenue_std": {
+        "bin_edges": [
+          0.0,
+          25330.565178518,
+          61601.08190493601,
+          103106.467384904,
+          160467.891179208,
+          247888.47941131,
+          391560.17645621416,
+          654684.212886184,
+          1253736.0786000006,
+          3356902.14266,
+          53768335952.0
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11206,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "revenue_min_month": {
+        "bin_edges": [
+          2501.0,
+          2502.0,
+          2503.0,
+          2505.0,
+          2507.0,
+          2508.0,
+          2509.0,
+          2511.0,
+          2512.0,
+          2601.0
+        ],
+        "train_counts": [
+          10941,
+          8528,
+          11336,
+          12671,
+          8037,
+          7423,
+          15981,
+          10005,
+          27137
+        ],
+        "n": 112059
+      },
+      "revenue_max_month": {
+        "bin_edges": [
+          2501.0,
+          2502.0,
+          2504.0,
+          2506.0,
+          2508.0,
+          2510.0,
+          2511.0,
+          2512.0,
+          2601.0
+        ],
+        "train_counts": [
+          6386,
+          11784,
+          10429,
+          10920,
+          12719,
+          8614,
+          8006,
+          43201
+        ],
+        "n": 112059
+      },
+      "revenue_median": {
+        "bin_edges": [
+          0.0,
+          56483.3,
+          104328.0,
+          168391.50000000003,
+          260563.60000000006,
+          400680.0,
+          635645.8000000002,
+          1066534.2000000004,
+          2023186.000000001,
+          5245154.799999999,
+          68080670728.0
+        ],
+        "train_counts": [
+          11206,
+          11196,
+          11216,
+          11206,
+          11202,
+          11209,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_sum": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          5.0,
+          14.0,
+          47889.0
+        ],
+        "train_counts": [
+          55679,
+          15498,
+          16840,
+          12301,
+          11741
+        ],
+        "n": 112059
+      },
+      "complaint_avg": {
+        "bin_edges": [
+          0.0,
+          0.07692307692307693,
+          0.125,
+          0.23076923076923078,
+          0.5384615384615384,
+          1.6153846153846154,
+          3683.769230769231
+        ],
+        "train_counts": [
+          55679,
+          11195,
+          8499,
+          13694,
+          11766,
+          11226
+        ],
+        "n": 112059
+      },
+      "complaint_std": {
+        "bin_edges": [
+          0.0,
+          0.3,
+          0.46153846153846156,
+          0.7457969011409737,
+          1.5907898179514348,
+          2596.76133747154
+        ],
+        "train_counts": [
+          67151,
+          11232,
+          10808,
+          11659,
+          11209
+        ],
+        "n": 112059
+      },
+      "complaint_min_month": {
+        "bin_edges": [
+          2501.0,
+          2502.0,
+          2504.0,
+          2506.0,
+          2508.0,
+          2509.0,
+          2510.0,
+          2512.0,
+          2601.0
+        ],
+        "train_counts": [
+          7094,
+          11342,
+          11844,
+          12417,
+          8128,
+          8306,
+          18174,
+          34754
+        ],
+        "n": 112059
+      },
+      "complaint_max_month": {
+        "bin_edges": [
+          2501.0,
+          2502.0,
+          2505.0,
+          2507.0,
+          2508.0,
+          2510.0,
+          2511.0,
+          2512.0,
+          2601.0
+        ],
+        "train_counts": [
+          6460,
+          15619,
+          9940,
+          6435,
+          17092,
+          8548,
+          9271,
+          38694
+        ],
+        "n": 112059
+      },
+      "complaint_median": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3832.0
+        ],
+        "train_counts": [
+          96304,
+          15755
+        ],
+        "n": 112059
+      },
+      "complaint_diversity": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          13.0
+        ],
+        "train_counts": [
+          93330,
+          18729
+        ],
+        "n": 112059
+      },
+      "most_common_complaint": {
+        "bin_edges": [
+          114.0,
+          115.0,
+          116.0,
+          134.0,
+          214.0,
+          654.0
+        ],
+        "train_counts": [
+          869,
+          7448,
+          5468,
+          2653,
+          2291
+        ],
+        "n": 18729
+      },
+      "weight_sum": {
+        "bin_edges": [
+          0.001,
+          2.8968000000000007,
+          9.518200000000004,
+          21.417200000000005,
+          41.625,
+          79.442,
+          154.79980000000003,
+          326.23040000000015,
+          777.6120000000003,
+          2604.910999999999,
+          10072730.613
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "weight_avg": {
+        "bin_edges": [
+          0.001,
+          0.47746153846153866,
+          1.1972769230769233,
+          2.443669230769231,
+          4.544720512820513,
+          8.482307692307693,
+          16.40996923076923,
+          35.10733076923077,
+          86.0598365384616,
+          289.9143076923077,
+          774825.4317692308
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11206,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "weight_std": {
+        "bin_edges": [
+          0.0,
+          0.1691621837788175,
+          0.6350991733555897,
+          1.4592640571583009,
+          2.8785787305363257,
+          5.364170179624835,
+          10.151667802720793,
+          20.754477215999977,
+          48.49066219709798,
+          151.59441293627754,
+          444330.33688682
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11206,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "avg_revenue_per_item": {
+        "bin_edges": [
+          0.0,
+          13309.85054945055,
+          16809.85068825911,
+          20184.100124754947,
+          23535.413238231475,
+          27429.678994760136,
+          32275.787486033518,
+          40251.046511627916,
+          54908.02784851241,
+          96960.74999999999,
+          407674298.8363636
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11206,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "avg_weight_per_item": {
+        "bin_edges": [
+          0.001,
+          0.041415321439180815,
+          0.07474989491382936,
+          0.1320441907867917,
+          0.2494330749354006,
+          0.5229683544303798,
+          1.014059552269744,
+          1.993395833333334,
+          4.079377612721683,
+          8.287675324675325,
+          230.6
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11206,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "pct_delay": {
+        "bin_edges": [
+          0.0,
+          0.015625,
+          0.026595744680851064,
+          0.037142857142857144,
+          0.05,
+          0.06451612903225806,
+          0.08386524780437822,
+          0.1111111111111111,
+          0.16666666666666666,
+          1.0
+        ],
+        "train_counts": [
+          22406,
+          11202,
+          11214,
+          11117,
+          11121,
+          11381,
+          10665,
+          11676,
+          11277
+        ],
+        "n": 112059
+      },
+      "pct_refund": {
+        "bin_edges": [
+          0.0,
+          0.002770083102493075,
+          0.007692307692307693,
+          0.013347022587268994,
+          0.02142857142857143,
+          0.03502814102121573,
+          0.06425529331147484,
+          1.0
+        ],
+        "train_counts": [
+          44821,
+          11147,
+          11266,
+          11187,
+          11226,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "pct_noaccepted": {
+        "bin_edges": [
+          -1e-06,
+          1.000001
+        ],
+        "train_counts": [
+          112059
+        ],
+        "n": 112059
+      },
+      "pct_lost_order": {
+        "bin_edges": [
+          -1e-06,
+          0.250001
+        ],
+        "train_counts": [
+          112059
+        ],
+        "n": 112059
+      },
+      "pct_complaint": {
+        "bin_edges": [
+          0.0,
+          0.00020868113522537563,
+          0.0042471862869922486,
+          0.01006922363540011,
+          0.020225123728247876,
+          0.04411764705882353,
+          6.0
+        ],
+        "train_counts": [
+          56029,
+          11206,
+          11206,
+          11206,
+          11203,
+          11209
+        ],
+        "n": 112059
+      },
+      "pct_complaint_per_item": {
+        "bin_edges": [
+          0.0,
+          0.07692307692307693,
+          0.09090909090909091,
+          0.2,
+          0.36363636363636365,
+          0.6666666666666666,
+          1.0
+        ],
+        "train_counts": [
+          55679,
+          10716,
+          11566,
+          11604,
+          10853,
+          11641
+        ],
+        "n": 112059
+      },
+      "pct_successful_item": {
+        "bin_edges": [
+          0.0,
+          0.9166112282640785,
+          0.9495432131307742,
+          0.9655172413793104,
+          0.975609756097561,
+          0.9827018121911038,
+          0.9884714021595522,
+          0.9940828402366864,
+          1.0
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          10992,
+          11351,
+          11274,
+          11206,
+          11193,
+          33631
+        ],
+        "n": 112059
+      },
+      "pct_intra_province": {
+        "bin_edges": [
+          0.0,
+          0.017045454545454544,
+          0.04878048780487805,
+          0.0967741935483871,
+          0.16666666666666666,
+          0.2624962178517399,
+          0.375,
+          0.5147058823529411,
+          0.72,
+          1.0
+        ],
+        "train_counts": [
+          22408,
+          11200,
+          11190,
+          11072,
+          11365,
+          11043,
+          11365,
+          11200,
+          11216
+        ],
+        "n": 112059
+      },
+      "pct_international": {
+        "bin_edges": [
+          -1e-06,
+          1.000001
+        ],
+        "train_counts": [
+          112059
+        ],
+        "n": 112059
+      },
+      "avg_delayday": {
+        "bin_edges": [
+          0.0,
+          2.0,
+          4.0,
+          7.0,
+          10.666666666666666,
+          15.153846153846153,
+          22.0,
+          35.81818181818182,
+          91.5,
+          241705.0
+        ],
+        "train_counts": [
+          22188,
+          10809,
+          11331,
+          11669,
+          11234,
+          11157,
+          11258,
+          11203,
+          11210
+        ],
+        "n": 112059
+      },
+      "order_score_avg": {
+        "bin_edges": [
+          0.0,
+          9.862,
+          10.190333333333333,
+          10.373857692307693,
+          10.5,
+          10.604461538461539,
+          10.692984615384614,
+          10.77491748251748,
+          10.8605,
+          10.99323076923077,
+          12.0
+        ],
+        "train_counts": [
+          11205,
+          11203,
+          11210,
+          10590,
+          11821,
+          11206,
+          11206,
+          11204,
+          11206,
+          11208
+        ],
+        "n": 112059
+      },
+      "order_score_std": {
+        "bin_edges": [
+          0.0,
+          0.10822582235379008,
+          0.17661298205374232,
+          0.2274218779823936,
+          0.2789640837073547,
+          0.33502459505227483,
+          0.40052571813335447,
+          0.4847950045624634,
+          0.6231293175673892,
+          0.9228106436848231,
+          6.0
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11206,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "order_min_month": {
+        "bin_edges": [
+          2501.0,
+          2502.0,
+          2504.0,
+          2507.0,
+          2509.0,
+          2510.0,
+          2512.0,
+          2601.0
+        ],
+        "train_counts": [
+          9881,
+          8924,
+          11698,
+          13348,
+          8205,
+          14572,
+          45431
+        ],
+        "n": 112059
+      },
+      "order_max_month": {
+        "bin_edges": [
+          2501.0,
+          2503.0,
+          2505.0,
+          2506.0,
+          2507.0,
+          2508.0,
+          2510.0,
+          2511.0,
+          2512.0,
+          2601.0
+        ],
+        "train_counts": [
+          9255,
+          12017,
+          8520,
+          10436,
+          10269,
+          15199,
+          10352,
+          11230,
+          24781
+        ],
+        "n": 112059
+      },
+      "satisfaction_avg": {
+        "bin_edges": [
+          0.0,
+          5.398000000000001,
+          6.1348276923076925,
+          6.535,
+          6.808000000000001,
+          7.02823076923077,
+          7.221902564102564,
+          7.39614945054945,
+          7.587090909090909,
+          7.770769230769231,
+          10.0
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11203,
+          11208,
+          11206,
+          11206,
+          11206,
+          11205,
+          11206,
+          11207
+        ],
+        "n": 112059
+      },
+      "satisfaction_std": {
+        "bin_edges": [
+          0.0,
+          0.18633899812498247,
+          0.35768450157407244,
+          0.5083244067473828,
+          0.636106483208952,
+          0.7786055126819348,
+          0.953998062337425,
+          1.1827187844361169,
+          1.4962573861738258,
+          1.9827689826853265,
+          4.5
+        ],
+        "train_counts": [
+          11145,
+          11267,
+          11206,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "satisfaction_min_month": {
+        "bin_edges": [
+          2501.0,
+          2502.0,
+          2504.0,
+          2507.0,
+          2508.0,
+          2509.0,
+          2511.0,
+          2512.0,
+          2601.0
+        ],
+        "train_counts": [
+          8534,
+          9619,
+          14986,
+          5644,
+          10350,
+          16481,
+          8973,
+          37472
+        ],
+        "n": 112059
+      },
+      "satisfaction_max_month": {
+        "bin_edges": [
+          2501.0,
+          2503.0,
+          2504.0,
+          2506.0,
+          2507.0,
+          2509.0,
+          2510.0,
+          2511.0,
+          2512.0,
+          2601.0
+        ],
+        "train_counts": [
+          10935,
+          7275,
+          13491,
+          8572,
+          15146,
+          7379,
+          10113,
+          10280,
+          28868
+        ],
+        "n": 112059
+      },
+      "active_months": {
+        "bin_edges": [
+          1.0,
+          3.0,
+          5.0,
+          7.0,
+          10.0,
+          12.0,
+          13.0
+        ],
+        "train_counts": [
+          10868,
+          8623,
+          9446,
+          14117,
+          9599,
+          59406
+        ],
+        "n": 112059
+      },
+      "inactive_months": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3.0,
+          6.0,
+          8.0,
+          10.0,
+          12.0
+        ],
+        "train_counts": [
+          51890,
+          12860,
+          12288,
+          11323,
+          8582,
+          15116
+        ],
+        "n": 112059
+      },
+      "active_days": {
+        "bin_edges": [
+          0.0,
+          7.0,
+          17.0,
+          29.0,
+          43.0,
+          61.0,
+          83.0,
+          112.0,
+          153.0,
+          215.0,
+          388.0
+        ],
+        "train_counts": [
+          10945,
+          11193,
+          11083,
+          11021,
+          11498,
+          11280,
+          11222,
+          11258,
+          11288,
+          11271
+        ],
+        "n": 112059
+      },
+      "inactive_days": {
+        "bin_edges": [
+          8.0,
+          180.0,
+          242.0,
+          283.0,
+          312.0,
+          334.0,
+          352.0,
+          366.0,
+          378.0,
+          389.0,
+          395.0
+        ],
+        "train_counts": [
+          11006,
+          11112,
+          11031,
+          10937,
+          11079,
+          11292,
+          10699,
+          10768,
+          11978,
+          11235
+        ],
+        "n": 111137
+      },
+      "avg_noservice_days": {
+        "bin_edges": [
+          0.5714285714285714,
+          12.857142857142858,
+          17.285714285714285,
+          20.214285714285715,
+          22.285714285714285,
+          23.857142857142858,
+          25.142857142857142,
+          26.142857142857142,
+          27.0,
+          27.785714285714285,
+          28.214285714285715
+        ],
+        "train_counts": [
+          11006,
+          11112,
+          11031,
+          10937,
+          11079,
+          11292,
+          10699,
+          10768,
+          11978,
+          11235
+        ],
+        "n": 111137
+      },
+      "max_consecutive_inactive": {
+        "bin_edges": [
+          -1e-06,
+          1e-06
+        ],
+        "train_counts": [
+          112059
+        ],
+        "n": 112059
+      },
+      "avg_lastday": {
+        "bin_edges": [
+          1.0,
+          19.0,
+          21.923076923076923,
+          23.857142857142858,
+          25.384615384615383,
+          26.615384615384617,
+          27.545454545454547,
+          28.333333333333332,
+          29.0,
+          29.46153846153846,
+          31.0
+        ],
+        "train_counts": [
+          10693,
+          11642,
+          11258,
+          10895,
+          11328,
+          11406,
+          11152,
+          10997,
+          11032,
+          11656
+        ],
+        "n": 112059
+      },
+      "item_slope": {
+        "bin_edges": [
+          -0.014707274426813735,
+          -1.119378745225247e-06,
+          -2.7397459504297025e-07,
+          -7.65327813065842e-08,
+          0.0,
+          3.208287133998604e-08,
+          1.3813920024724005e-07,
+          3.5049791850004335e-07,
+          8.254545694523696e-07,
+          2.498797487671491e-06,
+          0.026190636200716846
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11206,
+          10264,
+          12147,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "revenue_slope": {
+        "bin_edges": [
+          -2941.8328835042994,
+          -0.03889662685242743,
+          -0.008808782302819434,
+          -0.002187353662187742,
+          0.0,
+          0.0012005643128500173,
+          0.004636216875963059,
+          0.011722457947090542,
+          0.02998981544508834,
+          0.10441186456550447,
+          2570.8256831028193
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11206,
+          9474,
+          12937,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "satisfy_slope": {
+        "bin_edges": [
+          -3.360215053763441e-06,
+          -8.292241138616318e-08,
+          -4.1123041876946214e-08,
+          -2.255819561793215e-08,
+          -1.0511393237907396e-08,
+          -1.3549018918451489e-09,
+          1.2338352807165626e-09,
+          1.1086306168876543e-08,
+          2.6464168157433006e-08,
+          6.111885447872906e-08,
+          2.8935185185185184e-06
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11206,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "complaint_slope": {
+        "bin_edges": [
+          -0.00028991998089095903,
+          -1.721294478249318e-08,
+          -1.5620104962653302e-09,
+          0.0,
+          1.033847109433144e-08,
+          3.708054487635863e-08,
+          0.0006866039426523297
+        ],
+        "train_counts": [
+          11201,
+          11209,
+          1607,
+          65627,
+          11202,
+          11213
+        ],
+        "n": 112059
+      },
+      "cv_item": {
+        "bin_edges": [
+          0.0,
+          0.1767766952966369,
+          0.2791783043135497,
+          0.3456272395946107,
+          0.408248290463863,
+          0.4714045207910316,
+          0.5359346989248932,
+          0.6118639933850385,
+          0.7147143058265062,
+          0.9008808628781717,
+          3.364832050490869
+        ],
+        "train_counts": [
+          11186,
+          11226,
+          11206,
+          11116,
+          11268,
+          11231,
+          11205,
+          11209,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "cv_revenue": {
+        "bin_edges": [
+          0.0,
+          0.20108244614890694,
+          0.3164601388828685,
+          0.3962101602818462,
+          0.46730425792740327,
+          0.5371760015809729,
+          0.6135209156576579,
+          0.7041210013106989,
+          0.8311058732959122,
+          1.0565669029063707,
+          3.4641016151384623
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11206,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "item_range": {
+        "bin_edges": [
+          0.0,
+          2.0,
+          6.0,
+          10.0,
+          16.0,
+          23.0,
+          35.0,
+          55.0,
+          97.0,
+          229.0,
+          630042.0
+        ],
+        "train_counts": [
+          9492,
+          10985,
+          10971,
+          13202,
+          10705,
+          11719,
+          11222,
+          11192,
+          11338,
+          11233
+        ],
+        "n": 112059
+      },
+      "revenue_range": {
+        "bin_edges": [
+          0.0,
+          69568.80000000002,
+          190468.40000000002,
+          328860.0,
+          519321.8000000001,
+          805572.0,
+          1284937.8000000003,
+          2145781.600000001,
+          4097046.0000000005,
+          10954843.2,
+          221470900850.0
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11204,
+          11208,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "service_types_used": {
+        "bin_edges": [
+          1.0,
+          2.0,
+          3.0,
+          5.0
+        ],
+        "train_counts": [
+          52512,
+          48206,
+          11341
+        ],
+        "n": 112059
+      },
+      "dominant_service_ratio": {
+        "bin_edges": [
+          0.32653061224489793,
+          0.6951219512195121,
+          0.8606026121815595,
+          0.947933895276621,
+          0.9836065573770492,
+          0.9974457215836526,
+          1.0
+        ],
+        "train_counts": [
+          11205,
+          11207,
+          11206,
+          11185,
+          11224,
+          56032
+        ],
+        "n": 112059
+      },
+      "ser_c_sum": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3.0,
+          15.0,
+          46.0,
+          124.0,
+          400.0,
+          2548390.0
+        ],
+        "train_counts": [
+          44761,
+          9454,
+          12830,
+          11332,
+          11213,
+          11256,
+          11213
+        ],
+        "n": 112059
+      },
+      "ser_e_sum": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3.0,
+          12.0,
+          34.0,
+          74.0,
+          143.0,
+          286.0,
+          710.1999999999971,
+          6826762.0
+        ],
+        "train_counts": [
+          21938,
+          10184,
+          12561,
+          11283,
+          11250,
+          11114,
+          11290,
+          11233,
+          11206
+        ],
+        "n": 112059
+      },
+      "ser_m_sum": {
+        "bin_edges": [
+          -1e-06,
+          76047.000001
+        ],
+        "train_counts": [
+          112059
+        ],
+        "n": 112059
+      },
+      "ser_p_sum": {
+        "bin_edges": [
+          -1e-06,
+          5727.000001
+        ],
+        "train_counts": [
+          112059
+        ],
+        "n": 112059
+      },
+      "ser_r_sum": {
+        "bin_edges": [
+          0.0,
+          19.0,
+          436523.0
+        ],
+        "train_counts": [
+          100791,
+          11268
+        ],
+        "n": 112059
+      },
+      "ser_u_sum": {
+        "bin_edges": [
+          -1e-06,
+          789.000001
+        ],
+        "train_counts": [
+          112059
+        ],
+        "n": 112059
+      },
+      "ser_l_sum": {
+        "bin_edges": [
+          -1e-06,
+          8868.000001
+        ],
+        "train_counts": [
+          112059
+        ],
+        "n": 112059
+      },
+      "ser_q_sum": {
+        "bin_edges": [
+          -1e-06,
+          1e-06
+        ],
+        "train_counts": [
+          112059
+        ],
+        "n": 112059
+      },
+      "recency": {
+        "bin_edges": [
+          0.0,
+          7.0,
+          8.0,
+          10.0,
+          12.0,
+          15.0,
+          17.0,
+          23.0,
+          393.0
+        ],
+        "train_counts": [
+          6357,
+          22518,
+          24846,
+          12019,
+          12629,
+          8948,
+          12307,
+          12435
+        ],
+        "n": 112059
+      },
+      "frequency": {
+        "bin_edges": [
+          1.0,
+          2.5833333333333335,
+          4.555555555555555,
+          7.166666666666667,
+          10.76923076923077,
+          16.0,
+          24.0,
+          37.76923076923077,
+          65.76923076923077,
+          153.0,
+          525135.5384615385
+        ],
+        "train_counts": [
+          11145,
+          11246,
+          11219,
+          11127,
+          11282,
+          11110,
+          11309,
+          11204,
+          11207,
+          11210
+        ],
+        "n": 112059
+      },
+      "monetary": {
+        "bin_edges": [
+          0.0,
+          72107.86,
+          131411.42857142858,
+          211523.22307692308,
+          325657.00769230776,
+          498656.76923076925,
+          783918.8153846154,
+          1311382.7538461538,
+          2465801.8615384623,
+          6307194.019230769,
+          81872716183.38461
+        ],
+        "train_counts": [
+          11206,
+          11205,
+          11207,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "is_corporate": {
+        "bin_edges": [
+          -1e-06,
+          1.000001
+        ],
+        "train_counts": [
+          112059
+        ],
+        "n": 112059
+      },
+      "contract_classify": {
+        "bin_edges": [
+          0.999999,
+          6.000001
+        ],
+        "train_counts": [
+          112059
+        ],
+        "n": 112059
+      },
+      "contract_service": {
+        "bin_edges": [
+          4.0,
+          62.0,
+          87.0
+        ],
+        "train_counts": [
+          5,
+          112054
+        ],
+        "n": 112059
+      },
+      "custype": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          2.0,
+          7.0,
+          16.0
+        ],
+        "train_counts": [
+          935,
+          64284,
+          35023,
+          11817
+        ],
+        "n": 112059
+      },
+      "tenure": {
+        "bin_edges": [
+          0.0,
+          4.0,
+          8.0,
+          10.0,
+          15.0,
+          27.0,
+          41.0,
+          57.0,
+          68.0,
+          24135.0
+        ],
+        "train_counts": [
+          7320,
+          14505,
+          10488,
+          10971,
+          22319,
+          12598,
+          10822,
+          11207,
+          11829
+        ],
+        "n": 112059
+      },
+      "contract_mgr_org": {
+        "bin_edges": [
+          0.0,
+          18.0,
+          29.0,
+          43.0,
+          46.0,
+          63.0,
+          72.0,
+          88.0,
+          2842.0,
+          563000.0,
+          961065.0
+        ],
+        "train_counts": [
+          7351,
+          8314,
+          9076,
+          7683,
+          10829,
+          8764,
+          9086,
+          9360,
+          8792,
+          8828
+        ],
+        "n": 88083
+      },
+      "cus_poscode": {
+        "bin_edges": [
+          36.0,
+          7911.0,
+          13906.0,
+          24106.0,
+          34663.0,
+          47706.0,
+          57210.0,
+          67506.0,
+          76116.0,
+          85806.0,
+          98912.0
+        ],
+        "train_counts": [
+          10541,
+          10537,
+          10556,
+          10547,
+          10546,
+          10539,
+          10550,
+          10546,
+          10523,
+          10574
+        ],
+        "n": 105459
+      },
+      "cus_province": {
+        "bin_edges": [
+          10.0,
+          25.0,
+          40.0,
+          53.0,
+          66.0,
+          70.0,
+          84.0,
+          97.0
+        ],
+        "train_counts": [
+          41873,
+          9841,
+          10936,
+          10924,
+          2885,
+          17968,
+          11032
+        ],
+        "n": 105459
+      },
+      "lifetime_total_items": {
+        "bin_edges": [
+          1.0,
+          18.0,
+          43.0,
+          75.0,
+          119.0,
+          183.0,
+          283.0,
+          456.0,
+          802.0,
+          1883.0,
+          8172375.0
+        ],
+        "train_counts": [
+          10671,
+          11663,
+          11233,
+          11152,
+          11165,
+          11332,
+          11197,
+          11212,
+          11227,
+          11207
+        ],
+        "n": 112059
+      },
+      "lifetime_total_revenue": {
+        "bin_edges": [
+          0.0,
+          554480.0,
+          1266805.8,
+          2236223.4000000004,
+          3621651.2,
+          5716766.0,
+          9165724.400000002,
+          15443808.000000004,
+          29240178.20000005,
+          74099028.59999996,
+          1320810057571.0
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11206,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "lifetime_total_weight": {
+        "bin_edges": [
+          0.001,
+          4.04,
+          12.085600000000003,
+          26.152,
+          50.426000000000016,
+          95.7,
+          185.08600000000007,
+          390.8390000000001,
+          935.3094000000001,
+          3121.7524,
+          11225294.066
+        ],
+        "train_counts": [
+          11205,
+          11207,
+          11205,
+          11207,
+          11203,
+          11208,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "lifetime_total_complaint": {
+        "bin_edges": [
+          0.0,
+          1.0,
+          3.0,
+          6.0,
+          17.0,
+          57885.0
+        ],
+        "train_counts": [
+          52479,
+          23941,
+          11954,
+          12031,
+          11654
+        ],
+        "n": 112059
+      },
+      "lifetime_avg_revenue_per_item": {
+        "bin_edges": [
+          0.0,
+          13525.4196,
+          17043.5056,
+          20439.0556,
+          23779.154199999997,
+          27705.425,
+          32498.0538,
+          40564.20520000001,
+          55449.04480000006,
+          97978.04639999999,
+          339777446.0
+        ],
+        "train_counts": [
+          11206,
+          11206,
+          11206,
+          11206,
+          11205,
+          11206,
+          11206,
+          11206,
+          11206,
+          11206
+        ],
+        "n": 112059
+      },
+      "lifetime_avg_weight_per_item": {
+        "bin_edges": [
+          0.001,
+          0.043,
+          0.077,
+          0.135,
+          0.253,
+          0.53,
+          1.021,
+          2.007,
+          4.085,
+          8.267,
+          230.0
+        ],
+        "train_counts": [
+          11183,
+          11208,
+          11107,
+          11285,
+          11238,
+          11213,
+          11199,
+          11211,
+          11205,
+          11210
+        ],
+        "n": 112059
+      },
+      "lifetime_months_active": {
+        "bin_edges": [
+          1.0,
+          4.0,
+          7.0,
+          10.0,
+          12.0,
+          14.0,
+          15.0,
+          16.0
+        ],
+        "train_counts": [
+          7287,
+          12156,
+          13680,
+          9818,
+          9746,
+          6389,
+          52983
+        ],
+        "n": 112059
+      },
+      "lifetime_days_active": {
+        "bin_edges": [
+          1.0,
+          11.0,
+          23.0,
+          37.0,
+          53.0,
+          73.0,
+          97.0,
+          130.0,
+          177.0,
+          247.0,
+          456.0
+        ],
+        "train_counts": [
+          11115,
+          11189,
+          11211,
+          11042,
+          11378,
+          10925,
+          11407,
+          11375,
+          11178,
+          11239
+        ],
+        "n": 112059
+      },
+      "lifetime_pct_delay": {
+        "bin_edges": [
+          0.0,
+          0.019,
+          0.029,
+          0.041,
+          0.053,
+          0.068,
+          0.087,
+          0.114,
+          0.167,
+          1.0
+        ],
+        "train_counts": [
+          21863,
+          10609,
+          12307,
+          10641,
+          11496,
+          11157,
+          11350,
+          11382,
+          11254
+        ],
+        "n": 112059
+      },
+      "lifetime_pct_refund": {
+        "bin_edges": [
+          0.0,
+          0.004,
+          0.009,
+          0.014,
+          0.022,
+          0.035,
+          0.063,
+          1.0
+        ],
+        "train_counts": [
+          43275,
+          12451,
+          10431,
+          11729,
+          11443,
+          11258,
+          11472
+        ],
+        "n": 112059
+      },
+      "lifetime_pct_noaccepted": {
+        "bin_edges": [
+          -1e-06,
+          1.000001
+        ],
+        "train_counts": [
+          112059
+        ],
+        "n": 112059
+      },
+      "lifetime_pct_lost_order": {
+        "bin_edges": [
+          -1e-06,
+          0.250001
+        ],
+        "train_counts": [
+          112059
+        ],
+        "n": 112059
+      },
+      "lifetime_pct_complaint": {
+        "bin_edges": [
+          0.0,
+          0.001,
+          0.005,
+          0.011,
+          0.021,
+          0.044,
+          6.0
+        ],
+        "train_counts": [
+          53851,
+          12159,
+          11979,
+          11362,
+          11342,
+          11366
+        ],
+        "n": 112059
+      },
+      "lifetime_pct_complaint_per_item": {
+        "bin_edges": [
+          0.0,
+          0.001,
+          0.004,
+          0.009,
+          0.017,
+          0.037,
+          1.0
+        ],
+        "train_counts": [
+          55287,
+          11383,
+          11609,
+          10554,
+          11747,
+          11479
+        ],
+        "n": 112059
+      },
+      "lifetime_pct_successful_item": {
+        "bin_edges": [
+          0.0,
+          0.9,
+          0.935,
+          0.952,
+          0.964,
+          0.972,
+          0.979,
+          0.985,
+          0.992,
+          1.0
+        ],
+        "train_counts": [
+          11038,
+          11244,
+          10441,
+          11850,
+          10979,
+          11663,
+          11010,
+          10904,
+          22930
+        ],
+        "n": 112059
+      },
+      "lifetime_avg_delayday": {
+        "bin_edges": [
+          0.0,
+          2.286,
+          4.6,
+          7.5,
+          10.75,
+          15.0,
+          21.125,
+          34.467,
+          87.273,
+          268102.438
+        ],
+        "train_counts": [
+          22398,
+          11112,
+          11229,
+          11209,
+          11238,
+          11248,
+          11212,
+          11206,
+          11207
+        ],
+        "n": 112059
+      },
+      "lifetime_avg_order_score": {
+        "bin_edges": [
+          0.0,
+          9.511,
+          9.917,
+          10.135,
+          10.291,
+          10.418,
+          10.527,
+          10.628,
+          10.736,
+          10.881,
+          12.0
+        ],
+        "train_counts": [
+          11198,
+          11156,
+          11233,
+          11196,
+          11181,
+          11255,
+          11138,
+          11206,
+          11277,
+          11219
+        ],
+        "n": 112059
+      },
+      "lifetime_avg_satisfaction": {
+        "bin_edges": [
+          0.0,
+          5.285,
+          5.968,
+          6.354,
+          6.629,
+          6.847,
+          7.042,
+          7.232,
+          7.447,
+          7.737,
+          10.0
+        ],
+        "train_counts": [
+          11204,
+          11200,
+          11198,
+          11220,
+          11155,
+          11229,
+          11189,
+          11249,
+          11205,
+          11210
+        ],
+        "n": 112059
+      },
+      "lifetime_service_types_count": {
+        "bin_edges": [
+          1.0,
+          2.0,
+          3.0,
+          5.0
+        ],
+        "train_counts": [
+          49187,
+          50594,
+          12278
+        ],
+        "n": 112059
+      },
+      "lifetime_pct_international": {
+        "bin_edges": [
+          -1e-06,
+          1.000001
+        ],
+        "train_counts": [
+          112059
+        ],
+        "n": 112059
+      },
+      "lifetime_pct_intra_province": {
+        "bin_edges": [
+          0.0,
+          0.004,
+          0.009,
+          0.018,
+          0.034,
+          0.077,
+          1.0
+        ],
+        "train_counts": [
+          55986,
+          10993,
+          11451,
+          10877,
+          11298,
+          11454
+        ],
+        "n": 112059
+      },
+      "most_common_rec_province": {
+        "bin_edges": [
+          0.0,
+          12.0,
+          18.0,
+          27.0,
+          41.0,
+          53.0,
+          63.0,
+          71.0,
+          81.0,
+          86.0,
+          97.0
+        ],
+        "train_counts": [
+          5793,
+          15743,
+          11454,
+          11160,
+          11312,
+          10767,
+          9483,
+          13239,
+          11129,
+          11979
+        ],
+        "n": 112059
+      },
+      "most_common_rec_district": {
+        "bin_edges": [
+          0.0,
+          1340.0,
+          1635.0,
+          2568.0,
+          4023.0,
+          5233.0,
+          6327.0,
+          7130.0,
+          7580.0,
+          8537.0,
+          9745.0
+        ],
+        "train_counts": [
+          11026,
+          11262,
+          11265,
+          11148,
+          11281,
+          11203,
+          8406,
+          14049,
+          10811,
+          11608
+        ],
+        "n": 112059
+      },
+      "most_common_rec_commune": {
+        "bin_edges": [
+          0.0,
+          15261.0,
+          23641.0,
+          38204.0,
+          52183.0,
+          63615.0,
+          73190.0,
+          82488.0,
+          93133.60000000003,
+          360000.0,
+          973400.0
+        ],
+        "train_counts": [
+          11123,
+          11280,
+          11214,
+          11206,
+          11204,
+          11182,
+          11230,
+          11208,
+          11156,
+          11256
+        ],
+        "n": 112059
+      },
+      "ratio_item_last__lifetime_total_items": {
+        "bin_edges": [
+          1.1699190416023211e-05,
+          0.029661016949152543,
+          0.047619047619047616,
+          0.06146883506345368,
+          0.07329234407949474,
+          0.08629441624365482,
+          0.10313404704463212,
+          0.1282051282051282,
+          0.17307692307692307,
+          0.2857142857142857,
+          1.0
+        ],
+        "train_counts": [
+          11204,
+          11139,
+          11275,
+          11206,
+          11203,
+          11208,
+          11151,
+          11260,
+          11030,
+          11383
+        ],
+        "n": 112059
+      },
+      "ratio_revenue_last__lifetime_total_revenue": {
+        "bin_edges": [
+          0.0,
+          0.024815948924060433,
+          0.04294188005463692,
+          0.057547240770047484,
+          0.07064207693122142,
+          0.08450143336851915,
+          0.10216720995920485,
+          0.12785672006157844,
+          0.1734428722774424,
+          0.28537205155913437,
+          1.0
+        ],
+        "train_counts": [
+          11069,
+          11068,
+          11068,
+          11068,
+          11068,
+          11069,
+          11068,
+          11068,
+          11068,
+          11069
+        ],
+        "n": 110683
+      },
+      "ratio_complaint_last__lifetime_total_complaint": {
+        "bin_edges": [
+          0.0,
+          0.09424391577796047,
+          0.2,
+          0.46161577116350877,
+          1.0
+        ],
+        "train_counts": [
+          41706,
+          5567,
+          6349,
+          5958
+        ],
+        "n": 59580
+      },
+      "ratio_delay_last__lifetime_pct_delay_x_total_items": {
+        "bin_edges": [
+          0.0,
+          0.009227271388141016,
+          0.057524160147261846,
+          0.09315059858074208,
+          0.13774242672623402,
+          0.20068182675008284,
+          0.335345405767941,
+          1.3605442176870748
+        ],
+        "train_counts": [
+          40007,
+          10001,
+          10002,
+          10002,
+          10001,
+          9995,
+          10009
+        ],
+        "n": 100017
+      },
+      "ratio_nodone_last__lifetime_nodone_items": {
+        "bin_edges": [
+          0.0,
+          0.058648274573141555,
+          0.10088135327471691,
+          0.16650016650016727,
+          0.32862306933946694,
+          1.1764705882352626
+        ],
+        "train_counts": [
+          56161,
+          9360,
+          9359,
+          9351,
+          9371
+        ],
+        "n": 93602
+      },
+      "ratio_order_score_last__lifetime_avg_order_score": {
+        "bin_edges": [
+          0.0,
+          0.9337068160597571,
+          0.9690816797415781,
+          0.9868125585111287,
+          0.9992157936918566,
+          1.0067430581002554,
+          1.0163835884221517,
+          1.0274943310657596,
+          1.0429447852760736,
+          1.0727113107906234,
+          3.9442190669371193
+        ],
+        "train_counts": [
+          11201,
+          11201,
+          11202,
+          11201,
+          11201,
+          11201,
+          11200,
+          11200,
+          11203,
+          11202
+        ],
+        "n": 112012
+      }
+    },
+    "categorical": {
+      "dominant_service": {
+        "top": {
+          "E": 58821,
+          "C": 43692,
+          "R": 7655,
+          "M": 1854,
+          "L": 36,
+          "P": 1
+        },
+        "n": 112059
+      },
+      "contract_sig_first": {
+        "top": {
+          "2025-01-01": 12433,
+          "2026-01-01": 3258,
+          "2025-07-01": 3251,
+          "2020-01-01": 3243,
+          "2021-01-01": 3121,
+          "2025-12-01": 2239,
+          "2025-09-01": 1858,
+          "2025-08-01": 1779,
+          "2025-10-01": 1540,
+          "2025-02-01": 1173,
+          "2025-11-01": 1159,
+          "2024-01-01": 1126,
+          "2020-10-01": 1065,
+          "2025-03-01": 1030,
+          "2025-06-01": 953,
+          "2025-04-01": 926,
+          "2025-05-01": 896,
+          "2022-01-01": 833,
+          "2023-01-01": 622,
+          "2019-01-01": 571,
+          "2020-07-20": 562,
+          "2022-09-01": 525,
+          "2021-06-01": 509,
+          "2020-11-01": 498,
+          "2019-12-19": 440,
+          "2024-01-02": 433,
+          "2020-12-01": 417,
+          "2020-01-02": 381,
+          "2021-03-01": 361,
+          "2023-03-01": 348
+        },
+        "n": 112059
+      },
+      "lifetime_dominant_service": {
+        "top": {
+          "E": 59031,
+          "C": 43637,
+          "R": 7495,
+          "M": 1855,
+          "L": 40,
+          "P": 1
+        },
+        "n": 112059
+      },
+      "most_common_region": {
+        "top": {
+          "BAC": 30325,
+          "NOI_TINH": 25609,
+          "NAM": 22829,
+          "BAC_NAM": 11931,
+          "TRUNG_NAM": 4633,
+          "NOI_HN": 4206,
+          "NOI_HCM": 4088,
+          "BAC_TRUNG": 3592,
+          "TRUNG": 2258,
+          "HN_HCM": 1846,
+          "QUOC_TE": 742
+        },
+        "n": 112059
+      }
+    },
+    "n_bins": 10
+  }
+}

@@ -1,0 +1,285 @@
+
+from __future__ import annotations
+
+from pathlib import Path
+import traceback
+import pandas as pd
+
+from sqlalchemy.engine import Engine
+
+from infra.yymm import shift_yymm
+from infra.db import smoke_test
+from preprocess.feature_tables import max_window_end_for_k
+from preprocess.static_features import load_cus_lifetime
+from baseline.sweep import run_sweep_k
+from config_store.best_config import (
+    ensure_best_config_table,
+    load_latest_accepted_best_config,
+    load_previous_accepted_best_config,
+    upsert_best_config,
+)
+from scripts.train_main import main as _train_main_cli  # fallback
+from main_model.runner import run_main_variant
+from common.artifacts import save_bundle, load_bundle
+
+from export_risk_mode.runner import run_export_risk_mode
+
+from monitoring.ddl import ensure_monitoring_schema
+from monitoring.run_log import new_run_id, start_run, finish_run
+from monitoring.score import upsert_score_drift
+from monitoring.drift import compute_feature_drift, upsert_feature_drift
+from monitoring.backtest import run_backtest_precision_in_list
+
+
+def _train_main_inline(engine: Engine, *, horizon: int, bundle_dir: Path) -> dict:
+    """
+    Inline training (no subprocess). Trains both use_static variants (if allowed by cfg) and saves bundle.
+    Returns chosen report dict (same as scripts/train_main).
+    """
+    from config_store.best_config import load_latest_accepted_best_config as load_cfg
+    cfg = load_cfg(engine, horizon=int(horizon))
+    cfg = dict(cfg)
+    df_static = load_cus_lifetime(engine)
+    variants = [run_main_variant(engine, cfg, df_static, use_static_flag=False),
+                run_main_variant(engine, cfg, df_static, use_static_flag=True)]
+    ok = [v for v in variants if not v.get("guardrail_warning")]
+    if not ok:
+        raise RuntimeError("All variants failed guardrail. Stop training.")
+    ok.sort(key=lambda r: (r["F1_val"], r["AP_val"]), reverse=True)
+    best = ok[0]
+    if len(ok) == 2:
+        f1_gap = ok[0]["F1_val"] - ok[1]["F1_val"]
+        if abs(f1_gap) <= 0.002:
+            best = next((v for v in ok if v["use_static"] is False), best)
+
+    cfg["use_static"] = bool(best["use_static"])
+    meta = {
+        "cfg": cfg,
+        "main_report": best["report"],
+        "feat_cols": best.get("feat_cols"),
+        "cat_cols": best.get("cat_cols"),
+        "feature_name_map": best.get("feature_name_map"),
+        "feature_profile": best.get("feature_profile"),
+    }
+    save_bundle(bundle_dir, best["model"], metadata=meta)
+    return {"cfg": cfg, "main_report": best["report"]}
+
+
+from config.paths import CHURN_MODEL_DIR
+
+def run_monthly_pipeline(
+    engine: Engine,
+    *,
+    horizon: int,
+    risk_threshold_pct: int = 70,
+    bundle_dir: str | Path = CHURN_MODEL_DIR / "bundles/latest",
+    limit_rows_each: int | None = None,
+    k_min: int = 3,
+    f1_improve_eps: float = 1e-6,
+    do_backtest: bool = True,
+    do_feature_drift: bool = True,
+) -> dict:
+    """
+    FULL monthly pipeline (run once):
+      1) Sweep K (candidate)
+      2) Compare candidate F1 vs previous accepted F1
+         - accept if improved
+         - else keep previous accepted config/model
+      3) If accepted -> retrain main model + overwrite bundle
+      4) Score month (export_risk_mode) + save churned_now + dossier
+      5) Monitoring tables: score drift, feature drift (PSI), backtest
+
+    Returns a dict summary for logs.
+    """
+    ensure_best_config_table(engine)
+    ensure_monitoring_schema(engine)
+
+    run_id = new_run_id()
+
+    # previous accepted config (can be None)
+    prev_cfg = None
+    prev_f1 = None
+    prev_k = None
+    try:
+        prev_cfg = load_latest_accepted_best_config(engine, horizon=int(horizon))
+        prev_f1 = float(prev_cfg.get("metric_f1_val")) if prev_cfg.get("metric_f1_val") is not None else None
+        prev_k = int(prev_cfg.get("best_k")) if prev_cfg.get("best_k") is not None else None
+    except Exception:
+        prev_cfg = None
+
+    start_run(
+        engine,
+        run_id=run_id,
+        horizon=int(horizon),
+        risk_threshold_pct=int(risk_threshold_pct),
+        prev_best_k=prev_k,
+        prev_best_f1=prev_f1,
+        notes=f"smoke_test={smoke_test(engine)}",
+    )
+
+    did_retrain = False
+    did_score = False
+    t_current = None
+    cand_cfg = None
+    accepted = None
+
+    try:
+        # 1) Sweep K
+        cand_cfg, df_ab = run_sweep_k(
+            engine,
+            horizon=int(horizon),
+            limit_rows_each=limit_rows_each,
+            k_min=int(k_min),
+        )
+        cand_f1 = float(cand_cfg["metric_f1_val"])
+        cand_k = int(cand_cfg["best_k"])
+        t_current = int(cand_cfg["as_of_month"])
+
+        # 2) Decide accept
+        if prev_f1 is None:
+            accepted = True
+            rule = "accepted_no_prev"
+        else:
+            accepted = bool(cand_f1 > (prev_f1 + f1_improve_eps))
+            rule = "accepted_f1_improved" if accepted else "rejected_f1_not_improved"
+
+        cand_cfg["is_accepted"] = bool(accepted)
+        cand_cfg["prev_accepted_f1"] = prev_f1
+        cand_cfg["accept_rule"] = rule
+        cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime()
+
+        # Store candidate config (accepted or rejected)
+        upsert_best_config(engine, cand_cfg)
+
+        # Choose K/month for serving (if rejected -> keep previous accepted K)
+        best_k_for_scoring = int(cand_k) if accepted or prev_k is None else int(prev_k)
+        t_current = int(max_window_end_for_k(engine, best_k_for_scoring))
+
+        # 3) Retrain only if accepted
+        bundle_dir = Path(bundle_dir)
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+
+        if accepted:
+            _train_main_inline(engine, horizon=int(horizon), bundle_dir=bundle_dir)
+            did_retrain = True
+
+        # 4) Monthly scoring (always)
+        res = run_export_risk_mode(
+            engine,
+            horizon=int(horizon),
+            bundle_dir=bundle_dir,
+            risk_threshold=float(risk_threshold_pct),
+            t_current=int(t_current),
+            limit_rows=None,
+            make_dossier=True,
+        )
+        did_score = True
+
+        # 5) Monitoring
+        # Score drift
+        score_stats = res.get("score_stats") or {}
+        active_cnt = int(res.get("active_cnt") or 0)
+        churned_now_cnt = int(res.get("churned_now_cnt") or 0)
+        risk_cnt = int(res.get("risk_cnt") or 0)
+        # We don't have raw scores array here; but we can approximate by reading from score_stats.
+        # For anomaly detection, only need risk_ratio.
+        # Use empty scores to keep p50/p90/p99 as in res.
+        # We'll store res stats directly.
+        # To compute quantiles properly, we would need df_pred; that’s intentionally not returned.
+        # So we store what export runner computed.
+        # We'll pass dummy scores array and overwrite stats fields after upsert.
+        import numpy as np
+        payload = upsert_score_drift(
+            engine,
+            window_end=int(t_current),
+            horizon=int(horizon),
+            best_k=int(load_latest_accepted_best_config(engine, horizon=int(horizon)).get("best_k", cand_k)),
+            active_cnt=active_cnt,
+            churned_now_cnt=churned_now_cnt,
+            scores=np.array([], dtype=float),
+            risk_threshold_pct=int(risk_threshold_pct),
+            risk_cnt=risk_cnt,
+        )
+        # overwrite stored quantiles with export runner's (more accurate)
+        if score_stats:
+            from sqlalchemy import text
+            q = text(f"""
+                UPDATE ml_monitor.score_drift
+                SET mean_score=:m, p50=:p50, p90=:p90, p99=:p99
+                WHERE window_end=:w AND horizon=:h
+            """)
+            with engine.begin() as conn:
+                conn.execute(q, {
+                    "m": score_stats.get("mean"),
+                    "p50": score_stats.get("p50"),
+                    "p90": score_stats.get("p90"),
+                    "p99": score_stats.get("p99"),
+                    "w": int(t_current),
+                    "h": int(horizon),
+                })
+
+        # Feature drift (PSI) if baseline profile exists in bundle
+        if do_feature_drift:
+            try:
+                _, meta = load_bundle(bundle_dir)
+                prof = (meta or {}).get("feature_profile")
+                if prof:
+                    # Use scoring data (active) already engineered: take from risk snapshot? Too small.
+                    # Instead, load feature table for best_k and t_current as proxy for current distribution.
+                    best_k_used = int(load_latest_accepted_best_config(engine, horizon=int(horizon)).get("best_k", cand_k))
+                    from preprocess.dataset import load_scoring_table_for_k
+                    df_cur, _, _ = load_scoring_table_for_k(engine, k=best_k_used, window_end=int(t_current))
+                    drift_df = compute_feature_drift(df_cur, prof)
+                    upsert_feature_drift(engine, window_end=int(t_current), horizon=int(horizon), best_k=best_k_used, drift_df=drift_df)
+            except Exception:
+                # do not fail whole pipeline
+                pass
+
+        # Backtest (precision-in-list) when label month exists (t_current acts as label month)
+        bt = None
+        if do_backtest:
+            bt = run_backtest_precision_in_list(
+                engine,
+                label_window_end=int(t_current),
+                horizon=int(horizon),
+                risk_threshold_pct=int(risk_threshold_pct),
+                best_k_for_population=int(k_min),
+            )
+
+        finish_run(
+            engine,
+            run_id=run_id,
+            status="SUCCESS",
+            window_end=int(t_current),
+            cand_best_k=int(cand_k),
+            cand_best_f1=float(cand_f1),
+            cand_is_accepted=bool(accepted),
+            did_retrain=bool(did_retrain),
+            did_score=bool(did_score),
+            notes=f"accept_rule={rule}; backtest={'yes' if bt else 'no'}",
+        )
+
+        return {
+            "run_id": run_id,
+            "window_end": int(t_current),
+            "candidate": cand_cfg,
+            "accepted": bool(accepted),
+            "did_retrain": bool(did_retrain),
+            "export": res,
+            "backtest": bt,
+        }
+
+    except Exception as e:
+        finish_run(
+            engine,
+            run_id=run_id,
+            status="FAILED",
+            window_end=int(t_current) if t_current is not None else None,
+            cand_best_k=int(cand_cfg["best_k"]) if cand_cfg else None,
+            cand_best_f1=float(cand_cfg["metric_f1_val"]) if cand_cfg else None,
+            cand_is_accepted=bool(accepted) if accepted is not None else None,
+            did_retrain=bool(did_retrain),
+            did_score=bool(did_score),
+            notes=f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=3)}",
+        )
+        raise
