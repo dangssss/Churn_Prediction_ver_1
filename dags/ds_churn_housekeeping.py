@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 DAG: ds_churn_housekeeping
 Dọn dẹp định kỳ các runtime folders
@@ -10,6 +8,21 @@ Các thư mục chạy trong docker nên lấy thông tin từ env.dev và env.p
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 from pendulum import datetime
+import os
+from pathlib import Path
+from dotenv import dotenv_values
+
+# Đường dẫn tới file .env của ingestion (tương đối từ thư mục dags)
+DAGS_DIR = Path(__file__).parent
+ENV_PATH = DAGS_DIR.parent / "src" / "ingestion" / ".env"
+
+# Combine các biến môi trường hiện tại của Airflow với các biến trong .env
+airflow_env = os.environ.copy()
+if ENV_PATH.exists():
+    ingestion_env = dotenv_values(ENV_PATH)
+    # Lọc bỏ các biến rỗng hoặc có giá trị None
+    valid_env = {k: v for k, v in ingestion_env.items() if v is not None}
+    airflow_env.update(valid_env)
 
 # Housekeeping script nội dung
 HOUSEKEEPING_SCRIPT = '''
@@ -23,10 +36,12 @@ SAVED_RETENTION_DAYS=90
 FAIL_RETENTION_DAYS=30
 INCOMING_RETENTION_DAYS=7
 
-# CÁC ĐƯỜNG DẪN CHUẨN TRONG DOCKER CONTAINER
-BUNDLE_DIR="/churn_data/modeling/bundles"
-LOG_DIR="/logs/ingest"
-DATA_ROOT="/churn_data"
+# CÁC ĐƯỜNG DẪN LẤY TỪ BIẾN MÔI TRƯỜNG (với fallback nếu biến không tồn tại)
+BUNDLE_DIR="${BUNDLE_DIR:-/churn_source/modeling/bundles}"
+APP_LOGS_DIR="/logs" # Quét toàn bộ /logs để dọn cả ingest, preprocess, modeling
+SAVED_DIR="${SAVED_DIR:-/churn_processing/saved_data}"
+FAIL_DIR="${FAIL_DIR:-/churn_processing/fail_ingest}"
+INCOMING_DIR="${INCOMING_DIR:-/churn_data/churn_de}"
 
 echo "=== DS_CHURN Housekeeping - $(date) ==="
 
@@ -49,18 +64,16 @@ else
     echo "   Warning: Bundle dir ${BUNDLE_DIR} not found!"
 fi
 
-# 2. Log rotation (Airflow Logs)
-echo "[2] Cleaning old logs at: ${LOG_DIR}"
-if [[ -d "${LOG_DIR}" ]]; then
-    find "${LOG_DIR}" -type f \\( -name "*.log" -o -name "*.log.*" \\) -mtime +${LOG_RETENTION_DAYS} -delete 2>/dev/null || true
-    find "${LOG_DIR}" -type d -empty -delete 2>/dev/null || true
+# 2. Log rotation (App Logs: Ingest, Preprocess, Modeling...)
+echo "[2] Cleaning old logs at: ${APP_LOGS_DIR}"
+if [[ -d "${APP_LOGS_DIR}" ]]; then
+    find "${APP_LOGS_DIR}" -type f \\( -name "*.log" -o -name "*.log.*" \\) -mtime +${LOG_RETENTION_DAYS} -delete 2>/dev/null || true
+    find "${APP_LOGS_DIR}" -type d -empty -delete 2>/dev/null || true
     echo "   Cleaned logs older than ${LOG_RETENTION_DAYS} days."
 fi
 
 # 3. Saved data retention (Data đã xử lý thành công)
-# Đường dẫn: /churn_data/saved_data
-SAVED_DIR="${DATA_ROOT}/saved_data" 
-echo "[3] Cleaning old saved data at: ${SAVED_DIR}"
+echo "[3] Cleaning old saved data at: ${SAVED_DIR}" 
 if [[ -d "${SAVED_DIR}" ]]; then
     find "${SAVED_DIR}" -type f -mtime +${SAVED_RETENTION_DAYS} -delete 2>/dev/null || true
     find "${SAVED_DIR}" -type d -empty -delete 2>/dev/null || true
@@ -68,8 +81,6 @@ if [[ -d "${SAVED_DIR}" ]]; then
 fi
 
 # 4. Fail data retention (Data lỗi)
-# Đường dẫn: /churn_data/fail_ingest
-FAIL_DIR="${DATA_ROOT}/fail_ingest"
 echo "[4] Cleaning old fail data at: ${FAIL_DIR}"
 if [[ -d "${FAIL_DIR}" ]]; then
     find "${FAIL_DIR}" -type f -mtime +${FAIL_RETENTION_DAYS} -delete 2>/dev/null || true
@@ -78,8 +89,6 @@ if [[ -d "${FAIL_DIR}" ]]; then
 fi
 
 # 5. Incoming data retention (File zip gốc quá cũ chưa ai xử lý?)
-# Đường dẫn: /churn_data/churn_de
-INCOMING_DIR="${DATA_ROOT}/churn_de"
 echo "[5] Cleaning old incoming data at: ${INCOMING_DIR}"
 if [[ -d "${INCOMING_DIR}" ]]; then
     find "${INCOMING_DIR}" -type f -mtime +${INCOMING_RETENTION_DAYS} -delete 2>/dev/null || true
@@ -102,4 +111,5 @@ with DAG(
     housekeeping = BashOperator(
         task_id="run_housekeeping",
         bash_command=HOUSEKEEPING_SCRIPT,
+        env=airflow_env,
     )

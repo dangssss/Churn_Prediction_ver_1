@@ -57,6 +57,8 @@ x-airflow-common:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
@@ -99,17 +101,19 @@ x-airflow-common:
     # Day cac thu muc code tu Host vao Container de BashOperator cua Airflow co the goi chay.
 
     # Mount Core Code keo du lieu tu CSDL
-    - /home/dmst_ai/ds_churn/churn.deployment/src/ingestion:/churn_source/ingestion
+    - ./src/ingestion:/churn_source/ingestion
     # Mount Core Code bien doi, sinh feature (Sliding Windows, Baseline)
-    - /home/dmst_ai/ds_churn/churn.deployment/src/preprocessing:/churn_source/preprocessing
+    - ./src/preprocessing:/churn_source/preprocessing
     # Mount Core Code Model huan luyen va xuat diem rui ro roi bo
-    - /home/dmst_ai/ds_churn/churn.deployment/src/modeling:/churn_source/modeling
+    - ./src/modeling:/churn_source/modeling
 
     # --------------------------------------------------------------------------------------
     # [3] MAP DATA GIAO TIEP VOI TEAM DE & LOG UNG DUNG
     # --------------------------------------------------------------------------------------
-    # Nap du lieu dau vao (File Zip tu DE) va noi luu File ket qua (churn_de, saved_data...)
-    - /data/churn_prediction/ftp_churn:/churn_data
+    # Nap du lieu dau vao (File Zip tu DE) va noi luu File ket qua (fail_ingest, saved_data)
+    - /data/churn_prediction/churn_processing:/churn_process
+    # Nap du lieu dau vao (File Zip tu DE) va noi luu File ket qua (churn_de, output_prediction)
+    - /data/churn_prediction/ftp_churn/churn_de:/churn_data
     # Noi luu giu toan bo File text logs trong qua trinh tien xu ly
     - /data/churn_prediction/churn_logs:/logs
     # --------------------------------------------------------------------------------------

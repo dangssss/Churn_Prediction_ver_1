@@ -12,6 +12,7 @@ from config_store.best_config import load_latest_accepted_best_config as load_la
 
 from .create_risk_table import ensure_risk_table_schema
 from .insert_predictions import make_predictions, insert_predictions_to_risk_table, compute_simple_reasons
+import os
 
 
 def engineer_features_step6(df_window: pd.DataFrame, df_static: pd.DataFrame, *, use_static: bool) -> pd.DataFrame:
@@ -106,7 +107,8 @@ def run_export_risk(
     # CSV Export requirement
     print("\n[7/7] Export to CSV file...")
     try:
-        csv_dir = Path("/churn_data/output_prediction")
+        output_dir_env = os.environ.get("OUTPUT_DIR", "/churn_data/output_prediction")
+        csv_dir = Path(output_dir_env)
         csv_dir.mkdir(parents=True, exist_ok=True)
         
         # Calculate predict_period
