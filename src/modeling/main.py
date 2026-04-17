@@ -22,11 +22,14 @@ from config.paths import CHURN_MODEL_DIR
 from preprocess.static_features import load_cus_lifetime
 from main_model.runner import run_main_variant
 from common.artifacts import save_bundle
+from logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 def cmd_run_monthly(args) -> None:
     engine = get_engine()
-    print("DB:", smoke_test(engine))
+    logger.info("DB: %s", smoke_test(engine))
     out = run_monthly_pipeline(
         engine,
         horizon=int(args.horizon),
@@ -35,12 +38,12 @@ def cmd_run_monthly(args) -> None:
         limit_rows_each=args.limit_rows_each,
         k_min=int(args.k_min),
     )
-    print("\nDONE run-monthly:", out)
+    logger.info("DONE run-monthly: %s", out)
 
 
 def cmd_sweep_k(args) -> None:
     engine = get_engine()
-    print("DB:", smoke_test(engine))
+    logger.info("DB: %s", smoke_test(engine))
     ensure_best_config_table(engine)
 
     best_cfg, df_ab = run_sweep_k(
@@ -55,14 +58,14 @@ def cmd_sweep_k(args) -> None:
     best_cfg["accept_rule"] = "manual_sweep"
     upsert_best_config(engine, best_cfg)
 
-    print("Saved best_config:", best_cfg)
+    logger.info("Saved best_config: %s", best_cfg)
     cols = [c for c in ["k", "use_static", "val_month", "f1", "PR_AUC_val", "best_threshold", "spw_used"] if c in df_ab.columns]
-    print("\nTOP-10:\n", df_ab[cols].head(10).to_string(index=False))
+    logger.info("TOP-10:\n%s", df_ab[cols].head(10).to_string(index=False))
 
 
 def cmd_train_main(args) -> None:
     engine = get_engine()
-    print("DB:", smoke_test(engine))
+    logger.info("DB: %s", smoke_test(engine))
     cfg = load_latest_accepted_best_config(engine, horizon=int(args.horizon))
     df_static = load_cus_lifetime(engine)
 
@@ -90,12 +93,12 @@ def cmd_train_main(args) -> None:
         "feature_profile": best.get("feature_profile"),
     }
     save_bundle(bundle_dir, best["model"], metadata=meta)
-    print("Saved bundle to:", bundle_dir)
+    logger.info("Saved bundle to: %s", bundle_dir)
 
 
 def cmd_export_risk(args) -> None:
     engine = get_engine()
-    print("DB:", smoke_test(engine))
+    logger.info("DB: %s", smoke_test(engine))
     res = run_export_risk_mode(
         engine,
         horizon=int(args.horizon),
@@ -105,7 +108,7 @@ def cmd_export_risk(args) -> None:
         limit_rows=args.limit_rows,
         make_dossier=bool(args.make_dossier),
     )
-    print("\nDONE export-risk:", res)
+    logger.info("DONE export-risk: %s", res)
 
 
 
@@ -119,7 +122,7 @@ def load_config_defaults() -> dict:
                 cfg = json.load(f)
                 defaults.update(cfg)
     except Exception as e:
-        print(f"Warning: Failed to load config defaults: {e}")
+        logger.warning("Failed to load config defaults: %s", e)
     return defaults
 
 

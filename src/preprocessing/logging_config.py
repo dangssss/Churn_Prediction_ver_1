@@ -3,12 +3,12 @@ Centralized logging configuration for feature generation pipeline.
 All operations logged to both console and logs/pipeline.log
 """
 import logging
+import os
 import sys
 from pathlib import Path
 from datetime import datetime
 
-BASE = Path(__file__).resolve().parents[0]
-LOG_DIR = BASE / 'logs'
+LOG_DIR = Path(os.getenv("LOG_DIR", "/logs/preprocessing"))
 LOG_FILE = LOG_DIR / 'pipeline.log'
 
 
