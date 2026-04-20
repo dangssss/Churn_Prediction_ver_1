@@ -111,7 +111,7 @@ x-airflow-common:
     # [3] MAP DATA GIAO TIEP VOI TEAM DE & LOG UNG DUNG
     # --------------------------------------------------------------------------------------
     # Nap du lieu dau vao (File Zip tu DE) va noi luu File ket qua (fail_ingest, saved_data)
-    - /data/churn_prediction/churn_preprocessing:/churn_process
+    - /data/churn_prediction/churn_processing:/churn_process
     # Nap du lieu dau vao (File Zip tu DE) va noi luu File ket qua (churn_de, output_prediction)
     - /data/churn_prediction/ftp_churn/churn_de:/churn_data
     # Noi luu giu toan bo File text logs trong qua trinh tien xu ly
