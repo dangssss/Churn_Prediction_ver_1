@@ -9,20 +9,10 @@ from airflow import DAG
 from airflow.operators.bash import BashOperator
 from pendulum import datetime
 import os
-from pathlib import Path
-from dotenv import dotenv_values
 
-# Đường dẫn tới file .env của ingestion (tương đối từ thư mục dags)
-DAGS_DIR = Path(__file__).parent
-ENV_PATH = DAGS_DIR.parent / "src" / "ingestion" / ".env"
-
-# Combine các biến môi trường hiện tại của Airflow với các biến trong .env
+# Biến môi trường (SAVED_DIR, FAIL_DIR, INCOMING_DIR, ...) đã được
+# docker-compose nạp từ root .env (env_file) vào container.
 airflow_env = os.environ.copy()
-if ENV_PATH.exists():
-    ingestion_env = dotenv_values(ENV_PATH)
-    # Lọc bỏ các biến rỗng hoặc có giá trị None
-    valid_env = {k: v for k, v in ingestion_env.items() if v is not None}
-    airflow_env.update(valid_env)
 
 # Housekeeping script nội dung
 HOUSEKEEPING_SCRIPT = '''
@@ -39,8 +29,8 @@ INCOMING_RETENTION_DAYS=7
 # CÁC ĐƯỜNG DẪN LẤY TỪ BIẾN MÔI TRƯỜNG (với fallback nếu biến không tồn tại)
 BUNDLE_DIR="${BUNDLE_DIR:-/churn_source/modeling/bundles}"
 APP_LOGS_DIR="/logs" # Quét toàn bộ /logs để dọn cả ingest, preprocess, modeling
-SAVED_DIR="${SAVED_DIR:-/churn_processing/saved_data}"
-FAIL_DIR="${FAIL_DIR:-/churn_processing/fail_ingest}"
+SAVED_DIR="${SAVED_DIR:-/churn_process/saved_data}"
+FAIL_DIR="${FAIL_DIR:-/churn_process/fail_ingest}"
 INCOMING_DIR="${INCOMING_DIR:-/churn_data/churn_de}"
 
 echo "=== DS_CHURN Housekeeping - $(date) ==="
