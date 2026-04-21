@@ -10,6 +10,7 @@ from main_model.xgb_utils import (
     safe_to_category,
     predict_proba_best_iteration,
     date_col_to_ordinal,
+    is_date_like_col,
 )
 
 
@@ -39,11 +40,22 @@ def make_predictions(
     X = df_data[feat_cols].copy()
     
     # Get metadata
-    cat_cols = metadata.get("cat_cols", [])
-    date_cols = metadata.get("date_cols", [])
-    feature_name_map = metadata.get("feature_name_map", {})
+    cat_cols = list(metadata.get("cat_cols") or [])
+    date_cols = list(metadata.get("date_cols") or [])
+    feature_name_map = metadata.get("feature_name_map") or {}
 
-    # Type conversion — date cols first (ordinal numeric), then categorical, then numeric
+    # Detect date-like cols that were mistakenly put in cat_cols by older model bundles
+    # (handles bundles trained before the date_cols fix)
+    extra_date_cols = [
+        c for c in cat_cols
+        if c in X.columns and c not in date_cols and is_date_like_col(X[c])
+    ]
+    if extra_date_cols:
+        print(f"   Auto-detected {len(extra_date_cols)} date col(s) in cat_cols, converting to ordinal: {extra_date_cols}")
+        date_cols = date_cols + extra_date_cols
+        cat_cols = [c for c in cat_cols if c not in extra_date_cols]
+
+    # Type conversion — date cols (ordinal numeric), then categorical, then numeric
     for c in date_cols:
         if c in X.columns:
             X[c] = date_col_to_ordinal(X[c])
@@ -55,15 +67,19 @@ def make_predictions(
     for c in feat_cols:
         if c not in cat_cols and c not in date_cols:
             X[c] = pd.to_numeric(X[c], errors="coerce")
-    
+
     # Predict
     try:
         # Pad missing columns: if model was trained with K=12 but scoring data only has K=11,
         # fill missing *_Nm_ago columns with 0 so XGBoost doesn't crash
-        model_features = getattr(model, "feature_names_in_", None) or (
-            metadata.get("feat_cols") if not feature_name_map else
-            [feature_name_map.get(c, c) for c in metadata.get("feat_cols", [])]
-        )
+        _feat_names_raw = getattr(model, "feature_names_in_", None)
+        if _feat_names_raw is not None:
+            model_features = list(_feat_names_raw)
+        elif feature_name_map:
+            model_features = [feature_name_map.get(c, c) for c in metadata.get("feat_cols", [])]
+        else:
+            model_features = metadata.get("feat_cols") or None
+
         if model_features is not None:
             X_pred = X.rename(columns=feature_name_map) if feature_name_map else X.copy()
             missing = [c for c in model_features if c not in X_pred.columns]
