@@ -9,6 +9,7 @@ from sqlalchemy.engine import Engine
 from main_model.xgb_utils import (
     safe_to_category,
     predict_proba_best_iteration,
+    date_col_to_ordinal,
 )
 
 
@@ -39,15 +40,20 @@ def make_predictions(
     
     # Get metadata
     cat_cols = metadata.get("cat_cols", [])
+    date_cols = metadata.get("date_cols", [])
     feature_name_map = metadata.get("feature_name_map", {})
-    
-    # Type conversion
+
+    # Type conversion — date cols first (ordinal numeric), then categorical, then numeric
+    for c in date_cols:
+        if c in X.columns:
+            X[c] = date_col_to_ordinal(X[c])
+
     for c in cat_cols:
         if c in X.columns:
             X[c] = safe_to_category(X[c])
-    
+
     for c in feat_cols:
-        if c not in cat_cols:
+        if c not in cat_cols and c not in date_cols:
             X[c] = pd.to_numeric(X[c], errors="coerce")
     
     # Predict

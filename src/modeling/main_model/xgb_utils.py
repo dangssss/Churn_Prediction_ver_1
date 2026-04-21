@@ -7,6 +7,21 @@ from typing import Tuple, Dict, List
 import numpy as np
 import pandas as pd
 
+_DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+def is_date_like_col(s: pd.Series, threshold: float = 0.7) -> bool:
+    """Return True if most non-null values look like YYYY-MM-DD strings."""
+    sample = s.dropna().astype(str).head(50)
+    if len(sample) == 0:
+        return False
+    return sum(bool(_DATE_RE.match(v)) for v in sample) >= threshold * len(sample)
+
+def date_col_to_ordinal(s: pd.Series) -> pd.Series:
+    """Convert YYYY-MM-DD strings to integer day ordinal (days since year 1)."""
+    return pd.to_datetime(s, errors="coerce").map(
+        lambda d: d.toordinal() if pd.notna(d) else np.nan
+    )
+
 def sanitize_xgb_feature_names(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """XGBoost không cho feature name chứa [, ], < và vài ký tự lạ.
     Đồng thời đảm bảo tất cả tên cột là string và unique.

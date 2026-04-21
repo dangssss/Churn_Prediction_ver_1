@@ -20,6 +20,8 @@ from .xgb_utils import (
     sanitize_xgb_feature_names,
     fit_xgb_with_early_stopping,
     predict_proba_best_iteration,
+    is_date_like_col,
+    date_col_to_ordinal,
 )
 
 def select_feature_cols_for_model(df: pd.DataFrame, label_col: str):
@@ -110,8 +112,15 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
     thr_baseline = float(cfg["best_threshold"])  # tham chiếu
     es_rounds = int(cfg.get("main_es_rounds", 200))
 
-    # detect categorical
-    cat_cols = [c for c in feat_cols if (X_tr[c].dtype == "object" or str(X_tr[c].dtype) == "category")]
+    # detect categorical — exclude date-string columns (YYYY-MM-DD) which change each month
+    obj_cols = [c for c in feat_cols if (X_tr[c].dtype == "object" or str(X_tr[c].dtype) == "category")]
+    date_cols = [c for c in obj_cols if is_date_like_col(X_tr[c])]
+    cat_cols = [c for c in obj_cols if c not in date_cols]
+
+    # convert date-string cols to numeric ordinal
+    for c in date_cols:
+        X_tr[c] = date_col_to_ordinal(X_tr[c])
+        X_va[c] = date_col_to_ordinal(X_va[c])
 
     # category must NOT be pandas string[python]
     for c in cat_cols:
@@ -120,7 +129,7 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
 
     # numeric cols
     for c in feat_cols:
-        if c not in cat_cols:
+        if c not in cat_cols and c not in date_cols:
             X_tr[c] = pd.to_numeric(X_tr[c], errors="coerce")
             X_va[c] = pd.to_numeric(X_va[c], errors="coerce")
 
@@ -225,7 +234,7 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
         "f1@main_thr": float(f1_opt),
     }
 
-    return model, report, feat_cols, cat_cols, feature_name_map
+    return model, report, feat_cols, cat_cols, feature_name_map, date_cols
 
 def run_main_variant(engine, cfg: dict, df_static: pd.DataFrame, use_static_flag: bool):
     from preprocess.trainval import build_train_val_for_main
@@ -235,7 +244,7 @@ def run_main_variant(engine, cfg: dict, df_static: pd.DataFrame, use_static_flag
     cfg_tmp = dict(cfg)
     cfg_tmp["use_static"] = bool(use_static_flag)
 
-    model, report, feat_cols, cat_cols, fmap = train_main_xgb_option_B(df_tr, df_va, cfg_tmp)
+    model, report, feat_cols, cat_cols, fmap, date_cols = train_main_xgb_option_B(df_tr, df_va, cfg_tmp)
 
     # baseline profile for monitoring drift (built on train split)
     feature_profile = compute_feature_profile(df_tr, feat_cols=feat_cols, cat_cols=cat_cols)
@@ -252,6 +261,7 @@ def run_main_variant(engine, cfg: dict, df_static: pd.DataFrame, use_static_flag
         "model": model,
         "feat_cols": feat_cols,
         "cat_cols": cat_cols,
+        "date_cols": date_cols,
         "feature_name_map": fmap,
         "feature_profile": feature_profile,
     }
