@@ -89,6 +89,7 @@ def cmd_train_main(args) -> None:
         "main_report": best["report"],
         "feat_cols": best.get("feat_cols"),
         "cat_cols": best.get("cat_cols"),
+        "date_cols": best.get("date_cols", []),
         "feature_name_map": best.get("feature_name_map"),
         "feature_profile": best.get("feature_profile"),
     }
