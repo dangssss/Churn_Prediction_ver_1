@@ -113,7 +113,7 @@ def run_export_risk(
         
         # Calculate predict_period
         dt_window = pd.to_datetime(str(month_used), format='%y%m')
-        dt_predict = dt_window + pd.DateOffset(months=horizon)
+        dt_predict = dt_window + pd.DateOffset(months=horizon - 1)
         predict_period_str = dt_predict.strftime('%y%m')
         
         df_csv = df_ins.copy()

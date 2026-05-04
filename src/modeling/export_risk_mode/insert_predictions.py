@@ -302,7 +302,8 @@ def insert_predictions_to_risk_table(
     # Calculate predict_period: yymm
     y = df_insert["window_end"] // 100
     m = df_insert["window_end"] % 100
-    m = m + horizon
+    write_horizon = horizon - 1
+    m = m + write_horizon
     y = y + (m - 1) // 12
     m = (m - 1) % 12 + 1
     df_insert["predict_period"] = (y * 100 + m).astype("int64")
