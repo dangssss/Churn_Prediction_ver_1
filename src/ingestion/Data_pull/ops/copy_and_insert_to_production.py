@@ -242,11 +242,10 @@ def copy_and_insert_to_production(
         conn.commit()
         logger.info(f"Ensured production table: {prod_tbl}")
         
-        # 2) TRUNCATE production nếu mode = snapshot
-        if mode == "snapshot":
-            cur.execute(f"TRUNCATE TABLE {prod_tbl};")
-            conn.commit()
-            logger.info(f"Truncated {prod_tbl} (snapshot mode)")
+        # 2) TRUNCATE production table (always truncate and rewrite from scratch)
+        cur.execute(f"TRUNCATE TABLE {prod_tbl};")
+        conn.commit()
+        logger.info(f"Truncated {prod_tbl}")
         
         # 3) Đọc CSV và transform data
         total_rows = 0
@@ -343,8 +342,8 @@ def copy_and_insert_to_production(
 
 def _bulk_insert_rows(cur, prod_tbl: str, rows: List[Dict[str, Any]], base: str) -> None:
     """
-    Insert rows vào production table bằng COPY FROM với StringIO.
-    Nhanh hơn executemany() rất nhiều lần.
+    Insert rows vào production table bằng COPY FROM kết hợp với TEMP TABLE và ON CONFLICT.
+    Đảm bảo hiệu suất siêu tốc của COPY đồng thời triệt tiêu trùng lặp (duplicate) bằng UPSERT.
     """
     if not rows:
         return
@@ -382,13 +381,51 @@ def _bulk_insert_rows(cur, prod_tbl: str, rows: List[Dict[str, Any]], base: str)
     
     buffer.seek(0)
 
+    # Xác định các cột khoá chính (conflict keys) cho cơ chế UPSERT
+    conflict_keys = []
+    if base == "bccp_orderitem":
+        conflict_keys = ["item_code"]
+    elif base == "cms_complaint":
+        conflict_keys = ["item_code", "complaint_code", "create_complaint_date"]
+
     try:
-        cur.copy_expert(
-            f"COPY {prod_tbl} ({col_str}) FROM STDIN WITH (FORMAT TEXT, NULL '\\N')",
-            buffer
-        )
+        if conflict_keys:
+            import uuid
+            # Tạo tên bảng tạm duy nhất
+            temp_tbl = f"temp_{base}_{uuid.uuid4().hex[:8]}"
+            
+            # 1. Tạo bảng tạm cấu trúc giống bảng đích nhưng không sao chép khóa chính
+            cur.execute(f"CREATE TEMP TABLE {temp_tbl} (LIKE {prod_tbl}) ON COMMIT DROP;")
+            
+            # 2. COPY siêu tốc dữ liệu thô vào bảng tạm
+            cur.copy_expert(
+                f"COPY {temp_tbl} ({col_str}) FROM STDIN WITH (FORMAT TEXT, NULL '\\N')",
+                buffer
+            )
+            
+            # 3. Chạy lệnh UPSERT (INSERT ON CONFLICT DO UPDATE) từ bảng tạm sang bảng đích
+            update_cols = [c for c in columns if c not in conflict_keys]
+            update_set_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols])
+            conflict_str = ", ".join([f'"{k}"' for k in conflict_keys])
+            
+            upsert_query = f"""
+                INSERT INTO {prod_tbl} ({col_str})
+                SELECT {col_str} FROM {temp_tbl}
+                ON CONFLICT ({conflict_str})
+                DO UPDATE SET {update_set_str};
+            """
+            cur.execute(upsert_query)
+            
+            # 4. Xóa bảng tạm thủ công
+            cur.execute(f"DROP TABLE IF EXISTS {temp_tbl};")
+        else:
+            # COPY trực tiếp đối với các bảng snapshot (đã được TRUNCATE trước đó)
+            cur.copy_expert(
+                f"COPY {prod_tbl} ({col_str}) FROM STDIN WITH (FORMAT TEXT, NULL '\\N')",
+                buffer
+            )
     except Exception as e:
-        logger.error(f"COPY FROM failed for base={base}: {e}")
+        logger.error(f"Insert/UPSERT failed for base={base}: {e}")
         logger.debug(f"Columns: {columns}")
         logger.debug(f"First row sample: {rows[0] if rows else 'N/A'}")
         raise

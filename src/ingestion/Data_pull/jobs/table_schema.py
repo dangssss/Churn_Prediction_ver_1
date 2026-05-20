@@ -202,20 +202,18 @@ def get_prod_table_ddl(table_base: str, table_name: str, prod_schema: str = "pub
     
     Returns:
         CREATE TABLE SQL statement
-    
-    Example:
-        >>> ddl = get_prod_table_ddl("cms_complaint", "cms_complaint", "public")
-        >>> print(ddl)
-        CREATE TABLE IF NOT EXISTS public.cms_complaint (
-            "cms_code_enc" VARCHAR(20),
-            "item_code" VARCHAR(20),
-            ...
-        );
     """
     schema = get_table_schema(table_base)
     
     # Build column definitions
     cols = [f'"{col_name}" {dtype}' for col_name, dtype, _ in schema]
+    
+    # Thêm PRIMARY KEY định danh để hỗ trợ UPSERT
+    if table_base == "bccp_orderitem":
+        cols.append('PRIMARY KEY ("item_code")')
+    elif table_base == "cms_complaint":
+        cols.append('PRIMARY KEY ("item_code", "complaint_code", "create_complaint_date")')
+        
     col_list = ",\n    ".join(cols)
     
     return f"""CREATE TABLE IF NOT EXISTS {table_name} (
