@@ -190,23 +190,28 @@ def run_once_scan(
             logger.warning(f"Could not parse {zip_name}: {e}. Skipping.")
             continue
         # Kiểm tra xem file đã được xử lý thành công chưa (dựa trên mtime để tránh lặp vô hạn)
-        already_processed, logged_mtime = has_success_log(zip_name, pg_cfg, ingest_schema=ingest_schema)
+        import os
+        force_ingest = os.getenv("FORCE_INGEST", "").lower() in ("1", "true", "yes")
         
-        if already_processed:
-            current_mtime = zip_path.stat().st_mtime
-            if current_mtime == logged_mtime:
-                logger.info(
-                    f"Skipping {zip_name} (mode={mode}): already processed (same mtime)"
-                )
-                continue
-            else:
-                from datetime import datetime
-                logged_time_str = datetime.fromtimestamp(logged_mtime).strftime("%Y-%m-%d %H:%M:%S")
-                current_time_str = datetime.fromtimestamp(current_mtime).strftime("%Y-%m-%d %H:%M:%S")
-                logger.info(
-                    f"Re-ingesting {zip_name} (mode={mode}): File was updated/replaced. "
-                    f"Old mtime: {logged_time_str}, New mtime: {current_time_str}"
-                )
+        if not force_ingest:
+            already_processed, logged_mtime = has_success_log(zip_name, pg_cfg, ingest_schema=ingest_schema)
+            if already_processed:
+                current_mtime = zip_path.stat().st_mtime
+                if current_mtime == logged_mtime:
+                    logger.info(
+                        f"Skipping {zip_name} (mode={mode}): already processed (same mtime)"
+                    )
+                    continue
+                else:
+                    from datetime import datetime
+                    logged_time_str = datetime.fromtimestamp(logged_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                    current_time_str = datetime.fromtimestamp(current_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                    logger.info(
+                        f"Re-ingesting {zip_name} (mode={mode}): File was updated/replaced. "
+                        f"Old mtime: {logged_time_str}, New mtime: {current_time_str}"
+                    )
+        else:
+            logger.info(f"[FORCE] Force ingesting {zip_name} (FORCE_INGEST environment variable is set)")
 
         try:
             logger.info(f"Running ingest_zip_job for {zip_name}")

@@ -209,12 +209,6 @@ def get_prod_table_ddl(table_base: str, table_name: str, prod_schema: str = "pub
     # Build column definitions
     cols = [f'"{col_name}" {dtype}' for col_name, dtype, _ in schema]
     
-    # Thêm PRIMARY KEY định danh để hỗ trợ UPSERT
-    if table_base == "bccp_orderitem":
-        cols.append('PRIMARY KEY ("item_code")')
-    elif table_base == "cms_complaint":
-        cols.append('PRIMARY KEY ("item_code", "complaint_code", "create_complaint_date")')
-        
     col_list = ",\n    ".join(cols)
     
     return f"""CREATE TABLE IF NOT EXISTS {table_name} (
