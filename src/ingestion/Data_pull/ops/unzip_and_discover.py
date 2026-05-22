@@ -4,7 +4,8 @@ import logging
 import shutil
 import zipfile
 
-from Data_pull.resources import FSConfig, ZIP_RE, list_zip_files
+from typing import Optional
+from Data_pull.resources import FSConfig, ZIP_RE, list_zip_files, PostgresConfig, get_pg_conn
 from Data_pull.ops.naming import (
     parse_zip_and_decide_names,
     order_csvs_chronologically,
@@ -14,11 +15,27 @@ from Data_pull.logging_config import get_logger
 logger = get_logger(__name__)
 
 
-def unzip_and_discover(zip_path: Path, fs_cfg: FSConfig) -> dict:
+def ensure_manifest_table(cur) -> None:
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS public.ingestion_manifest (
+        zip_name text NOT NULL,
+        csv_name text NOT NULL,
+        file_sha256 varchar(64) NOT NULL PRIMARY KEY,
+        ingested_at timestamptz DEFAULT now()
+    );
+    """)
+
+
+def unzip_and_discover(
+    zip_path: Path,
+    fs_cfg: FSConfig,
+    pg_cfg: Optional[PostgresConfig] = None,
+) -> dict:
     """
     Input:
       - zip_path: đường dẫn tới file ZIP (đang nằm trong incoming_dir, vd: churn_data)
       - fs_cfg: config filesystem (incoming_dir, saved_dir)
+      - pg_cfg: config database to check manifest
 
     Output: dict meta:
       {
@@ -27,7 +44,8 @@ def unzip_and_discover(zip_path: Path, fs_cfg: FSConfig) -> dict:
         "table_name": "bccp_orderitem_2501" hoặc "cas_customer",
         "month_folder": "bccp_orderitem_2501" hoặc "cas_customer_snapshot_DDMMYY",
         "extract_dir": <Path saved_data/bccp_orderitem/bccp_orderitem_2501>,
-        "csv_files": [Path(...), ...]
+        "csv_files": [Path(...), ...],
+        "csv_hashes": {str(Path): sha256, ...}
       }
 
     CSV Format:
@@ -61,6 +79,9 @@ def unzip_and_discover(zip_path: Path, fs_cfg: FSConfig) -> dict:
 
     # 2) Thư mục giải nén (trong saved_data)
     extract_dir = fs_cfg.saved_dir / base / month_folder
+    if extract_dir.exists():
+        logger.warning(f"Clearing existing extraction directory to avoid stale files: {extract_dir}")
+        shutil.rmtree(extract_dir)
     extract_dir.mkdir(parents=True, exist_ok=True)
 
     # 3) COPY ZIP từ incoming_dir sang extract_dir (KHÔNG move/xoá zip_path)
@@ -71,11 +92,56 @@ def unzip_and_discover(zip_path: Path, fs_cfg: FSConfig) -> dict:
     shutil.copy2(str(zip_path), str(dest_zip))
     logger.info(f"Copied ZIP from {zip_path.name} to {extract_dir}")
 
-    # 4) Giải nén từ bản trong saved_data
+    # 4) Load ingested hashes from database
+    already_ingested_hashes = set()
+    if pg_cfg is not None:
+        try:
+            conn = get_pg_conn(pg_cfg)
+            with conn.cursor() as cur:
+                ensure_manifest_table(cur)
+                conn.commit()
+                cur.execute("SELECT file_sha256 FROM public.ingestion_manifest;")
+                already_ingested_hashes = {row[0] for row in cur.fetchall()}
+            conn.close()
+            logger.info(f"Loaded {len(already_ingested_hashes)} hashes from public.ingestion_manifest")
+        except Exception as e:
+            logger.warning(f"Could not read ingestion_manifest: {e}")
+
+    # 5) Giải nén từ bản trong saved_data (Chỉ giải nén các file chưa ingest)
+    import hashlib
+    csv_hashes = {}
+    extracted_csv_paths = []
+
     try:
         with zipfile.ZipFile(dest_zip, "r") as zf:
-            zf.extractall(extract_dir)
-        logger.info(f"Extracted {dest_zip.name} to {extract_dir}")
+            # Lấy danh sách các file CSV
+            members = [
+                m for m in zf.infolist()
+                if not m.is_dir() and m.filename.lower().endswith(".csv")
+            ]
+            
+            for member in members:
+                # Tính SHA256 in-memory của member
+                sha = hashlib.sha256()
+                with zf.open(member) as f:
+                    for chunk in iter(lambda: f.read(4096 * 1024), b""): # 4MB chunks
+                        sha.update(chunk)
+                file_hash = sha.hexdigest()
+                
+                member_filename = Path(member.filename).name
+                
+                # Nếu đã ingest rồi thì bỏ qua
+                if file_hash in already_ingested_hashes:
+                    logger.info(f"CSV '{member_filename}' (SHA256: {file_hash}) already ingested. Skipping extraction.")
+                    continue
+                
+                # Giải nén file
+                extracted_path = Path(zf.extract(member, extract_dir))
+                extracted_csv_paths.append(extracted_path)
+                csv_hashes[str(extracted_path)] = file_hash
+                logger.info(f"Extracted '{member_filename}' (SHA256: {file_hash}) to {extracted_path}")
+                
+        logger.info(f"Unzipped completed. Extracted {len(extracted_csv_paths)} new CSV files.")
     except Exception as e:
         # Unzip fail -> copy ZIP sang fail_data, KHÔNG move/xoá
         fail_path = fs_cfg.fail_dir / zip_path.name
@@ -91,20 +157,19 @@ def unzip_and_discover(zip_path: Path, fs_cfg: FSConfig) -> dict:
             logger.error(f"Failed to unzip {zip_path.name}: {e} - also failed to copy to fail_data: {copy_err}")
         raise RuntimeError(f"Failed to unzip: {zip_path.name}") from e
 
-    # 5) Tìm CSV đệ quy trong extract_dir
-    csv_unsorted = sorted(
-        [p for p in extract_dir.rglob("*") if p.is_file() and p.suffix.lower() == ".csv"]
-    )
+    # 6) Sắp xếp CSV theo thứ tự logic
+    csv_unsorted = sorted(extracted_csv_paths)
     
     if not csv_unsorted:
-        logger.warning(f"No CSV files found after unzipping {table_name}")
+        logger.warning(f"No new CSV files to ingest after unzipping {table_name}")
         return {
             **meta,
             "extract_dir": extract_dir,
             "csv_files": [],
+            "csv_hashes": {},
         }
 
-    # 6) Đối với monthly mode: sắp CSV theo thời gian
+    # Đối với monthly mode: sắp CSV theo thời gian
     if mode == "monthly":
         csv_files = order_csvs_chronologically(
             csv_unsorted,
@@ -120,4 +185,5 @@ def unzip_and_discover(zip_path: Path, fs_cfg: FSConfig) -> dict:
         **meta,
         "extract_dir": extract_dir,
         "csv_files": csv_files,
+        "csv_hashes": csv_hashes,
     }

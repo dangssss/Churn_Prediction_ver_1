@@ -9,6 +9,7 @@ import io
 import os
 
 import psycopg2
+import pandas as pd
 
 from Data_pull.resources import PostgresConfig, get_pg_conn
 from Data_pull.logging_config import get_logger
@@ -112,7 +113,7 @@ DEDUP_KEYS: Dict[str, List[str]] = {
 }
 
 
-def _dedup_exact_duplicates(cur, conn, prod_tbl: str, base: str) -> int:
+def _dedup_exact_duplicates(cur, conn, prod_tbl: str, base: str, columns_list: Optional[List[str]] = None) -> int:
     """
     Phát hiện và xoá duplicate rows sau khi COPY.
     
@@ -136,13 +137,16 @@ def _dedup_exact_duplicates(cur, conn, prod_tbl: str, base: str) -> int:
         tbl_name = prod_tbl.strip().strip('"')
 
     # Bước 1: Xoá trùng lặp y hệt nhau (tất cả các cột trùng nhau)
-    cur.execute("""
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = %s AND table_name = %s
-        ORDER BY ordinal_position;
-    """, (schema, tbl_name))
-    columns = [f'"{r[0]}"' for r in cur.fetchall()]
+    if columns_list is not None:
+        columns = [f'"{col}"' for col in columns_list]
+    else:
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position;
+        """, (schema, tbl_name))
+        columns = [f'"{r[0]}"' for r in cur.fetchall()]
 
     deleted_exact = 0
     if columns:
@@ -372,92 +376,233 @@ def copy_and_insert_to_production(
         conn.commit()
         logger.info(f"Ensured production table: {prod_tbl}")
         
-        # 2) TRUNCATE production table (always truncate and rewrite from scratch)
-        cur.execute(f"TRUNCATE TABLE {prod_tbl};")
+        # 2) Đảm bảo bảng manifest tồn tại và lấy danh sách csv_hashes
+        try:
+            from unzip_and_discover import ensure_manifest_table
+        except ImportError:
+            # Fallback if imported differently
+            def ensure_manifest_table(cur) -> None:
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.ingestion_manifest (
+                    zip_name text NOT NULL,
+                    csv_name text NOT NULL,
+                    file_sha256 varchar(64) NOT NULL PRIMARY KEY,
+                    ingested_at timestamptz DEFAULT now()
+                );
+                """)
+        ensure_manifest_table(cur)
         conn.commit()
-        logger.info(f"Truncated {prod_tbl}")
-        
+
         # 3) Đọc CSV và transform data
         total_rows = 0
+        audit_log = []
+        total_read_all = 0
+        total_skipped_all = 0
+        total_inserted_all = 0
+        total_deleted_all = 0
+        
+        csv_hashes = meta.get("csv_hashes", {})
+
         for csv_file in csv_files:
             logger.info(f"Reading {csv_file.name}")
             
-            with open(csv_file, "r", encoding="utf-8-sig", newline="") as f:
-                # CSV files sử dụng delimiter ';'
-                delimiter = ";"
-                reader = csv.DictReader(f, delimiter=delimiter)
-                source_fields = [h.strip() for h in (reader.fieldnames or [])]
-                if len(source_fields) != len(headers_raw):
-                    msg = (
-                        f"Header mismatch in {csv_file.name}: "
-                        f"expected {len(headers_raw)} columns (from first CSV), "
-                        f"got {len(source_fields)} columns. "
-                        f"All CSVs in ZIP must have same header structure."
-                    )
-                    logger.error(msg)
-                    raise CsvHeaderMismatchError(msg)
-                
-                logger.debug(f"Processing: {len(source_fields)} columns from {csv_file.name}")
+            # Tính hoặc lấy SHA256
+            file_sha256 = csv_hashes.get(str(csv_file))
+            if not file_sha256:
+                import hashlib
+                sha = hashlib.sha256()
+                with open(csv_file, "rb") as f:
+                    for chunk in iter(lambda: f.read(4096 * 1024), b""):
+                        sha.update(chunk)
+                file_sha256 = sha.hexdigest()
 
-                # Buffer rows để batch insert
-                rows_buffer: List[Dict[str, Any]] = []
-                for raw_row in reader:
-                    # ===== NORMALIZE ROW: Apply header_map (position-based) =====
-                    # Chuẩn hoá key: strip khoảng trắng 2 đầu
-                    raw_row = {
-                        (k.strip() if isinstance(k, str) else k): v
-                        for k, v in raw_row.items()
-                    }
-                    
-                    # Áp map header: CSV key → canonical key (nếu khác tên)
-                    normalized_row: Dict[str, Any] = {}
-                    for k, v in raw_row.items():
-                        canonical_key = header_map.get(k, k)
-                        normalized_row[canonical_key] = v
-                    
-                    raw_row = normalized_row
-                    # ===== HẾT NORMALIZE =====
+            # Kiểm tra xem đã ingest chưa
+            cur.execute("SELECT 1 FROM public.ingestion_manifest WHERE file_sha256 = %s LIMIT 1;", (file_sha256,))
+            if cur.fetchone():
+                logger.info(f"CSV file {csv_file.name} (SHA256: {file_sha256}) already in manifest database. Skipping.")
+                continue
 
-                    # Transform row theo table type (sử dụng dispatch dict)
-                    transform_func = TRANSFORM_DISPATCH.get(base)
-                    if transform_func is None:
-                        logger.warning(f"No transform function for base={base}, skipping row")
-                        continue
-                    
-                    transformed = transform_func(raw_row, encrypto)
-                    if transformed is None:
-                        continue  # Skip invalid row
+            file_rows_read = 0
+            file_rows_skipped = 0
+            file_rows_inserted = 0
+            file_rows_staged = 0
+            file_deleted = 0
 
-                    rows_buffer.append(transformed)
+            # Tạo bảng Staging tạm thời
+            # Dùng prefix _stg_ để tránh trùng tên với production table
+            staging_tbl = f"_stg_{table_name}"
+            cur.execute(f"DROP TABLE IF EXISTS {staging_tbl};")
+            cur.execute(f"CREATE TEMP TABLE {staging_tbl} (LIKE {prod_tbl});")
+            conn.commit()
 
-                    # Batch insert
-                    if len(rows_buffer) >= batch_rows:
-                        _bulk_insert_rows(cur, prod_tbl, rows_buffer, base)
-                        conn.commit()
-                        total_rows += len(rows_buffer)
-                        logger.info(f"[{base}] Inserted {total_rows:,} rows so far...")
-                        rows_buffer = []
-                
-                # Insert remaining rows
-                if rows_buffer:
-                    _bulk_insert_rows(cur, prod_tbl, rows_buffer, base)
-                    conn.commit()
-                    total_rows += len(rows_buffer)
-        
-        # 4) Dedup: xoá các dòng duplicate chính xác (tất cả cột giống nhau)
-        try:
-            deleted = _dedup_exact_duplicates(cur, conn, prod_tbl, base)
-            if deleted > 0:
-                total_rows -= deleted
-                logger.warning(
-                    f"[DEDUP] {prod_tbl}: sau dedup còn {total_rows:,} rows "
-                    f"({deleted:,} dòng duplicate đã bị xoá)."
+            columns_to_insert = []
+
+            try:
+                # Đọc CSV theo chunk
+                chunks = pd.read_csv(
+                    csv_file,
+                    sep=";",
+                    chunksize=batch_rows,
+                    dtype=str,
+                    keep_default_na=False,
+                    encoding="utf-8-sig"
                 )
-        except Exception as dedup_exc:
-            logger.warning(
-                f"[DEDUP] {prod_tbl}: bước dedup gặp lỗi (sẽ bỏ qua, dữ liệu vẫn có thể chứa duplicate): {dedup_exc}"
-            )
-            conn.rollback()
+                
+                first_chunk = True
+                for chunk in chunks:
+                    chunk_len = len(chunk)
+                    file_rows_read += chunk_len
+                    
+                    if first_chunk:
+                        chunk_cols = [h.strip() for h in chunk.columns]
+                        if len(chunk_cols) != len(headers_raw):
+                            msg = (
+                                f"Header mismatch in {csv_file.name}: "
+                                f"expected {len(headers_raw)} columns (from first CSV), "
+                                f"got {len(chunk_cols)} columns."
+                            )
+                            logger.error(msg)
+                            raise CsvHeaderMismatchError(msg)
+                        first_chunk = False
+
+                    rows_buffer = []
+                    records = chunk.to_dict('records')
+                    for raw_row in records:
+                        raw_row = {
+                            (k.strip() if isinstance(k, str) else k): v
+                            for k, v in raw_row.items()
+                        }
+                        
+                        normalized_row = {}
+                        for k, v in raw_row.items():
+                            canonical_key = header_map.get(k, k)
+                            normalized_row[canonical_key] = v
+                        
+                        transform_func = TRANSFORM_DISPATCH.get(base)
+                        if transform_func is None:
+                            file_rows_skipped += 1
+                            continue
+                            
+                        transformed = transform_func(normalized_row, encrypto)
+                        if transformed is None:
+                            file_rows_skipped += 1
+                            continue
+                            
+                        rows_buffer.append(transformed)
+
+                    if rows_buffer:
+                        if not columns_to_insert:
+                            columns_to_insert = list(rows_buffer[0].keys())
+                        _bulk_insert_rows(cur, staging_tbl, rows_buffer, base)
+                        # KHÔNG commit giữa chừng: nếu chunk sau bị lỗi,
+                        # rollback sẽ cuốn toàn bộ staging trong transaction này.
+                        file_rows_staged += len(rows_buffer)
+                        logger.info(f"[{base}] Staged {file_rows_staged:,} rows so far from {csv_file.name}...")
+
+            except pd.errors.EmptyDataError:
+                logger.warning(f"CSV file {csv_file.name} is empty. Skipping.")
+                try:
+                    cur.execute(f"DROP TABLE IF EXISTS {staging_tbl};")
+                    conn.commit()
+                except Exception:
+                    pass
+                continue
+            except Exception as e:
+                logger.error(f"Error reading CSV file {csv_file.name}: {e}")
+                try:
+                    cur.execute(f"DROP TABLE IF EXISTS {staging_tbl};")
+                    conn.commit()
+                except Exception:
+                    pass
+                raise
+
+            # Commit toàn bộ dữ liệu staging 1 lần duy nhất sau khi đọc xong file
+            conn.commit()
+
+            # Thực hiện Dedup trên Staging Table
+            if file_rows_staged > 0:
+                try:
+                    file_deleted = _dedup_exact_duplicates(cur, conn, staging_tbl, base, columns_to_insert)
+                    logger.info(f"[DEDUP] {staging_tbl}: cleaned {file_deleted:,} duplicate rows from staging.")
+                except Exception as dedup_exc:
+                    logger.warning(
+                        f"[DEDUP] {staging_tbl}: staging dedup failed: {dedup_exc}. Proceeding with raw staged data."
+                    )
+                    conn.rollback()
+
+                # Insert từ staging_tbl vào prod_tbl WHERE NOT EXISTS
+                col_str = ", ".join([f'"{c}"' for c in columns_to_insert])
+                dedup_cols = DEDUP_KEYS.get(base)
+                if dedup_cols:
+                    key_conditions = " AND ".join([f'p."{col}" IS NOT DISTINCT FROM s."{col}"' for col in dedup_cols])
+                    insert_sql = f"""
+                        INSERT INTO {prod_tbl} ({col_str})
+                        SELECT {col_str} FROM {staging_tbl} s
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM {prod_tbl} p
+                            WHERE {key_conditions}
+                        );
+                    """
+                else:
+                    all_cols_cond = " AND ".join([f'p."{col}" IS NOT DISTINCT FROM s."{col}"' for col in columns_to_insert])
+                    insert_sql = f"""
+                        INSERT INTO {prod_tbl} ({col_str})
+                        SELECT {col_str} FROM {staging_tbl} s
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM {prod_tbl} p
+                            WHERE {all_cols_cond}
+                        );
+                    """
+
+                try:
+                    cur.execute(insert_sql)
+                    file_rows_inserted = cur.rowcount
+                    conn.commit()
+                    logger.info(f"[{base}] Inserted {file_rows_inserted:,} new rows from {csv_file.name} into {prod_tbl}.")
+                except Exception as insert_exc:
+                    logger.error(f"Failed to insert from staging to production: {insert_exc}")
+                    conn.rollback()
+                    raise
+
+            # Ghi nhận SHA256 vào manifest
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO public.ingestion_manifest (zip_name, csv_name, file_sha256, ingested_at)
+                    VALUES (%s, %s, %s, now())
+                    ON CONFLICT (file_sha256) DO NOTHING;
+                    """,
+                    (meta.get("zip_name") or "", csv_file.name, file_sha256)
+                )
+                conn.commit()
+                logger.info(f"Recorded SHA256 of {csv_file.name} in ingestion_manifest.")
+            except Exception as manifest_exc:
+                logger.warning(f"Failed to write manifest for {csv_file.name}: {manifest_exc}")
+                conn.rollback()
+
+            # Xoá Staging Table
+            try:
+                cur.execute(f"DROP TABLE IF EXISTS {staging_tbl};")
+                conn.commit()
+            except Exception:
+                pass
+
+            # Track audit cho file này
+            audit_log.append({
+                "file": csv_file.name,
+                "read": file_rows_read,
+                "skipped": file_rows_skipped,
+                "inserted": file_rows_inserted
+            })
+            total_read_all += file_rows_read
+            total_skipped_all += file_rows_skipped
+            total_inserted_all += file_rows_inserted
+            total_deleted_all += file_deleted
+
+        # Tính tổng số rows cuối cùng trong bảng Production
+        cur.execute(f"SELECT COUNT(*) FROM {prod_tbl};")
+        total_rows = cur.fetchone()[0]
+        total_deleted = total_deleted_all
 
         # Save encryption mapping nếu sử dụng
         if use_encryption and encrypto and encryption_mapping_file:
@@ -467,7 +612,20 @@ def copy_and_insert_to_production(
             except Exception as e:
                 logger.warning(f"Could not save encryption mapping: {e}")
         
-        logger.info(f"Production {prod_tbl}: {total_rows:,} rows inserted (sau dedup)")
+        # --- AUDIT SUMMARY ---
+        logger.info(f"==================================================")
+        logger.info(f"AUDIT SUMMARY: {prod_tbl}")
+        logger.info(f"==================================================")
+        for stat in audit_log:
+            logger.info(f"File: {stat['file']} | Read: {stat['read']:,} | Skipped: {stat['skipped']:,} | Inserted: {stat['inserted']:,}")
+        logger.info(f"--------------------------------------------------")
+        logger.info(f"TOTAL CSV ROWS READ:      {total_read_all:,}")
+        logger.info(f"TOTAL CSV ROWS SKIPPED:   {total_skipped_all:,}")
+        logger.info(f"TOTAL ROWS INSERTED:      {total_inserted_all:,}")
+        logger.info(f"TOTAL ROWS DEDUPLICATED:  {total_deleted:,}")
+        logger.info(f"FINAL DB ROW COUNT:       {total_rows:,}")
+        logger.info(f"==================================================")
+
         return total_rows
         
     except Exception as e:

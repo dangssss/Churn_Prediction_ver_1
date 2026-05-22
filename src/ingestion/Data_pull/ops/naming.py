@@ -103,11 +103,14 @@ def order_csvs_chronologically(csv_paths, expect_base: str, expect_year: int, ex
       - base phải khớp
       - start_mmdd & end_mmdd phải thuộc đúng (expect_year, expect_month)
     """
-    keyed, tail = [], []    
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    keyed = []    
     for p in csv_paths:
         m = CSV_RE.fullmatch(p.name)
         if not m or m["base"].lower() != expect_base.lower():
-            tail.append((999999, p.name, p))
+            logger.warning(f"File bị loại bỏ vì không khớp format/base: {p.name}")
             continue
 
         s_mmdd = m["start"]
@@ -118,12 +121,12 @@ def order_csvs_chronologically(csv_paths, expect_base: str, expect_year: int, ex
             ps = _mmdd_to_date(s_mmdd, y)
             pe = _mmdd_to_date(e_mmdd, y)
             if not (ps.year == pe.year == expect_year and ps.month == pe.month == expect_month):
-                raise AssertionError(f"{p.name} không thuộc {expect_month:02d}/{expect_year}.")
+                logger.warning(f"File bị loại bỏ vì không thuộc {expect_month:02d}/{expect_year}: {p.name}")
+                continue
             keyed.append((int(s_mmdd), p.name, p))
-        except Exception:
-            # nếu parse lỗi thì đẩy xuống cuối
-            tail.append((999999, p.name, p))
+        except Exception as e:
+            logger.warning(f"File bị loại bỏ vì lỗi parse thời gian: {p.name} - {e}")
+            continue
 
     keyed.sort(key=lambda x: (x[0], x[1]))
-    tail.sort(key=lambda x: x[1])
-    return [p for _, __, p in keyed] + [p for _, __, p in tail]
+    return [p for _, __, p in keyed]

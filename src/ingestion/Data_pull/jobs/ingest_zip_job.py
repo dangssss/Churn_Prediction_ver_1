@@ -108,7 +108,7 @@ def ingest_zip_job(
 
     # 1) unzip & discover
     try:
-        meta = unzip_and_discover(zip_path, fs_cfg)
+        meta = unzip_and_discover(zip_path, fs_cfg, pg_cfg)
         result["meta"] = meta
     except Exception as e:
         result["error"] = str(e)
