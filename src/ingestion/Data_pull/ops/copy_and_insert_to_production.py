@@ -95,6 +95,136 @@ TRANSFORM_DISPATCH = {
     "cas_info": transform_cas_info_row,
 }
 
+# ============================================================
+# DEDUP KEYS — khoá tự nhiên để phát hiện duplicate sau COPY
+# Nếu có khoá tự nhiên → dùng để dedup (nhanh hơn)
+# Nếu không có → so sánh toàn bộ row (chậm hơn, dùng làm fallback)
+# ============================================================
+DEDUP_KEYS: Dict[str, List[str]] = {
+    # bccp_orderitem: mỗi đơn hàng có item_code_enc duy nhất
+    "bccp_orderitem": ["item_code_enc"],
+    # cms_complaint: 1 khiếu nại = 1 (customer, item, ngày tạo, mã KN)
+    "cms_complaint": ["cms_code_enc", "item_code", "create_complaint_date", "complaint_code"],
+    # cas_customer: 1 customer chỉ có 1 bản ghi mỗi tháng
+    "cas_customer": ["cms_code_enc", "report_month"],
+    # cas_info: 1 customer chỉ có 1 bản ghi thông tin
+    "cas_info": ["cms_code_enc"],
+}
+
+
+def _dedup_exact_duplicates(cur, conn, prod_tbl: str, base: str) -> int:
+    """
+    Phát hiện và xoá duplicate rows sau khi COPY.
+    
+    Quy trình 2 bước:
+      1. Xoá trùng lặp Y HỆT NHAU (tất cả các cột giống hệt nhau):
+         - Lấy danh sách cột thực tế của bảng từ information_schema.
+         - Sử dụng ctid để chỉ giữ lại 1 row đầu tiên cho mỗi nhóm trùng toàn bộ cột.
+      2. Xoá trùng lặp theo khoá tự nhiên DEDUP_KEYS nếu có cấu hình:
+         - Giữ lại row có ctid nhỏ nhất cho mỗi nhóm trùng key (vd: item_code_enc).
+    
+    Returns:
+        Tổng số dòng đã bị xoá (0 = không có duplicate).
+    """
+    # Parse schema và table name từ prod_tbl (vd: public."bccp_orderitem_2501")
+    parts = prod_tbl.split('.')
+    if len(parts) == 2:
+        schema = parts[0].strip().strip('"')
+        tbl_name = parts[1].strip().strip('"')
+    else:
+        schema = 'public'
+        tbl_name = prod_tbl.strip().strip('"')
+
+    # Bước 1: Xoá trùng lặp y hệt nhau (tất cả các cột trùng nhau)
+    cur.execute("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+        ORDER BY ordinal_position;
+    """, (schema, tbl_name))
+    columns = [f'"{r[0]}"' for r in cur.fetchall()]
+
+    deleted_exact = 0
+    if columns:
+        cols_joined = ", ".join(columns)
+        count_exact_sql = f"""
+            SELECT COALESCE(SUM(cnt - 1), 0)
+            FROM (
+                SELECT COUNT(*) AS cnt
+                FROM {prod_tbl}
+                GROUP BY {cols_joined}
+                HAVING COUNT(*) > 1
+            ) sub;
+        """
+        cur.execute(count_exact_sql)
+        row = cur.fetchone()
+        exact_dup_count = int(row[0]) if row else 0
+
+        if exact_dup_count > 0:
+            logger.warning(
+                f"[DEDUP] {prod_tbl}: phát hiện {exact_dup_count:,} dòng trùng lặp Y HỆT NHAU (tất cả các cột). Đang xoá..."
+            )
+            delete_exact_sql = f"""
+                DELETE FROM {prod_tbl}
+                WHERE ctid NOT IN (
+                    SELECT MIN(ctid)
+                    FROM {prod_tbl}
+                    GROUP BY {cols_joined}
+                );
+            """
+            cur.execute(delete_exact_sql)
+            deleted_exact = cur.rowcount
+            conn.commit()
+            logger.warning(
+                f"[DEDUP] {prod_tbl}: đã xoá {deleted_exact:,} dòng trùng lặp y hệt nhau."
+            )
+        else:
+            logger.info(f"[DEDUP] {prod_tbl}: không phát hiện dòng trùng lặp y hệt nhau.")
+    else:
+        logger.warning(f"[DEDUP] {prod_tbl}: không lấy được danh sách cột từ schema, bỏ qua bước dedup trùng lặp y hệt.")
+
+    # Bước 2: Xoá trùng lặp theo khoá tự nhiên
+    deleted_key = 0
+    dedup_cols = DEDUP_KEYS.get(base)
+
+    if dedup_cols:
+        key_cols_sql = ', '.join([f'"{c}"' for c in dedup_cols])
+        count_key_sql = f"""
+            SELECT COALESCE(SUM(cnt - 1), 0)
+            FROM (
+                SELECT COUNT(*) AS cnt
+                FROM {prod_tbl}
+                GROUP BY {key_cols_sql}
+                HAVING COUNT(*) > 1
+            ) sub;
+        """
+        cur.execute(count_key_sql)
+        row = cur.fetchone()
+        key_dup_count = int(row[0]) if row else 0
+
+        if key_dup_count > 0:
+            logger.warning(
+                f"[DEDUP] {prod_tbl}: phát hiện {key_dup_count:,} dòng trùng khóa tự nhiên {dedup_cols} (khác biệt ở các cột khác). Đang xoá..."
+            )
+            delete_key_sql = f"""
+                DELETE FROM {prod_tbl}
+                WHERE ctid NOT IN (
+                    SELECT MIN(ctid)
+                    FROM {prod_tbl}
+                    GROUP BY {key_cols_sql}
+                );
+            """
+            cur.execute(delete_key_sql)
+            deleted_key = cur.rowcount
+            conn.commit()
+            logger.warning(
+                f"[DEDUP] {prod_tbl}: đã xoá {deleted_key:,} dòng trùng khóa tự nhiên."
+            )
+        else:
+            logger.info(f"[DEDUP] {prod_tbl}: không phát hiện trùng khóa tự nhiên (key={dedup_cols}).")
+
+    return deleted_exact + deleted_key
+
 
 def get_csv_header(csv_file: Path) -> List[str]:
     """
@@ -314,6 +444,21 @@ def copy_and_insert_to_production(
                     conn.commit()
                     total_rows += len(rows_buffer)
         
+        # 4) Dedup: xoá các dòng duplicate chính xác (tất cả cột giống nhau)
+        try:
+            deleted = _dedup_exact_duplicates(cur, conn, prod_tbl, base)
+            if deleted > 0:
+                total_rows -= deleted
+                logger.warning(
+                    f"[DEDUP] {prod_tbl}: sau dedup còn {total_rows:,} rows "
+                    f"({deleted:,} dòng duplicate đã bị xoá)."
+                )
+        except Exception as dedup_exc:
+            logger.warning(
+                f"[DEDUP] {prod_tbl}: bước dedup gặp lỗi (sẽ bỏ qua, dữ liệu vẫn có thể chứa duplicate): {dedup_exc}"
+            )
+            conn.rollback()
+
         # Save encryption mapping nếu sử dụng
         if use_encryption and encrypto and encryption_mapping_file:
             try:
@@ -322,7 +467,7 @@ def copy_and_insert_to_production(
             except Exception as e:
                 logger.warning(f"Could not save encryption mapping: {e}")
         
-        logger.info(f"Production {prod_tbl}: {total_rows:,} rows inserted")
+        logger.info(f"Production {prod_tbl}: {total_rows:,} rows inserted (sau dedup)")
         return total_rows
         
     except Exception as e:
