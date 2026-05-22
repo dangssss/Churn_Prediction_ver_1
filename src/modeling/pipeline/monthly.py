@@ -29,6 +29,44 @@ from monitoring.run_log import new_run_id, start_run, finish_run
 from monitoring.score import upsert_score_drift
 from monitoring.drift import compute_feature_drift, upsert_feature_drift
 from monitoring.backtest import run_backtest_precision_in_list
+from logging_config import get_logger
+
+logger = get_logger(__name__)
+
+
+def is_mandatory_retrain_month(window_end: int, anchor_yymm: int = 2603, interval: int = 3) -> bool:
+    """Xác định tháng hiện tại có thuộc chu kỳ 3 tháng bắt buộc retrain cố định hay không."""
+    try:
+        def yymm_to_months(yymm: int) -> int:
+            s = str(yymm).zfill(4)
+            yy = int(s[:2])
+            mm = int(s[2:])
+            return yy * 12 + mm
+        
+        diff = abs(yymm_to_months(window_end) - yymm_to_months(anchor_yymm))
+        return diff % interval == 0
+    except Exception as e:
+        logger.warning("Lỗi khi kiểm tra chu kỳ retrain bắt buộc cho month=%s: %s", window_end, e)
+        return False
+
+
+def get_active_count_for_month(engine: Engine, k: int, window_end: int) -> int:
+    """Lấy số lượng khách hàng active trong một tháng của K xác định bằng SQL COUNT nhanh."""
+    from preprocess.dataset import load_scoring_table_for_k
+    try:
+        # Load chỉ 1 dòng để lấy tên bảng thực tế tương ứng với window_end
+        _, table_name, _ = load_scoring_table_for_k(engine, k, window_end, limit_rows=1)
+        schema = "data_window"
+        
+        from sqlalchemy import text
+        q = text(f'SELECT COUNT(*) FROM "{schema}"."{table_name}" WHERE is_active_now = 1')
+        with engine.connect() as conn:
+            cnt = conn.execute(q).scalar()
+            return int(cnt)
+    except Exception as e:
+        logger.warning("[GUARD-RAIL] Không thể đếm số lượng active_cnt cho K=%d, month=%d: %s", k, window_end, e)
+        return 0
+
 
 
 def _train_main_inline(engine: Engine, *, horizon: int, bundle_dir: Path) -> dict:
@@ -137,12 +175,49 @@ def run_monthly_pipeline(
         t_current = int(cand_cfg["as_of_month"])
 
         # 2) Decide accept
-        if prev_f1 is None:
+        is_mandatory = is_mandatory_retrain_month(t_current)
+        pass_guardrail = True
+        active_ratio = 1.0
+        active_cnt_cur = 0
+        active_cnt_prev = 0
+        t_prev = None
+
+        if not is_mandatory:
+            from infra.yymm import shift_yymm
+            try:
+                t_prev = int(shift_yymm(str(t_current), -1))
+                active_cnt_cur = get_active_count_for_month(engine, cand_k, t_current)
+                active_cnt_prev = get_active_count_for_month(engine, cand_k, t_prev)
+                if active_cnt_prev > 0:
+                    active_ratio = active_cnt_cur / active_cnt_prev
+                    if active_ratio < 0.80:
+                        pass_guardrail = False
+                else:
+                    logger.warning("[GUARD-RAIL] Không có active customers ở tháng trước %s. Tự động kích hoạt guardrail.", t_prev)
+                    pass_guardrail = False
+            except Exception as e:
+                logger.warning("[GUARD-RAIL] Gặp lỗi khi tính toán guardrail active customers: %s. Chặn retrain để an toàn.", e)
+                pass_guardrail = False
+
+        if is_mandatory:
             accepted = True
-            rule = "accepted_no_prev"
+            rule = "accepted_mandatory_cycle"
+            logger.info("[CYCLE] Tháng %d thuộc chu kỳ 3 tháng cố định. BẮT BUỘC RETRAIN (bỏ qua check guardrail).", t_current)
+        elif not pass_guardrail:
+            accepted = False
+            rule = "rejected_by_guardrail_incomplete_data"
+            logger.warning(
+                "[GUARD] Tháng %d chưa hoàn thành dữ liệu (Active: %d vs tháng trước %s: %d, Tỷ lệ: %.2f < 0.80). "
+                "HỦY RETRAIN, giữ nguyên model cũ và chỉ chạy scoring.", 
+                t_current, active_cnt_cur, t_prev, active_cnt_prev, active_ratio
+            )
         else:
-            accepted = bool(cand_f1 > (prev_f1 + f1_improve_eps))
-            rule = "accepted_f1_improved" if accepted else "rejected_f1_not_improved"
+            if prev_f1 is None:
+                accepted = True
+                rule = "accepted_no_prev"
+            else:
+                accepted = bool(cand_f1 > (prev_f1 + f1_improve_eps))
+                rule = "accepted_f1_improved" if accepted else "rejected_f1_not_improved"
 
         cand_cfg["is_accepted"] = bool(accepted)
         cand_cfg["prev_accepted_f1"] = prev_f1
@@ -247,6 +322,13 @@ def run_monthly_pipeline(
                 best_k_for_population=int(k_min),
             )
 
+        guardrail_meta = {
+            "is_mandatory_cycle": bool(is_mandatory),
+            "pass_guardrail": bool(pass_guardrail),
+            "active_ratio": round(float(active_ratio), 4),
+            "active_cnt_cur": int(active_cnt_cur),
+            "active_cnt_prev": int(active_cnt_prev),
+        }
         finish_run(
             engine,
             run_id=run_id,
@@ -257,7 +339,13 @@ def run_monthly_pipeline(
             cand_is_accepted=bool(accepted),
             did_retrain=bool(did_retrain),
             did_score=bool(did_score),
-            notes=f"accept_rule={rule}; backtest={'yes' if bt else 'no'}",
+            notes=(
+                f"accept_rule={rule}; "
+                f"mandatory={is_mandatory}; "
+                f"guardrail={'pass' if pass_guardrail else 'blocked'}; "
+                f"active_ratio={active_ratio:.2f}; "
+                f"backtest={'yes' if bt else 'no'}"
+            ),
         )
 
         return {
@@ -266,6 +354,7 @@ def run_monthly_pipeline(
             "candidate": cand_cfg,
             "accepted": bool(accepted),
             "did_retrain": bool(did_retrain),
+            "guardrail": guardrail_meta,
             "export": res,
             "backtest": bt,
         }
