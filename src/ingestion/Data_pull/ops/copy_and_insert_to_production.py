@@ -615,10 +615,14 @@ def copy_and_insert_to_production(
         # Ước tính tổng rows trong production bằng pg_class.reltuples (rất nhanh, sau ANALYZE).
         # Chính xác hơn COUNT(*) sequential scan cho mục đích audit log.
         try:
+            # Chạy ANALYZE để DB cập nhật số lượng dòng chính xác ngay lập tức
+            cur.execute(f"ANALYZE {prod_tbl};")
+            conn.commit()
+
             cur.execute(
                 "SELECT reltuples::bigint FROM pg_class "
-                "WHERE relname = %s AND relnamespace = 'public'::regnamespace",
-                (table_name,)
+                "WHERE relname = %s AND relnamespace = %s::regnamespace",
+                (table_name, prod_schema)
             )
             row = cur.fetchone()
             total_rows = row[0] if (row and row[0] > 0) else total_inserted_all
