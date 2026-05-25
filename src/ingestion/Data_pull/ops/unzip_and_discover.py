@@ -92,22 +92,8 @@ def unzip_and_discover(
     shutil.copy2(str(zip_path), str(dest_zip))
     logger.info(f"Copied ZIP from {zip_path.name} to {extract_dir}")
 
-    # 4) Load ingested hashes from database
-    already_ingested_hashes = set()
-    if pg_cfg is not None:
-        try:
-            conn = get_pg_conn(pg_cfg)
-            with conn.cursor() as cur:
-                ensure_manifest_table(cur)
-                conn.commit()
-                cur.execute("SELECT file_sha256 FROM public.ingestion_manifest;")
-                already_ingested_hashes = {row[0] for row in cur.fetchall()}
-            conn.close()
-            logger.info(f"Loaded {len(already_ingested_hashes)} hashes from public.ingestion_manifest")
-        except Exception as e:
-            logger.warning(f"Could not read ingestion_manifest: {e}")
+    # 4) (Removed manifest check because Full Refresh requires extracting all CSVs)
 
-    # 5) Giải nén từ bản trong saved_data (Chỉ giải nén các file chưa ingest)
     import hashlib
     csv_hashes = {}
     extracted_csv_paths = []
@@ -129,12 +115,7 @@ def unzip_and_discover(
                 file_hash = sha.hexdigest()
                 
                 member_filename = Path(member.filename).name
-                
-                # Nếu đã ingest rồi thì bỏ qua
-                if file_hash in already_ingested_hashes:
-                    logger.info(f"CSV '{member_filename}' (SHA256: {file_hash}) already ingested. Skipping extraction.")
-                    continue
-                
+                # (Removed skip logic: always extract for Full Refresh)
                 # Giải nén file
                 extracted_path = Path(zf.extract(member, extract_dir))
                 extracted_csv_paths.append(extracted_path)
