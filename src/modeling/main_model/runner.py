@@ -136,14 +136,19 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
     params = dict(
         n_estimators=5000,
         learning_rate=0.01,
-        max_depth=8,
-        subsample=0.85,
-        colsample_bytree=0.85,
-        reg_lambda=1.0,
+        max_depth=6,
+        max_leaves=63,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        colsample_bylevel=0.7,
+        reg_lambda=2.0,
+        reg_alpha=1.0, 
+        min_child_weight=100,
+        gamma=0.2,
         tree_method="hist",
         random_state=42,
-        scale_pos_weight=spw,
-        eval_metric="aucpr",
+        scale_pos_weight='spw',
+        eval_metric=["aucpr", "logloss"]
     )
 
     feature_name_map = None
