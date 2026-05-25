@@ -376,6 +376,12 @@ def copy_and_insert_to_production(
         cur.execute(ddl)
         conn.commit()
         logger.info(f"Ensured production table: {prod_tbl}")
+
+        # 1.5) TRUNCATE bảng trước khi chạy để đảm bảo chế độ Full Refresh (Snapshot / Monthly).
+        # Cách này dọn sạch rác, historical duplicates và các dữ liệu bị xóa từ source.
+        cur.execute(f"TRUNCATE TABLE {prod_tbl};")
+        conn.commit()
+        logger.info(f"TRUNCATED table {prod_tbl} before loading new ZIP data.")
         
         # 2) Đảm bảo bảng manifest tồn tại và lấy danh sách csv_hashes
         try:
@@ -416,11 +422,10 @@ def copy_and_insert_to_production(
                         sha.update(block)
                 file_sha256 = sha.hexdigest()
 
-            # Kiểm tra xem đã ingest chưa
+            # Ghi nhận mã băm (bỏ qua bước skip vì bảng đã bị TRUNCATE, bắt buộc phải load lại toàn bộ CSV)
             cur.execute("SELECT 1 FROM public.ingestion_manifest WHERE file_sha256 = %s LIMIT 1;", (file_sha256,))
             if cur.fetchone():
-                logger.info(f"CSV file {csv_file.name} (SHA256: {file_sha256}) already in manifest database. Skipping.")
-                continue
+                logger.info(f"CSV file {csv_file.name} (SHA256: {file_sha256}) seen before, but will reload due to Full Refresh.")
 
             file_rows_read = 0
             file_rows_skipped = 0
@@ -536,38 +541,61 @@ def copy_and_insert_to_production(
             # Bỏ qua bước dedup-on-staging để tiết kiệm thời gian (~9s/bảng).
             # Duplicate giữa staging và production được xử lý bởi WHERE NOT EXISTS ở dưới.
             if file_rows_staged > 0:
-                # Insert từ staging_tbl vào prod_tbl WHERE NOT EXISTS
+                # Thực hiện UPSERT: Xóa dòng cũ nếu trùng key, sau đó Insert dòng mới
+                # Cách này đảm bảo:
+                # 1. Các đơn hàng có cập nhật sẽ được ghi đè bản mới nhất.
+                # 2. File chạy sau (mới hơn) sẽ ghi đè dữ liệu của file chạy trước (nếu trùng giao dịch).
                 col_str = ", ".join([f'"{c}"' for c in columns_to_insert])
                 dedup_cols = DEDUP_KEYS.get(base)
-                if dedup_cols:
-                    # Dùng '=' để Postgres dùng Hash Anti-Join (nhanh hơn IS NOT DISTINCT FROM)
-                    key_conditions = " AND ".join([f'p."{col}" = s."{col}"' for col in dedup_cols])
-                    insert_sql = f"""
-                        INSERT INTO {prod_tbl} ({col_str})
-                        SELECT {col_str} FROM {staging_tbl} s
-                        WHERE NOT EXISTS (
-                            SELECT 1 FROM {prod_tbl} p
-                            WHERE {key_conditions}
-                        );
-                    """
-                else:
-                    all_cols_cond = " AND ".join([f'p."{col}" = s."{col}"' for col in columns_to_insert])
-                    insert_sql = f"""
-                        INSERT INTO {prod_tbl} ({col_str})
-                        SELECT {col_str} FROM {staging_tbl} s
-                        WHERE NOT EXISTS (
-                            SELECT 1 FROM {prod_tbl} p
-                            WHERE {all_cols_cond}
-                        );
-                    """
-
+                
                 try:
-                    cur.execute(insert_sql)
-                    file_rows_inserted = cur.rowcount
+                    if dedup_cols:
+                        key_conditions = " AND ".join([f'p."{col}" = s."{col}"' for col in dedup_cols])
+                        key_cols_sql = ", ".join([f'"{col}"' for col in dedup_cols])
+                        
+                        # 1. DELETE các bản ghi cũ trùng khóa
+                        delete_sql = f"""
+                            DELETE FROM {prod_tbl} p
+                            USING {staging_tbl} s
+                            WHERE {key_conditions};
+                        """
+                        cur.execute(delete_sql)
+                        file_deleted = cur.rowcount
+                        
+                        # 2. INSERT các bản ghi mới (lọc trùng lặp bên trong nội bộ staging bằng ROW_NUMBER)
+                        insert_sql = f"""
+                            INSERT INTO {prod_tbl} ({col_str})
+                            SELECT {col_str} FROM (
+                                SELECT {col_str}, ROW_NUMBER() OVER(PARTITION BY {key_cols_sql}) as rn
+                                FROM {staging_tbl}
+                            ) sub
+                            WHERE rn = 1;
+                        """
+                        cur.execute(insert_sql)
+                        file_rows_inserted = cur.rowcount
+                        
+                    else:
+                        # Fallback (exact match): delete exact match to avoid duplication
+                        all_cols_cond = " AND ".join([f'p."{col}" = s."{col}"' for col in columns_to_insert])
+                        delete_sql = f"""
+                            DELETE FROM {prod_tbl} p
+                            USING {staging_tbl} s
+                            WHERE {all_cols_cond};
+                        """
+                        cur.execute(delete_sql)
+                        file_deleted = cur.rowcount
+
+                        insert_sql = f"""
+                            INSERT INTO {prod_tbl} ({col_str})
+                            SELECT {col_str} FROM {staging_tbl} s;
+                        """
+                        cur.execute(insert_sql)
+                        file_rows_inserted = cur.rowcount
+                        
                     conn.commit()
-                    logger.info(f"[{base}] Inserted {file_rows_inserted:,} new rows from {csv_file.name} into {prod_tbl}.")
+                    logger.info(f"[{base}] Upserted {file_rows_inserted:,} rows (deleted {file_deleted:,} overlapping rows) from {csv_file.name}.")
                 except Exception as insert_exc:
-                    logger.error(f"Failed to insert from staging to production: {insert_exc}")
+                    logger.error(f"Failed to upsert from staging to production: {insert_exc}")
                     conn.rollback()
                     raise
             else:
@@ -612,20 +640,12 @@ def copy_and_insert_to_production(
             total_inserted_all += file_rows_inserted
             total_deleted_all += file_deleted
 
-        # Ước tính tổng rows trong production bằng pg_class.reltuples (rất nhanh, sau ANALYZE).
-        # Chính xác hơn COUNT(*) sequential scan cho mục đích audit log.
+        # Chuyển lại dùng SELECT COUNT(*) để có con số chính xác tuyệt đối cho Audit Log.
+        # pg_class.reltuples chỉ là số ước tính (có thể sai số hàng triệu dòng nếu bảng có dead tuples).
         try:
-            # Chạy ANALYZE để DB cập nhật số lượng dòng chính xác ngay lập tức
-            cur.execute(f"ANALYZE {prod_tbl};")
-            conn.commit()
-
-            cur.execute(
-                "SELECT reltuples::bigint FROM pg_class "
-                "WHERE relname = %s AND relnamespace = %s::regnamespace",
-                (table_name, prod_schema)
-            )
+            cur.execute(f"SELECT COUNT(*) FROM {prod_tbl}")
             row = cur.fetchone()
-            total_rows = row[0] if (row and row[0] > 0) else total_inserted_all
+            total_rows = row[0] if row else total_inserted_all
         except Exception:
             total_rows = total_inserted_all
         total_deleted = total_deleted_all
