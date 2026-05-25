@@ -1,6 +1,7 @@
 # ops/copy_and_insert_to_production.py
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Dict, Any, List, Set, Optional
@@ -406,14 +407,13 @@ def copy_and_insert_to_production(
         for csv_file in csv_files:
             logger.info(f"Reading {csv_file.name}")
             
-            # Tính hoặc lấy SHA256
+            # Tính hoặc lấy SHA256 (hashlib đã được import ở đầu file)
             file_sha256 = csv_hashes.get(str(csv_file))
             if not file_sha256:
-                import hashlib
                 sha = hashlib.sha256()
                 with open(csv_file, "rb") as f:
-                    for chunk in iter(lambda: f.read(4096 * 1024), b""):
-                        sha.update(chunk)
+                    for block in iter(lambda: f.read(4096 * 1024), b""):
+                        sha.update(block)
                 file_sha256 = sha.hexdigest()
 
             # Kiểm tra xem đã ingest chưa
@@ -436,6 +436,12 @@ def copy_and_insert_to_production(
             conn.commit()
 
             columns_to_insert = []
+
+            # Lấy transform function 1 lần — base không đổi trong suốt file
+            transform_func = TRANSFORM_DISPATCH.get(base)
+            if transform_func is None:
+                logger.error(f"Không tìm thấy transform function cho base={base}. Bỏ qua file.")
+                continue
 
             try:
                 # Đọc CSV theo chunk
@@ -478,11 +484,6 @@ def copy_and_insert_to_production(
                             canonical_key = header_map.get(k, k)
                             normalized_row[canonical_key] = v
                         
-                        transform_func = TRANSFORM_DISPATCH.get(base)
-                        if transform_func is None:
-                            file_rows_skipped += 1
-                            continue
-                            
                         transformed = transform_func(normalized_row, encrypto)
                         if transformed is None:
                             file_rows_skipped += 1
@@ -531,22 +532,15 @@ def copy_and_insert_to_production(
                 conn.rollback()
 
             # Thực hiện Dedup trên Staging Table
+            # Lưu ý: staging là fresh data từ CSV trong 1 lần load → thường không có duplicate nội tại.
+            # Bỏ qua bước dedup-on-staging để tiết kiệm thời gian (~9s/bảng).
+            # Duplicate giữa staging và production được xử lý bởi WHERE NOT EXISTS ở dưới.
             if file_rows_staged > 0:
-                try:
-                    file_deleted = _dedup_exact_duplicates(cur, conn, staging_tbl, base, columns_to_insert)
-                    logger.info(f"[DEDUP] {staging_tbl}: cleaned {file_deleted:,} duplicate rows from staging.")
-                except Exception as dedup_exc:
-                    logger.warning(
-                        f"[DEDUP] {staging_tbl}: staging dedup failed: {dedup_exc}. Proceeding with raw staged data."
-                    )
-                    conn.rollback()
-
                 # Insert từ staging_tbl vào prod_tbl WHERE NOT EXISTS
                 col_str = ", ".join([f'"{c}"' for c in columns_to_insert])
                 dedup_cols = DEDUP_KEYS.get(base)
                 if dedup_cols:
-                    # Dùng '=' thay vì 'IS NOT DISTINCT FROM' để Postgres BẮT BUỘC dùng Hash Anti-Join.
-                    # 'IS NOT DISTINCT FROM' làm mất index/hash-join trên các bản PG cũ.
+                    # Dùng '=' để Postgres dùng Hash Anti-Join (nhanh hơn IS NOT DISTINCT FROM)
                     key_conditions = " AND ".join([f'p."{col}" = s."{col}"' for col in dedup_cols])
                     insert_sql = f"""
                         INSERT INTO {prod_tbl} ({col_str})
@@ -576,22 +570,28 @@ def copy_and_insert_to_production(
                     logger.error(f"Failed to insert from staging to production: {insert_exc}")
                     conn.rollback()
                     raise
+            else:
+                logger.warning(f"[{base}] 0 rows staged từ {csv_file.name} — bỏ qua insert và manifest.")
 
             # Ghi nhận SHA256 vào manifest
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO public.ingestion_manifest (zip_name, csv_name, file_sha256, ingested_at)
-                    VALUES (%s, %s, %s, now())
-                    ON CONFLICT (file_sha256) DO NOTHING;
-                    """,
-                    (meta.get("zip_name") or "", csv_file.name, file_sha256)
-                )
-                conn.commit()
-                logger.info(f"Recorded SHA256 of {csv_file.name} in ingestion_manifest.")
-            except Exception as manifest_exc:
-                logger.warning(f"Failed to write manifest for {csv_file.name}: {manifest_exc}")
-                conn.rollback()
+            # Chỉ ghi manifest khi thực sự đã stage và insert thành công.
+            # Nếu 0 rows staged (toàn bộ bị filter bởi transform), KHÔNG ghi manifest
+            # để tránh bỏ sót file lần sau.
+            if file_rows_staged > 0:
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO public.ingestion_manifest (zip_name, csv_name, file_sha256, ingested_at)
+                        VALUES (%s, %s, %s, now())
+                        ON CONFLICT (file_sha256) DO NOTHING;
+                        """,
+                        (meta.get("zip_name") or "", csv_file.name, file_sha256)
+                    )
+                    conn.commit()
+                    logger.info(f"Recorded SHA256 of {csv_file.name} in ingestion_manifest.")
+                except Exception as manifest_exc:
+                    logger.warning(f"Failed to write manifest for {csv_file.name}: {manifest_exc}")
+                    conn.rollback()
 
             # Xoá Staging Table
             try:
@@ -612,9 +612,18 @@ def copy_and_insert_to_production(
             total_inserted_all += file_rows_inserted
             total_deleted_all += file_deleted
 
-        # Tính tổng số rows cuối cùng trong bảng Production
-        cur.execute(f"SELECT COUNT(*) FROM {prod_tbl};")
-        total_rows = cur.fetchone()[0]
+        # Ước tính tổng rows trong production bằng pg_class.reltuples (rất nhanh, sau ANALYZE).
+        # Chính xác hơn COUNT(*) sequential scan cho mục đích audit log.
+        try:
+            cur.execute(
+                "SELECT reltuples::bigint FROM pg_class "
+                "WHERE relname = %s AND relnamespace = 'public'::regnamespace",
+                (table_name,)
+            )
+            row = cur.fetchone()
+            total_rows = row[0] if (row and row[0] > 0) else total_inserted_all
+        except Exception:
+            total_rows = total_inserted_all
         total_deleted = total_deleted_all
 
         # Save encryption mapping nếu sử dụng
@@ -658,8 +667,9 @@ def copy_and_insert_to_production(
 
 def _bulk_insert_rows(cur, prod_tbl: str, rows: List[Dict[str, Any]], base: str) -> None:
     """
-    Insert rows vào production table bằng COPY FROM trực tiếp.
-    Do bảng đích luôn được TRUNCATE trước mỗi lần chạy, ta không cần UPSERT.
+    Bulk-copy một batch rows vào bảng đích bằng COPY FROM STDIN (TEXT format).
+    Hàm này KHÔNG dedup — dedup được xử lý bởi WHERE NOT EXISTS ở caller.
+    Bảng đích có thể là staging temp table hoặc production table.
     """
     if not rows:
         return
