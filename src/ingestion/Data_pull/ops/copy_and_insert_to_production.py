@@ -472,17 +472,17 @@ def copy_and_insert_to_production(
                         first_chunk = False
 
                     rows_buffer = []
-                    records = chunk.to_dict('records')
-                    for raw_row in records:
-                        raw_row = {
-                            (k.strip() if isinstance(k, str) else k): v
-                            for k, v in raw_row.items()
-                        }
-                        
-                        normalized_row = {}
-                        for k, v in raw_row.items():
-                            canonical_key = header_map.get(k, k)
-                            normalized_row[canonical_key] = v
+                    
+                    # Tối ưu: Xử lý keys 1 lần duy nhất cho cả chunk thay vì mỗi row
+                    # 1. Strip whitespace từ tên cột
+                    stripped_cols = [str(c).strip() for c in chunk.columns]
+                    # 2. Map thẳng sang canonical keys
+                    canonical_cols = [header_map.get(c, c) for c in stripped_cols]
+                    
+                    # Dùng itertuples nhanh hơn to_dict('records') rất nhiều
+                    for row_tuple in chunk.itertuples(index=False, name=None):
+                        # Ghép trực tiếp canonical keys với values của row
+                        normalized_row = dict(zip(canonical_cols, row_tuple))
                         
                         transformed = transform_func(normalized_row, encrypto)
                         if transformed is None:
