@@ -519,6 +519,17 @@ def copy_and_insert_to_production(
             # Commit toàn bộ dữ liệu staging 1 lần duy nhất sau khi đọc xong file
             conn.commit()
 
+            # BẮT BUỘC: Cập nhật thống kê cho TEMP TABLE.
+            # Nếu không có ANALYZE, Postgres nghĩ bảng staging có 0 dòng và sẽ
+            # chọn Nested Loop join cho NOT EXISTS, gây treo database nhiều ngày.
+            try:
+                cur.execute(f"ANALYZE {staging_tbl};")
+                conn.commit()
+                logger.info(f"Analyzed {staging_tbl}")
+            except Exception as e:
+                logger.warning(f"Could not analyze {staging_tbl}: {e}")
+                conn.rollback()
+
             # Thực hiện Dedup trên Staging Table
             if file_rows_staged > 0:
                 try:
@@ -534,7 +545,9 @@ def copy_and_insert_to_production(
                 col_str = ", ".join([f'"{c}"' for c in columns_to_insert])
                 dedup_cols = DEDUP_KEYS.get(base)
                 if dedup_cols:
-                    key_conditions = " AND ".join([f'p."{col}" IS NOT DISTINCT FROM s."{col}"' for col in dedup_cols])
+                    # Dùng '=' thay vì 'IS NOT DISTINCT FROM' để Postgres BẮT BUỘC dùng Hash Anti-Join.
+                    # 'IS NOT DISTINCT FROM' làm mất index/hash-join trên các bản PG cũ.
+                    key_conditions = " AND ".join([f'p."{col}" = s."{col}"' for col in dedup_cols])
                     insert_sql = f"""
                         INSERT INTO {prod_tbl} ({col_str})
                         SELECT {col_str} FROM {staging_tbl} s
@@ -544,7 +557,7 @@ def copy_and_insert_to_production(
                         );
                     """
                 else:
-                    all_cols_cond = " AND ".join([f'p."{col}" IS NOT DISTINCT FROM s."{col}"' for col in columns_to_insert])
+                    all_cols_cond = " AND ".join([f'p."{col}" = s."{col}"' for col in columns_to_insert])
                     insert_sql = f"""
                         INSERT INTO {prod_tbl} ({col_str})
                         SELECT {col_str} FROM {staging_tbl} s
