@@ -103,8 +103,8 @@ TRANSFORM_DISPATCH = {
 # Nếu không có → so sánh toàn bộ row (chậm hơn, dùng làm fallback)
 # ============================================================
 DEDUP_KEYS: Dict[str, List[str]] = {
-    # bccp_orderitem: mỗi đơn hàng có item_code_enc duy nhất
-    "bccp_orderitem": ["item_code_enc"],
+    # bccp_orderitem: mỗi đơn hàng có item_code duy nhất (dù raw CSV là item_code_enc)
+    "bccp_orderitem": ["item_code"],
     # cms_complaint: 1 khiếu nại = 1 (customer, item, ngày tạo, mã KN)
     "cms_complaint": ["cms_code_enc", "item_code", "create_complaint_date", "complaint_code"],
     # cas_customer: 1 customer chỉ có 1 bản ghi mỗi tháng
