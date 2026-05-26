@@ -19,7 +19,7 @@ from .gating import apply_gate
 
 logger = logging.getLogger(__name__)
 
-def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 1.0, percentile_upper: float = 99.0) -> pd.DataFrame:
+def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 0.1, percentile_upper: float = 99.9) -> pd.DataFrame:
     df_clipped = df.copy()
     outlier_summary = []
     
@@ -46,25 +46,46 @@ def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 1.0, perce
         if lower_bound == upper_bound:
             continue
             
-        low_mask = vals < lower_bound
-        high_mask = vals > upper_bound
+        v_max = vals.max()
+        v_min = vals.min()
+        
+        should_clip_high = False
+        should_clip_low = False
+        
+        # Chỉ thực sự clip nếu giá trị max/min vượt quá xa ngưỡng 99.9% / 0.1% để tránh làm phẳng các cột thưa (sparse) hoặc nhị phân
+        if upper_bound > 0 and v_max > 5 * upper_bound:
+            should_clip_high = True
+            
+        if lower_bound < 0 and v_min < 5 * lower_bound:
+            should_clip_low = True
+            
+        clip_low = lower_bound if should_clip_low else v_min
+        clip_high = upper_bound if should_clip_high else v_max
+        
+        if clip_low == clip_high:
+            continue
+            
+        low_mask = vals < clip_low
+        high_mask = vals > clip_high
         
         low_count = low_mask.sum()
         high_count = high_mask.sum()
         
         if low_count > 0 or high_count > 0:
-            df_clipped[col] = vals.clip(lower_bound, upper_bound)
+            df_clipped[col] = vals.clip(clip_low, clip_high)
             outlier_summary.append({
                 "column": col,
                 "low_count": low_count,
-                "high_count": high_count
+                "high_count": high_count,
+                "clip_low": clip_low,
+                "clip_high": clip_high
             })
             
     if outlier_summary:
         logger.info(
-            "[OUTLIER DETECTION] Đã cắt ngoại lai (1%% - 99%%) cho %d cột. Một số cột ví dụ: %s",
+            "[OUTLIER DETECTION] Đã cắt ngoại lai cho %d cột có giá trị cực đại dị thường. Một số cột ví dụ: %s",
             len(outlier_summary),
-            ", ".join(x["column"] for x in outlier_summary[:5])
+            ", ".join(f"{x['column']} (high_clip={x['clip_high']:.2f}, count={x['high_count']})" for x in outlier_summary[:5])
         )
         
     return df_clipped

@@ -150,7 +150,7 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
         gamma=0.2,
         tree_method="hist",
         random_state=42,
-        scale_pos_weight='spw',
+        scale_pos_weight=spw,
         eval_metric=["aucpr", "logloss"]
     )
 
