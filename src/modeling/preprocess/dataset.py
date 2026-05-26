@@ -160,10 +160,7 @@ def build_labeled_pair(
         # rpi per column; chỉ lấy khi item > 0
         _rpi_mat = _rev_mat.values / _item_mat2.values.clip(1)  # tránh /0, giá trị khi item=0 bị mask dưới
         _rpi_mat_masked = np.where(_item_mat2.values > 0, _rpi_mat, np.nan)
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            _avg_rpi_3m = pd.Series(np.nanmean(_rpi_mat_masked, axis=1), index=df_tp.index).fillna(0)
+        _avg_rpi_3m = pd.DataFrame(_rpi_mat_masked, index=df_tp.index).mean(axis=1).fillna(0)
         _rpi_last   = np.where(item_tp > 0, rev_tp / item_tp.clip(1), 0)
         c2 = (_avg_rpi_3m > 0) & (_rpi_last < 0.60 * _avg_rpi_3m)
     else:
