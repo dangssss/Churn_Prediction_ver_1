@@ -41,6 +41,9 @@ def run_sweep_k(
             )
             if out is None:
                 continue
+            if out.get('degenerate'):
+                print(f"[WARN] Skipping degenerate K={k} use_static={use_static} (predict-all-positive)")
+                continue
             ablation.append(out)
             print(f"K={k} | use_static={use_static} | val={out.get('val_month')} | "
                   f"F1={out['f1']:.4f} | PR_AUC={out['PR_AUC_val']:.4f}")

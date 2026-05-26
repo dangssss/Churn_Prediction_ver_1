@@ -68,7 +68,16 @@ def best_threshold_by_f1(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     f1s = (2 * prec[:-1] * rec[:-1]) / (prec[:-1] + rec[:-1] + 1e-9)
     if len(f1s) == 0:
         return 0.5
-    return float(thr[int(np.argmax(f1s))])
+    best_idx = int(np.argmax(f1s))
+    # Bug fix: nếu argmax trả về index 0 (predict all positive — degenerate)
+    # thì tìm best trong phần còn lại để tránh threshold ≈ 0
+    if best_idx == 0 and len(f1s) > 1:
+        rest_idx = int(np.argmax(f1s[1:])) + 1
+        # chỉ dùng nếu f1 tại rest_idx không kém quá 5%
+        if f1s[rest_idx] >= f1s[0] * 0.95:
+            best_idx = rest_idx
+    # Clamp: không cho threshold xuống dưới 5% để tránh predict all-positive
+    return float(max(thr[best_idx], 0.05))
 
 def time_split_train_val_last_month(df: pd.DataFrame, time_col: str = "window_end"):
     df2 = df.copy()
@@ -121,7 +130,7 @@ def eval_one_k_train_val(
     pre = make_preprocess(num_cols, cat_cols)
     clf = LogisticRegression(
         max_iter=5000,
-        solver="lbfgs",
+        solver="saga",   # saga hội tụ tốt hơn lbfgs khi feature space lớn
         class_weight={0: 1.0, 1: spw},
     )
     pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
@@ -134,6 +143,15 @@ def eval_one_k_train_val(
 
     thr = best_threshold_by_f1(y_va.to_numpy(), va_prob)
     yhat = (va_prob >= thr).astype(int)
+
+    f1_val = float(f1_score(y_va, yhat, zero_division=0))
+
+    # Bug #2: đánh dấu degenerate nếu F1 gần bằng predict-all-positive
+    prevalence = float(y_va.mean())
+    dummy_f1 = 2 * prevalence / (prevalence + 1 + 1e-9)
+    is_degenerate = abs(f1_val - dummy_f1) < 0.005
+    if is_degenerate:
+        print(f"  [WARN] K={k} use_static={use_static}: model degenerate (F1={f1_val:.4f} ≈ dummy={dummy_f1:.4f}, predict-all-positive)")
 
     return {
         "K": int(k),
@@ -150,5 +168,6 @@ def eval_one_k_train_val(
         "best_threshold": float(thr),
         "precision": float(precision_score(y_va, yhat, zero_division=0)),
         "recall": float(recall_score(y_va, yhat, zero_division=0)),
-        "f1": float(f1_score(y_va, yhat, zero_division=0)),
+        "f1": f1_val,
+        "degenerate": is_degenerate,
     }

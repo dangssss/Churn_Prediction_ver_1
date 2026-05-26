@@ -36,7 +36,10 @@ def average_precision_np(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float(ap)
 
 def best_threshold_by_f1_np(y_true: np.ndarray, y_prob: np.ndarray, n_grid: int = 400):
-    lo, hi = float(np.min(y_prob)), float(np.max(y_prob))
+    lo = max(float(np.min(y_prob)), 0.05)  # floor: tránh ngưỡng ≈ 0 → predict all-positive
+    hi = float(np.max(y_prob))
+    if lo >= hi:
+        lo = max(hi * 0.1, 0.05)
     grid = np.linspace(lo, hi, n_grid)
     best = (0.5, 0.0, 0.0, 0.0)  # thr, p, r, f1
     for thr in grid:
