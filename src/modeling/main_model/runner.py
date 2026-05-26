@@ -3,8 +3,11 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+import logging
 
-from sklearn.metrics import average_precision_score, roc_auc_score
+logger = logging.getLogger(__name__)
+
+from sklearn.metrics import average_precision_score, roc_auc_score, confusion_matrix
 from sklearn.linear_model import LogisticRegression
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
@@ -184,6 +187,18 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
     # optimize threshold on MAIN val
     thr_opt, p_opt, r_opt, f1_opt = best_threshold_by_f1_np(y_va, va_prob, n_grid=600)
     ap = average_precision_np(y_va, va_prob)
+    
+    # Calculate and log confusion matrix at optimal threshold
+    y_pred_opt = (va_prob >= thr_opt).astype(int)
+    cm = confusion_matrix(y_va, y_pred_opt)
+    logger.info(
+        "\n[MAIN MODEL EVALUATION]\n"
+        "Confusion Matrix on Validation Set (Threshold = %.4f):\n"
+        "                     Predicted Active (0) | Predicted Churn (1)\n"
+        "Actual Active (0) | %-20d | %-20d\n"
+        "Actual Churn (1)  | %-20d | %-20d",
+        thr_opt, cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
+    )
 
     # --- early stop meta
     best_it = getattr(model, "best_iteration", None)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 from sqlalchemy.engine import Engine
 
@@ -14,6 +16,58 @@ from .feature_tables import (
     list_tables_for_k,
 )
 from .gating import apply_gate
+
+logger = logging.getLogger(__name__)
+
+def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 1.0, percentile_upper: float = 99.0) -> pd.DataFrame:
+    df_clipped = df.copy()
+    outlier_summary = []
+    
+    # Bỏ qua các cột metadata và nhãn
+    skip_cols = {"cms_code_enc", "window_size", "window_start", "window_end", 
+                 "source_table_t", "source_table_t_plus_h", 
+                 "is_active_now", "is_churned_now", "gate_group"}
+    
+    num_cols = []
+    for c in df_clipped.columns:
+        if c in skip_cols or c.startswith("y_churn_"):
+            continue
+        if pd.api.types.is_numeric_dtype(df_clipped[c]):
+            num_cols.append(c)
+            
+    for col in num_cols:
+        vals = pd.to_numeric(df_clipped[col], errors='coerce')
+        if vals.isna().all():
+            continue
+            
+        lower_bound = np.nanpercentile(vals, percentile_lower)
+        upper_bound = np.nanpercentile(vals, percentile_upper)
+        
+        if lower_bound == upper_bound:
+            continue
+            
+        low_mask = vals < lower_bound
+        high_mask = vals > upper_bound
+        
+        low_count = low_mask.sum()
+        high_count = high_mask.sum()
+        
+        if low_count > 0 or high_count > 0:
+            df_clipped[col] = vals.clip(lower_bound, upper_bound)
+            outlier_summary.append({
+                "column": col,
+                "low_count": low_count,
+                "high_count": high_count
+            })
+            
+    if outlier_summary:
+        logger.info(
+            "[OUTLIER DETECTION] Đã cắt ngoại lai (1%% - 99%%) cho %d cột. Một số cột ví dụ: %s",
+            len(outlier_summary),
+            ", ".join(x["column"] for x in outlier_summary[:5])
+        )
+        
+    return df_clipped
 
 def future_table_for_pair(k: int, start: str, end: str, horizon: int) -> str:
     start_h = shift_yymm(start, horizon)
@@ -47,6 +101,11 @@ def build_labeled_pair(
     item_tp = pd.to_numeric(df_tp[cols_tp["item_now"]], errors="coerce").fillna(0)
     rev_tp  = pd.to_numeric(df_tp[cols_tp["rev_now"]],  errors="coerce").fillna(0)
     y = ((item_tp == 0) & (rev_tp == 0)).astype(int)
+    
+    n_pos = int(y.sum())
+    n_total = len(y)
+    logger.info("Đã sinh nhãn y_churn_t_plus_%d từ %s: %d Churn (1), %d Active (0) trên tổng %d rows.",
+                horizon, table_tp, n_pos, n_total - n_pos, n_total)
 
     lab = df_tp[["cms_code_enc"]].copy()
     lab[f"y_churn_t_plus_{horizon}"] = y.values
@@ -71,6 +130,7 @@ def build_dataset_for_k(engine: Engine, k: int, horizon: int = 1, limit_rows_eac
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if not out.empty:
         out = apply_gate(out)
+        out = clip_and_log_outliers(out)
     return out
 
 
@@ -125,4 +185,5 @@ def load_scoring_table_for_k(
 
     # gate now (active_now vs churned_now)
     df = apply_gate(df)
+    df = clip_and_log_outliers(df)
     return df, table_t, window_end

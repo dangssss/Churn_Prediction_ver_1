@@ -59,7 +59,7 @@ def get_active_count_for_month(engine: Engine, k: int, window_end: int) -> int:
         schema = "data_window"
         
         from sqlalchemy import text
-        q = text(f'SELECT COUNT(*) FROM "{schema}"."{table_name}" WHERE is_active_now = 1')
+        q = text(f'SELECT COUNT(*) FROM "{schema}"."{table_name}" WHERE COALESCE(item_last, 0) != 0 OR COALESCE(revenue_last, 0) != 0')
         with engine.connect() as conn:
             cnt = conn.execute(q).scalar()
             return int(cnt)
