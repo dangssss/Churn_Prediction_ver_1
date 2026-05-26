@@ -90,11 +90,6 @@ def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 0.1, perce
         
     return df_clipped
 
-def future_table_for_pair(k: int, start: str, end: str, horizon: int) -> str:
-    start_h = shift_yymm(start, horizon)
-    end_h   = shift_yymm(end, horizon)
-    return f"cus_feature_{k}m_{start_h}_{end_h}"
-
 def build_labeled_pair(
     engine: Engine,
     k: int,
@@ -106,9 +101,27 @@ def build_labeled_pair(
     if kk != k:
         raise ValueError("table_t không thuộc K")
 
-    table_tp = future_table_for_pair(k, start, end, horizon)
-    if not table_exists(engine, FEATURE_SCHEMA, table_tp):
+    t_plus_h = shift_yymm(end, horizon)
+
+    # -------------------------------------------------------------------------
+    # SỬA LỖI LOGIC: Không dùng `k` để tìm bảng tương lai (table_tp), vì số lượng 
+    # cột lịch sử (item_1m_ago,...) sẽ thay đổi theo `k`, làm nhãn bị thay đổi.
+    # Giải pháp: Tìm bảng có end == t_plus_h và có K LỚN NHẤT để đảm bảo luôn 
+    # có đủ 3 tháng lịch sử tính nhãn (nhãn sẽ đồng nhất cho mọi vòng sweep K).
+    # -------------------------------------------------------------------------
+    from .feature_tables import list_feature_tables
+    all_tbls = list_feature_tables(engine)
+    future_cands = []
+    for t in all_tbls:
+        k_f, st_f, en_f = parse_feature_table_name(t)
+        if en_f == t_plus_h:
+            future_cands.append((k_f, t))
+            
+    if not future_cands:
         return pd.DataFrame()  # censor window này (không có label tương lai)
+        
+    future_cands.sort(key=lambda x: x[0], reverse=True)
+    best_k_f, table_tp = future_cands[0]
 
     df_t  = load_feature_table(engine, table_t,  limit=limit)
     df_tp = load_feature_table(engine, table_tp, limit=limit)
@@ -179,6 +192,12 @@ def build_labeled_pair(
     lab[f"y_churn_t_plus_{horizon}"] = y.values
 
     out = df_t.merge(lab, on="cms_code_enc", how="left")
+
+    # Khách hàng có ở tháng t nhưng biến mất khỏi bảng tương lai (t+h)
+    # => Không có giao dịch ở t+h => Rơi vào C0 (Churn hoàn toàn)
+    missing_mask = out[f"y_churn_t_plus_{horizon}"].isna()
+    if missing_mask.any():
+        out.loc[missing_mask, f"y_churn_t_plus_{horizon}"] = 1
 
     # enforce window_end exists
     if "window_end" not in out.columns:
