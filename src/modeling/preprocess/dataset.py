@@ -143,26 +143,45 @@ def build_labeled_pair(
     # C0: churn hoàn toàn (item=0 và revenue=0)
     c0 = (item_tp == 0) & (rev_tp == 0)
 
-    # C1: item_last tại t+h < 60% trung bình 3 tháng trước (chỉ tháng có đơn)
-    _item_prev_cols = [c for c in ["item_1m_ago", "item_2m_ago", "item_3m_ago"] if c in df_tp.columns]
-    if _item_prev_cols:
-        _item_mat = df_tp[_item_prev_cols].apply(pd.to_numeric, errors="coerce")
-        _avg_item_3m = _item_mat.where(_item_mat > 0).mean(axis=1).fillna(0)
-        c1 = (_avg_item_3m > 0) & (item_tp < 0.60 * _avg_item_3m)
+    # C1: item_last giảm liên tục >= 2 tháng (< 60% base trung bình của 2m_ago và 3m_ago)
+    _item_older_cols = [c for c in ["item_2m_ago", "item_3m_ago"] if c in df_tp.columns]
+    if "item_1m_ago" in df_tp.columns and _item_older_cols:
+        _item_older_mat = df_tp[_item_older_cols].apply(pd.to_numeric, errors="coerce")
+        _avg_item_older = _item_older_mat.where(_item_older_mat > 0).mean(axis=1).fillna(0)
+        item_1m = pd.to_numeric(df_tp["item_1m_ago"], errors="coerce").fillna(0)
+        
+        drop_1m = (_avg_item_older > 0) & (item_1m < 0.60 * _avg_item_older)
+        drop_tp = (_avg_item_older > 0) & (item_tp < 0.60 * _avg_item_older)
+        c1 = drop_1m & drop_tp
     else:
-        c1 = pd.Series(False, index=df_tp.index)
+        # Fallback 1 tháng nếu thiếu history
+        _item_prev_cols = [c for c in ["item_1m_ago", "item_2m_ago", "item_3m_ago"] if c in df_tp.columns]
+        if _item_prev_cols:
+            _item_mat = df_tp[_item_prev_cols].apply(pd.to_numeric, errors="coerce")
+            _avg_item_3m = _item_mat.where(_item_mat > 0).mean(axis=1).fillna(0)
+            c1 = (_avg_item_3m > 0) & (item_tp < 0.60 * _avg_item_3m)
+        else:
+            c1 = pd.Series(False, index=df_tp.index)
 
-    # C2: revenue-per-item tại t+h < 60% trung bình rpi 3 tháng trước (chỉ tháng có đơn)
-    _rev_prev_cols = [c for c in ["revenue_1m_ago", "revenue_2m_ago", "revenue_3m_ago"] if c in df_tp.columns]
-    if _item_prev_cols and _rev_prev_cols:
-        _rev_mat  = df_tp[_rev_prev_cols].apply(pd.to_numeric, errors="coerce")
-        _item_mat2 = df_tp[_item_prev_cols[:len(_rev_prev_cols)]].apply(pd.to_numeric, errors="coerce")
-        # rpi per column; chỉ lấy khi item > 0
-        _rpi_mat = _rev_mat.values / _item_mat2.values.clip(1)  # tránh /0, giá trị khi item=0 bị mask dưới
-        _rpi_mat_masked = np.where(_item_mat2.values > 0, _rpi_mat, np.nan)
-        _avg_rpi_3m = pd.DataFrame(_rpi_mat_masked, index=df_tp.index).mean(axis=1).fillna(0)
-        _rpi_last   = np.where(item_tp > 0, rev_tp / item_tp.clip(1), 0)
-        c2 = (_avg_rpi_3m > 0) & (_rpi_last < 0.60 * _avg_rpi_3m)
+    # C2: revenue-per-item giảm liên tục >= 2 tháng (< 60% rpi trung bình của 2m_ago và 3m_ago)
+    _rev_older_cols = [c for c in ["revenue_2m_ago", "revenue_3m_ago"] if c in df_tp.columns]
+    if "revenue_1m_ago" in df_tp.columns and _item_older_cols and _rev_older_cols:
+        _rev_older_mat = df_tp[_rev_older_cols].apply(pd.to_numeric, errors="coerce")
+        _item_older_mat2 = df_tp[_item_older_cols[:len(_rev_older_cols)]].apply(pd.to_numeric, errors="coerce")
+        
+        _rpi_older_mat = _rev_older_mat.values / _item_older_mat2.values.clip(1)
+        _rpi_older_mat_masked = np.where(_item_older_mat2.values > 0, _rpi_older_mat, np.nan)
+        _avg_rpi_older = pd.DataFrame(_rpi_older_mat_masked, index=df_tp.index).mean(axis=1).fillna(0)
+        
+        rev_1m = pd.to_numeric(df_tp["revenue_1m_ago"], errors="coerce").fillna(0)
+        rpi_1m = np.where(item_1m > 0, rev_1m / item_1m.clip(1), 0)
+        
+        drop_rpi_1m = (_avg_rpi_older > 0) & (rpi_1m < 0.60 * _avg_rpi_older)
+        
+        _rpi_last = np.where(item_tp > 0, rev_tp / item_tp.clip(1), 0)
+        drop_rpi_tp = (_avg_rpi_older > 0) & (_rpi_last < 0.60 * _avg_rpi_older)
+        
+        c2 = drop_rpi_1m & drop_rpi_tp
     else:
         c2 = pd.Series(False, index=df_tp.index)
 
@@ -191,7 +210,8 @@ def build_labeled_pair(
     out = df_t.merge(lab, on="cms_code_enc", how="left")
 
     # Khách hàng có ở tháng t nhưng biến mất khỏi bảng tương lai (t+h)
-    # => Không có giao dịch ở t+h => Rơi vào C0 (Churn hoàn toàn)
+    # Vì bảng t+h chỉ chứa khách hàng CÓ GIAO DỊCH trong window K đó,
+    # nên vắng mặt ở đây CHẮC CHẮN nghĩa là họ không mua gì -> C0 (Churn hoàn toàn).
     missing_mask = out[f"y_churn_t_plus_{horizon}"].isna()
     if missing_mask.any():
         out.loc[missing_mask, f"y_churn_t_plus_{horizon}"] = 1
