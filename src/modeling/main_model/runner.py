@@ -188,16 +188,19 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
     thr_opt, p_opt, r_opt, f1_opt = best_threshold_by_f1_np(y_va, va_prob, n_grid=600)
     ap = average_precision_np(y_va, va_prob)
     
-    # Calculate and log confusion matrix at optimal threshold
+    # Calculate and print confusion matrix at optimal threshold
     y_pred_opt = (va_prob >= thr_opt).astype(int)
     cm = confusion_matrix(y_va, y_pred_opt)
-    logger.info(
-        "\n[MAIN MODEL EVALUATION]\n"
-        "Confusion Matrix on Validation Set (Threshold = %.4f):\n"
-        "                     Predicted Active (0) | Predicted Churn (1)\n"
-        "Actual Active (0) | %-20d | %-20d\n"
-        "Actual Churn (1)  | %-20d | %-20d",
-        thr_opt, cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
+    tn, fp, fn, tp = cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
+    print(
+        f"\n{'='*60}\n"
+        f"[MAIN MODEL] Confusion Matrix @ threshold={thr_opt:.4f}\n"
+        f"{'='*60}\n"
+        f"                   Pred Active(0)   Pred Churn(1)\n"
+        f"  Actual Active(0)  TN={tn:<10}   FP={fp}\n"
+        f"  Actual Churn(1)   FN={fn:<10}   TP={tp}\n"
+        f"  Precision={tp/(tp+fp+1e-9):.4f}  Recall={tp/(tp+fn+1e-9):.4f}  F1={f1_opt:.4f}\n"
+        f"{'='*60}"
     )
 
     # --- early stop meta
