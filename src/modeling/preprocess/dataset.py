@@ -116,17 +116,61 @@ def build_labeled_pair(
     if "cms_code_enc" not in df_t.columns or "cms_code_enc" not in df_tp.columns:
         raise KeyError("Thiếu cms_code_enc để join label")
 
-    # label y = churn at t+h based on item/revenue at t+h
+    # ---------- Labeling đa tín hiệu (C0 OR C1 OR C2) ----------
+    # Tất cả tín hiệu tính từ df_tp (tháng t+h) — không leakage từ df_t
+
     from .gating import resolve_now_cols
     cols_tp = resolve_now_cols(df_tp)
-    item_tp = pd.to_numeric(df_tp[cols_tp["item_now"]], errors="coerce").fillna(0)
-    rev_tp  = pd.to_numeric(df_tp[cols_tp["rev_now"]],  errors="coerce").fillna(0)
-    y = ((item_tp == 0) & (rev_tp == 0)).astype(int)
-    
-    n_pos = int(y.sum())
+    item_tp_col = cols_tp["item_now"]
+    rev_tp_col  = cols_tp["rev_now"]
+
+    item_tp = pd.to_numeric(df_tp[item_tp_col], errors="coerce").fillna(0)
+    rev_tp  = pd.to_numeric(df_tp[rev_tp_col],  errors="coerce").fillna(0)
+
+    # C0: churn hoàn toàn (item=0 và revenue=0)
+    c0 = (item_tp == 0) & (rev_tp == 0)
+
+    # C1: item_last tại t+h < 60% trung bình 3 tháng trước (chỉ tháng có đơn)
+    _item_prev_cols = [c for c in ["item_1m_ago", "item_2m_ago", "item_3m_ago"] if c in df_tp.columns]
+    if _item_prev_cols:
+        _item_mat = df_tp[_item_prev_cols].apply(pd.to_numeric, errors="coerce")
+        _avg_item_3m = _item_mat.where(_item_mat > 0).mean(axis=1).fillna(0)
+        c1 = (_avg_item_3m > 0) & (item_tp < 0.60 * _avg_item_3m)
+    else:
+        c1 = pd.Series(False, index=df_tp.index)
+
+    # C2: revenue-per-item tại t+h < 60% trung bình rpi 3 tháng trước (chỉ tháng có đơn)
+    _rev_prev_cols = [c for c in ["revenue_1m_ago", "revenue_2m_ago", "revenue_3m_ago"] if c in df_tp.columns]
+    if _item_prev_cols and _rev_prev_cols:
+        _rev_mat  = df_tp[_rev_prev_cols].apply(pd.to_numeric, errors="coerce")
+        _item_mat2 = df_tp[_item_prev_cols[:len(_rev_prev_cols)]].apply(pd.to_numeric, errors="coerce")
+        # rpi per column; chỉ lấy khi item > 0
+        _rpi_mat = _rev_mat.values / _item_mat2.values.clip(1)  # tránh /0, giá trị khi item=0 bị mask dưới
+        _rpi_mat_masked = np.where(_item_mat2.values > 0, _rpi_mat, np.nan)
+        _avg_rpi_3m = pd.Series(np.nanmean(_rpi_mat_masked, axis=1), index=df_tp.index).fillna(0)
+        _rpi_last   = np.where(item_tp > 0, rev_tp / item_tp.clip(1), 0)
+        c2 = (_avg_rpi_3m > 0) & (_rpi_last < 0.60 * _avg_rpi_3m)
+    else:
+        c2 = pd.Series(False, index=df_tp.index)
+
+    y = (c0 | c1 | c2).astype(int)
+
+    n_c0    = int(c0.sum())
+    n_c1    = int(c1.sum())
+    n_c2    = int(c2.sum())
     n_total = len(y)
-    logger.info("Đã sinh nhãn y_churn_t_plus_%d từ %s: %d Churn (1), %d Active (0) trên tổng %d rows.",
-                horizon, table_tp, n_pos, n_total - n_pos, n_total)
+    n_pos   = int(y.sum())
+    logger.info(
+        "Đã sinh nhãn y_churn_t_plus_%d từ %s: "
+        "Tổng Churn=%d (%.1f%%) | C0(hoàn toàn)=%d | C1(item<60%%)=%d | C2(rpi<60%%)=%d | Active=%d | Total=%d",
+        horizon, table_tp,
+        n_pos, 100.0 * n_pos / max(n_total, 1),
+        n_c0, n_c1, n_c2,
+        n_total - n_pos, n_total,
+    )
+    # -----------------------------------------------------------
+
+
 
     lab = df_tp[["cms_code_enc"]].copy()
     lab[f"y_churn_t_plus_{horizon}"] = y.values

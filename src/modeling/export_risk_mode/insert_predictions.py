@@ -112,7 +112,223 @@ def make_predictions(
     return df_out
 
 
+# ---------------------------------------------------------------------------
+# SHAP-based reason engine
+# ---------------------------------------------------------------------------
+
+# Map từ feature name → bucket index (1-8) tương ứng với 8 reason template
+# B1=số bưu gửi, B2=khiếu nại, B3=giao muộn, B4=không hoàn thành,
+# B5=biến động, B6=giá trị đơn, B7=đa dạng dịch vụ, B8=khách mới
+FEATURE_TO_BUCKET: dict[str, int] = {
+    # B1 — Số bưu gửi giảm
+    "item_last": 1, "item_slope": 1, "item_avg": 1, "item_sum": 1,
+    "cv_item": 5,   # cv → B5 (biến động)
+    "item_range": 5, "frequency": 1,
+    # B2 — Khiếu nại tăng
+    "complaint_last": 2, "complaint_avg": 2, "complaint_slope": 2,
+    "pct_complaint": 2, "pct_complaint_per_item": 2, "complaint_sum": 2, "complaint_diversity": 2,
+    # B3 — Giao muộn tăng
+    "delay_last": 3, "pct_delay": 3, "avg_delayday": 3, "delay_sum": 3,
+    # B4 — Không hoàn thành
+    "nodone_last": 4, "pct_noaccepted": 4, "pct_refund": 4, "pct_lost_order": 4, "nodone_sum": 4,
+    # B5 — Biến động đơn hàng cao
+    "cv_revenue": 5, "revenue_range": 5, "item_std": 5, "revenue_std": 5,
+    # B6 — Giá trị đơn giảm
+    "revenue_last": 6, "avg_revenue_per_item": 6, "revenue_slope": 6,
+    "revenue_avg": 6, "monetary": 6, "revenue_sum": 6,
+    # B7 — Giảm đa dạng dịch vụ
+    "service_types_used": 7, "dominant_service_ratio": 7,
+    # B8 — Khách hàng mới
+    "tenure": 8, "recency": 8, "active_months": 8, "inactive_months": 8,
+}
+
+# Prefix matching cho các ratio features tổng hợp (vd: ratio_item_last__lifetime_total_items)
+_BUCKET_PREFIX_MAP: list[tuple[str, int]] = [
+    ("ratio_item",       1),
+    ("ratio_revenue",    6),
+    ("ratio_complaint",  2),
+    ("ratio_delay",      3),
+    ("ratio_nodone",     4),
+    ("ratio_satisf",     6),
+    ("ratio_order",      6),
+]
+
+
+def _get_bucket(feature_name: str) -> int | None:
+    """Trả về bucket id cho một feature, hoặc None nếu không map được."""
+    b = FEATURE_TO_BUCKET.get(feature_name)
+    if b is not None:
+        return b
+    for prefix, bid in _BUCKET_PREFIX_MAP:
+        if feature_name.startswith(prefix):
+            return bid
+    return None
+
+
+def compute_shap_reasons(
+    model,
+    X_scored: pd.DataFrame,
+    df_with_raw: pd.DataFrame,
+    df_static: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Dùng SHAP TreeExplainer để xác định top-3 features quan trọng nhất
+    cho từng khách hàng, map sang 1 trong 8 reason buckets, sau đó render
+    text tiếng Việt với số liệu thực tế (giống vỏ bọc compute_simple_reasons).
+
+    - model        : XGBoost model đã train
+    - X_scored     : DataFrame features (đã rename/pad, giống lúc predict)
+    - df_with_raw  : DataFrame gốc có đủ cột raw (item_last, revenue_last, ...)
+    - df_static    : bảng cus_lifetime (để lấy tenure)
+
+    Trả về df_with_raw với cột reason_1/2/3 được điền.
+    Nếu shap không import được → fallback sang compute_simple_reasons().
+    """
+    try:
+        import shap  # noqa: F401
+    except ImportError:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "[SHAP] Thư viện shap chưa được cài. Fallback sang rule-based reasons."
+        )
+        return compute_simple_reasons(df_with_raw, df_static)
+
+    try:
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_scored)
+        # shap_values shape: (n_samples, n_features) — giá trị dương = đẩy xác suất tăng
+        shap_arr = np.abs(shap_values)   # lấy magnitude để tìm feature quan trọng nhất
+        feat_names = list(X_scored.columns)
+
+        # Build per-customer top-3 bucket list
+        top_buckets_per_row: list[list[int]] = []
+        for i in range(len(X_scored)):
+            row_shap = shap_arr[i]
+            order = np.argsort(-row_shap)  # desc by magnitude
+            seen_buckets: list[int] = []
+            for idx in order:
+                if len(seen_buckets) >= 3:
+                    break
+                fname = feat_names[idx]
+                bid = _get_bucket(fname)
+                if bid is not None and bid not in seen_buckets:
+                    seen_buckets.append(bid)
+            top_buckets_per_row.append(seen_buckets)
+
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "[SHAP] Lỗi khi tính SHAP values: %s. Fallback sang rule-based reasons.", exc
+        )
+        return compute_simple_reasons(df_with_raw, df_static)
+
+    # ---------- Render reason text giống compute_simple_reasons ----------
+    d = df_with_raw.copy()
+
+    # Merge tenure từ static nếu chưa có
+    if "tenure" not in d.columns and "cms_code_enc" in d.columns and "tenure" in df_static.columns:
+        tenure_map = df_static[["cms_code_enc", "tenure"]].drop_duplicates("cms_code_enc")
+        d = d.merge(tenure_map, on="cms_code_enc", how="left")
+
+    def _num(s):
+        return pd.to_numeric(s, errors="coerce").fillna(0)
+
+    def _avg_prev_3m_active(base_col: str) -> pd.Series:
+        cols = [f"{base_col}_{i}m_ago" for i in [1, 2, 3]]
+        available = [c for c in cols if c in d.columns]
+        if not available:
+            return pd.Series(0, index=d.index)
+        mat = d[available].apply(pd.to_numeric, errors="coerce")
+        return mat.where(mat > 0).mean(axis=1, skipna=True).fillna(0)
+
+    item_last       = _num(d.get("item_last", 0))
+    item_1m_ago     = _num(d.get("item_1m_ago", 0))
+    complaint_last  = _num(d.get("complaint_last", 0))
+    delay_last      = _num(d.get("delay_last", 0))
+    nodone_last     = _num(d.get("nodone_last", 0))
+    revenue_last    = _num(d.get("revenue_last", 0))
+    cv_item         = _num(d.get("cv_item", 0))
+    service_types   = _num(d.get("service_types_used", 0))
+    service_prev    = _num(d.get("service_types_used_prev", service_types))
+    tenure_s        = _num(d.get("tenure", 999))
+
+    avg_item_3m     = _avg_prev_3m_active("item")
+    avg_complaint_3m = _avg_prev_3m_active("complaint")
+    avg_delay_3m    = _avg_prev_3m_active("delay")
+    avg_nodone_3m   = _avg_prev_3m_active("nodone")
+    avg_revenue_3m  = _avg_prev_3m_active("revenue")
+
+    rpi_last = np.where(item_last > 0, revenue_last / item_last, 0)
+    rpi_3m   = np.where(avg_item_3m > 0, avg_revenue_3m / avg_item_3m, 0)
+
+    active_mask = (item_last > 0) & (item_1m_ago > 0)
+
+    def _render_bucket(bid: int, i: int) -> str | None:
+        """Render text cho bucket bid tại dòng i. Trả về None nếu không render được."""
+        if bid == 1:
+            if avg_item_3m.iloc[i] > 0 and item_last.iloc[i] < 0.6 * avg_item_3m.iloc[i]:
+                pct = (1 - item_last.iloc[i] / avg_item_3m.iloc[i]) * 100
+                return f"Số bưu gửi tháng hiện tại thấp hơn {pct:.0f}% so với trung bình 3 tháng liền trước"
+            return "Xu hướng số lượng bưu gửi đang giảm dần"
+        elif bid == 2:
+            if avg_complaint_3m.iloc[i] > 0 and complaint_last.iloc[i] > 1.15 * avg_complaint_3m.iloc[i]:
+                pct = (complaint_last.iloc[i] / avg_complaint_3m.iloc[i] - 1) * 100
+                return f"Số lượng khiếu nại nhận được tăng {pct:.0f}% so với trung bình 3 tháng liền trước"
+            return "Số lượng khiếu nại tăng so với xu hướng trước đó"
+        elif bid == 3:
+            if avg_delay_3m.iloc[i] > 0 and delay_last.iloc[i] > 1.15 * avg_delay_3m.iloc[i]:
+                pct = (delay_last.iloc[i] / avg_delay_3m.iloc[i] - 1) * 100
+                return f"Tỷ lệ số đơn giao muộn tăng {pct:.0f}% so với trung bình 3 tháng liền trước"
+            return "Tỷ lệ giao hàng muộn đang tăng"
+        elif bid == 4:
+            if avg_nodone_3m.iloc[i] > 0 and nodone_last.iloc[i] > 1.15 * avg_nodone_3m.iloc[i]:
+                pct = (nodone_last.iloc[i] / avg_nodone_3m.iloc[i] - 1) * 100
+                return f"Tỷ lệ số đơn không hoàn thành tăng {pct:.0f}% so với trung bình 3 tháng liền trước"
+            return "Tỷ lệ đơn hàng không hoàn thành đang tăng"
+        elif bid == 5:
+            return f"Biến động số lượng bưu gửi cao (CV={cv_item.iloc[i]:.2f})"
+        elif bid == 6:
+            if rpi_3m[i] > 0 and rpi_last[i] < rpi_3m[i]:
+                pct = (1 - rpi_last[i] / rpi_3m[i]) * 100
+                return f"Giá trị đơn hàng trung bình giảm {pct:.0f}% theo thời gian"
+            return "Giá trị trung bình mỗi đơn hàng đang có xu hướng giảm"
+        elif bid == 7:
+            old_c = int(service_prev.iloc[i])
+            new_c = int(service_types.iloc[i])
+            if old_c > 0 and new_c < old_c:
+                return f"Giảm đa dạng dịch vụ (giảm từ {old_c} còn {new_c} loại)"
+            return "Mức độ sử dụng đa dạng dịch vụ đang thu hẹp"
+        elif bid == 8:
+            months = int(tenure_s.iloc[i])
+            return f"Khách hàng mới, mức độ gắn bó thấp ({months} tháng)"
+        return None
+
+    reasons_list: list[tuple[str | None, str | None, str | None]] = []
+    for i in range(len(d)):
+        if not active_mask.iloc[i]:
+            reasons_list.append((None, None, None))
+            continue
+        buckets = top_buckets_per_row[i]
+        texts: list[str] = []
+        for bid in buckets:
+            t = _render_bucket(bid, i)
+            if t is not None:
+                texts.append(t)
+        while len(texts) < 3:
+            texts.append(None)
+        reasons_list.append((texts[0], texts[1], texts[2]))
+
+    d["reason_1"] = [r[0] for r in reasons_list]
+    d["reason_2"] = [r[1] for r in reasons_list]
+    d["reason_3"] = [r[2] for r in reasons_list]
+
+    # Chỉ giữ khách active (giống compute_simple_reasons)
+    d = d[active_mask].copy()
+    return d
+
+
 def compute_simple_reasons(df: pd.DataFrame, df_static: pd.DataFrame) -> pd.DataFrame:
+
     """
     Tính reasons chi ti?t theo yêu c?u:
     Ch? xét khách hàng có phát sinh don trong 2 tháng g?n nh?t (item_last > 0 AND item_1m_ago > 0)

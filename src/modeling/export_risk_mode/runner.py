@@ -11,7 +11,12 @@ from common.artifacts import load_bundle
 from config_store.best_config import load_latest_accepted_best_config as load_latest_best_config
 
 from .create_risk_table import ensure_risk_table_schema
-from .insert_predictions import make_predictions, insert_predictions_to_risk_table, compute_simple_reasons
+from .insert_predictions import (
+    make_predictions,
+    insert_predictions_to_risk_table,
+    compute_simple_reasons,
+    compute_shap_reasons,
+)
 import os
 
 
@@ -79,9 +84,54 @@ def run_export_risk(
     df_pred = make_predictions(model, df_engineered, cfg, metadata)
     print("? Predictions completed")
 
-    # Compute simple reasons
-    print("      Compute reasons...")
-    df_pred = compute_simple_reasons(df_pred, df_static)
+    # Compute reasons — dùng SHAP làm cốt lõi, fallback sang rule-based
+    print("      Compute reasons (SHAP)...")
+    try:
+        from main_model.xgb_utils import date_col_to_ordinal, is_date_like_col, safe_to_category
+
+        # Tái tạo X_scored từ df_engineered (cùng pipeline type-conversion với make_predictions)
+        _feat_cols_meta = metadata.get("feat_cols") or []
+        _feat_cols = [c for c in _feat_cols_meta if c in df_engineered.columns]
+        if not _feat_cols:
+            drop_cols = {
+                "cms_code_enc", "window_size", "window_start", "window_end",
+                "source_table_t", "source_table_t_plus_h",
+                "is_active_now", "is_churned_now", "gate_group",
+            }
+            _feat_cols = [c for c in df_engineered.columns if c not in drop_cols]
+
+        X_scored = df_engineered[_feat_cols].copy()
+        _cat_cols  = list(metadata.get("cat_cols")  or [])
+        _date_cols = list(metadata.get("date_cols") or [])
+        _extra_dc  = [
+            c for c in _cat_cols
+            if c in X_scored.columns and c not in _date_cols and is_date_like_col(X_scored[c])
+        ]
+        _date_cols = _date_cols + _extra_dc
+        _cat_cols  = [c for c in _cat_cols if c not in _extra_dc]
+        for c in _date_cols:
+            if c in X_scored.columns:
+                X_scored[c] = date_col_to_ordinal(X_scored[c])
+        for c in _cat_cols:
+            if c in X_scored.columns:
+                X_scored[c] = safe_to_category(X_scored[c])
+        for c in _feat_cols:
+            if c not in _cat_cols and c not in _date_cols:
+                X_scored[c] = pd.to_numeric(X_scored[c], errors="coerce")
+        _fmap = metadata.get("feature_name_map") or {}
+        if _fmap:
+            X_scored = X_scored.rename(columns=_fmap)
+        _model_feats = getattr(model, "feature_names_in_", None)
+        if _model_feats is not None:
+            for c in _model_feats:
+                if c not in X_scored.columns:
+                    X_scored[c] = 0
+            X_scored = X_scored[list(_model_feats)]
+
+        df_pred = compute_shap_reasons(model, X_scored, df_pred, df_static)
+    except Exception as _shap_err:
+        print(f"   ? SHAP reasons gặp lỗi: {_shap_err}. Fallback sang rule-based.")
+        df_pred = compute_simple_reasons(df_pred, df_static)
     print("? Reasons computed")
 
     # Score stats
