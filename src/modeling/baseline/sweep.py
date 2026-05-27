@@ -8,6 +8,9 @@ from preprocess.feature_tables import list_k_available, max_window_end_for_k
 from infra.yymm import shift_yymm
 from preprocess.static_features import load_cus_lifetime
 from baseline.runner import eval_one_k_train_val
+from logging_config import get_logger
+
+logger = get_logger(__name__)
 
 def run_sweep_k(
     engine: Engine,
@@ -41,11 +44,13 @@ def run_sweep_k(
             if out is None:
                 continue
             if out.get('degenerate'):
-                print(f"[WARN] Skipping degenerate K={k} use_static={use_static} (predict-all-positive)")
+                logger.warning("Skipping degenerate K=%d use_static=%s (predict-all-positive)", k, use_static)
                 continue
             ablation.append(out)
-            print(f"K={k} | use_static={use_static} | val={out.get('val_month')} | "
-                  f"F1={out['f1']:.4f} | PR_AUC={out['PR_AUC_val']:.4f}")
+            logger.info(
+                "K=%d | use_static=%s | val=%s | F1=%.4f | PR_AUC=%.4f",
+                k, use_static, out.get('val_month'), out['f1'], out['PR_AUC_val']
+            )
 
     if not ablation:
         raise ValueError("Ablation produced no result.")

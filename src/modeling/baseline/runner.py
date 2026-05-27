@@ -19,6 +19,9 @@ from sklearn.metrics import (
 
 from preprocess.dataset import build_dataset_for_k
 from preprocess.static_features import attach_static
+from logging_config import get_logger
+
+logger = get_logger(__name__)
 
 def select_feature_cols_mixed(df: pd.DataFrame, label_col: str):
     drop_cols = {
@@ -138,8 +141,7 @@ def eval_one_k_train_val(
         class_weight_used = {0: 1.0, 1: spw}
         spw_rule = f"churn_ratio <= 35% → class_weight={{1:{spw:.2f}}} (bù mất cân bằng)"
 
-    import logging as _logging
-    _logging.getLogger(__name__).info(
+    logger.info(
         "[BASELINE K=%d] Tập huấn luyện: Churn=%d | Active=%d | Total=%d | "
         "Tỷ lệ Churn=%.2f%% | Quyết định: %s",
         k, n_pos, n_neg, n_pos + n_neg, churn_ratio * 100, spw_rule,
@@ -173,7 +175,7 @@ def eval_one_k_train_val(
     dummy_f1 = 2 * prevalence / (prevalence + 1 + 1e-9)
     is_degenerate = abs(f1_val - dummy_f1) < 0.005
     if is_degenerate:
-        print(f"  [WARN] K={k} use_static={use_static}: model degenerate (F1={f1_val:.4f} ≈ dummy={dummy_f1:.4f}, predict-all-positive)")
+        logger.warning("K=%d use_static=%s: model degenerate (F1=%.4f ≈ dummy=%.4f, predict-all-positive)", k, use_static, f1_val, dummy_f1)
 
     return {
         "K": int(k),
