@@ -170,7 +170,7 @@ def compute_shap_reasons(
     X_scored: pd.DataFrame,
     df_with_raw: pd.DataFrame,
     df_static: pd.DataFrame,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
     """
     Dùng SHAP TreeExplainer để xác định top-3 features quan trọng nhất
     cho từng khách hàng, map sang 1 trong 8 reason buckets, sau đó render
@@ -191,22 +191,28 @@ def compute_shap_reasons(
         _log.getLogger(__name__).warning(
             "[SHAP] Thư viện shap chưa được cài. Fallback sang rule-based reasons."
         )
-        return compute_simple_reasons(df_with_raw, df_static)
+        return compute_simple_reasons(df_with_raw, df_static), None
 
     try:
         explainer = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(X_scored)
-        # shap_values shape: (n_samples, n_features) — giá trị dương = đẩy xác suất tăng
-        shap_arr = np.abs(shap_values)   # lấy magnitude để tìm feature quan trọng nhất
+        
+        # Build df_shap_raw
+        df_shap_raw = pd.DataFrame(shap_values, columns=X_scored.columns, index=X_scored.index)
+        if "cms_code_enc" in df_with_raw.columns:
+            df_shap_raw.insert(0, "cms_code_enc", df_with_raw["cms_code_enc"].values)
+            
         feat_names = list(X_scored.columns)
 
         # Build per-customer top-3 bucket list
         top_buckets_per_row: list[list[int]] = []
         for i in range(len(X_scored)):
-            row_shap = shap_arr[i]
-            order = np.argsort(-row_shap)  # desc by magnitude
+            row_shap = shap_values[i]
+            order = np.argsort(-row_shap)  # desc by actual SHAP value (only positive = pushes churn risk up)
             seen_buckets: list[int] = []
             for idx in order:
+                if row_shap[idx] <= 0:
+                    break  # no more features that increase churn risk
                 if len(seen_buckets) >= 3:
                     break
                 fname = feat_names[idx]
@@ -220,7 +226,7 @@ def compute_shap_reasons(
         _log.getLogger(__name__).warning(
             "[SHAP] Lỗi khi tính SHAP values: %s. Fallback sang rule-based reasons.", exc
         )
-        return compute_simple_reasons(df_with_raw, df_static)
+        return compute_simple_reasons(df_with_raw, df_static), None
 
     # ---------- Render reason text giống compute_simple_reasons ----------
     d = df_with_raw.copy()
@@ -324,7 +330,7 @@ def compute_shap_reasons(
 
     # Chỉ giữ khách active (giống compute_simple_reasons)
     d = d[active_mask].copy()
-    return d
+    return d, df_shap_raw
 
 
 def compute_simple_reasons(df: pd.DataFrame, df_static: pd.DataFrame) -> pd.DataFrame:

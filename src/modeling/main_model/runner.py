@@ -111,9 +111,17 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
     y_tr = df_tr[label_col].astype(int).to_numpy()
     y_va = df_va[label_col].astype(int).to_numpy()
 
+    # scale_pos_weight đã được baseline sweep tính + guardrail sẵn → dùng thẳng
     spw = float(cfg["best_spw"])
     thr_baseline = float(cfg["best_threshold"])  # tham chiếu
     es_rounds = int(cfg.get("main_es_rounds", 200))
+
+    n_churn_train = int(y_tr.sum())
+    n_active_train = len(y_tr) - n_churn_train
+    logger.info(
+        "[MAIN MODEL] Tập huấn luyện: Churn=%d | Active=%d | Total=%d | scale_pos_weight=%.2f (từ best_config)",
+        n_churn_train, n_active_train, len(y_tr), spw,
+    )
 
     # detect categorical — exclude date-string columns (YYYY-MM-DD) which change each month
     obj_cols = [c for c in feat_cols if (X_tr[c].dtype == "object" or str(X_tr[c].dtype) == "category")]
@@ -136,27 +144,6 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
             X_tr[c] = pd.to_numeric(X_tr[c], errors="coerce")
             X_va[c] = pd.to_numeric(X_va[c], errors="coerce")
 
-    # ---------- Guardrail: tự động chọn scale_pos_weight ----------
-    n_churn_train = int(y_tr.sum())
-    n_active_train = int(len(y_tr) - n_churn_train)
-    churn_ratio = n_churn_train / max(len(y_tr), 1)
-
-    CHURN_RATIO_THRESHOLD = 0.35
-
-    if churn_ratio > CHURN_RATIO_THRESHOLD:
-        spw_used = 1.0
-        spw_rule = "churn_ratio > 35% → scale_pos_weight=1.0 (dữ liệu đủ cân bằng)"
-    else:
-        spw_used = spw
-        spw_rule = f"churn_ratio <= 35% → scale_pos_weight={spw:.2f} (bù mất cân bằng)"
-
-    logger.info(
-        "[MAIN MODEL] Tập huấn luyện: Churn=%d | Active=%d | Total=%d | "
-        "Tỷ lệ Churn=%.2f%% | Quyết định: %s",
-        n_churn_train, n_active_train, len(y_tr),
-        churn_ratio * 100, spw_rule,
-    )
-
     params = dict(
         n_estimators=5000,
         learning_rate=0.01,
@@ -171,7 +158,7 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
         gamma=0.2,
         tree_method="hist",
         random_state=42,
-        scale_pos_weight=spw_used,
+        scale_pos_weight=spw,
         eval_metric=["aucpr", "logloss"]
     )
 

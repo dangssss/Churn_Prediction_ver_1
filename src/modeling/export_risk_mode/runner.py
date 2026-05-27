@@ -128,10 +128,21 @@ def run_export_risk(
                     X_scored[c] = 0
             X_scored = X_scored[list(_model_feats)]
 
-        df_pred = compute_shap_reasons(model, X_scored, df_pred, df_static)
+        df_pred, df_shap_raw = compute_shap_reasons(model, X_scored, df_pred, df_static)
+        
+        # In kết quả chuẩn của SHAP (lúc chưa map) ra 1 folder riêng
+        if df_shap_raw is not None:
+            output_dir_env = os.environ.get("OUTPUT_DIR", "/churn_data/output_prediction")
+            shap_dir = Path(output_dir_env) / "shap_raw"
+            shap_dir.mkdir(parents=True, exist_ok=True)
+            shap_csv_path = shap_dir / f"shap_raw_{month_used}.csv"
+            df_shap_raw.to_csv(shap_csv_path, index=False, encoding='utf-8-sig')
+            print(f"   ? Saved raw SHAP values to {shap_csv_path}")
+            
     except Exception as _shap_err:
         print(f"   ? SHAP reasons gặp lỗi: {_shap_err}. Fallback sang rule-based.")
         df_pred = compute_simple_reasons(df_pred, df_static)
+        df_shap_raw = None
     print("? Reasons computed")
 
     # Score stats
