@@ -18,7 +18,6 @@ def run_sweep_k(
 ) -> tuple[dict, pd.DataFrame]:
     """
     Always sweep K to find the best K for current data (picked by F1 then PR_AUC).
-
     Returns:
       (best_config_candidate, df_ablation_sorted)
     """
