@@ -130,14 +130,14 @@ def eval_one_k_train_val(
     pre = make_preprocess(num_cols, cat_cols)
     clf = LogisticRegression(
         max_iter=5000,
-        solver="saga",   # saga hội tụ tốt hơn lbfgs khi feature space lớn + L1/ElasticNet compatible
-        tol=1e-3,        # relaxed tolerance: K=3 edge case converge nhanh hơn mà không ảnh hưởng chất lượng
+        solver="saga",   # saga: solver duy nhất hỗ trợ ElasticNet (l1_ratio ∈ (0,1))
+        tol=1e-3,        # relaxed tolerance: converge nhanh hơn mà không ảnh hưởng chất lượng ranking
         class_weight={0: 1.0, 1: spw},
-        penalty="elasticnet",
-        l1_ratio=0.5,
-        C=0.1
+        l1_ratio=0.5,    # ElasticNet: 0=L2, 1=L1, 0.5=50/50 mix — penalty string deprecated từ sklearn 1.8
+        C=0.1,           # regularization strength (ngược với lambda); 0.1 = mạnh hơn default (1.0)
     )
     pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
+
     pipe.fit(X_tr, y_tr)
 
     va_prob = pipe.predict_proba(X_va)[:, 1]
