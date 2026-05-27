@@ -4,6 +4,9 @@ from airflow import DAG
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from pendulum import datetime
 
+import os
+from airflow.operators.bash import BashOperator
+    
 with DAG(
     dag_id="ds_churn_ingest",
     start_date=datetime(2026, 1, 1, tz="Asia/Ho_Chi_Minh"),
@@ -14,8 +17,6 @@ with DAG(
     tags=["ds_churn", "ingest"],
 ) as dag:
 
-    import os
-    from airflow.operators.bash import BashOperator
     
     # Calculate Project Root dynamically (dags/.. -> root)
     # This ensures paths work regardless of AIRFLOW_HOME
