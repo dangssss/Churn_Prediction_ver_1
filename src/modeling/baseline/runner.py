@@ -127,12 +127,30 @@ def eval_one_k_train_val(
     n_neg = int((y_tr == 0).sum())
     spw = (n_neg / max(n_pos, 1))
 
+    # ---------- Guardrail: tự động chọn class_weight ----------
+    CHURN_RATIO_THRESHOLD = 0.35
+    churn_ratio = n_pos / max(n_pos + n_neg, 1)
+
+    if churn_ratio > CHURN_RATIO_THRESHOLD:
+        class_weight_used = {0: 1.0, 1: 1.0}
+        spw_rule = "churn_ratio > 35% → class_weight={1:1.0} (dữ liệu đủ cân bằng)"
+    else:
+        class_weight_used = {0: 1.0, 1: spw}
+        spw_rule = f"churn_ratio <= 35% → class_weight={{1:{spw:.2f}}} (bù mất cân bằng)"
+
+    import logging as _logging
+    _logging.getLogger(__name__).info(
+        "[BASELINE K=%d] Tập huấn luyện: Churn=%d | Active=%d | Total=%d | "
+        "Tỷ lệ Churn=%.2f%% | Quyết định: %s",
+        k, n_pos, n_neg, n_pos + n_neg, churn_ratio * 100, spw_rule,
+    )
+
     pre = make_preprocess(num_cols, cat_cols)
     clf = LogisticRegression(
         max_iter=5000,
         solver="saga",   # saga: solver duy nhất hỗ trợ ElasticNet (l1_ratio ∈ (0,1))
         tol=1e-3,        # relaxed tolerance: converge nhanh hơn mà không ảnh hưởng chất lượng ranking
-        class_weight={0: 1.0, 1: spw},
+        class_weight=class_weight_used,
         l1_ratio=0.5,    # ElasticNet: 0=L2, 1=L1, 0.5=50/50 mix — penalty string deprecated từ sklearn 1.8
         C=0.1,           # regularization strength (ngược với lambda); 0.1 = mạnh hơn default (1.0)
     )
@@ -164,7 +182,9 @@ def eval_one_k_train_val(
         "val_month": int(val_month),
         "n_rows": int(len(df_k)),
         "n_months": int(df_k["window_end"].nunique()),
-        "spw_used": float(spw),
+        "spw_used": float(class_weight_used.get(1, 1.0)),
+        "spw_raw": float(spw),
+        "churn_ratio_train": float(churn_ratio),
         "n_num": int(len(num_cols)),
         "n_cat": int(len(cat_cols)),
         "PR_AUC_val": float(pr_auc),
