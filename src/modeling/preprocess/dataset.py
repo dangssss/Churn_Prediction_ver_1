@@ -143,61 +143,44 @@ def build_labeled_pair(
     # C0: churn hoàn toàn (item=0 và revenue=0)
     c0 = (item_tp == 0) & (rev_tp == 0)
 
-    # C1: item_last giảm liên tục >= 2 tháng (< 60% base trung bình của 2m_ago và 3m_ago)
-    _item_older_cols = [c for c in ["item_2m_ago", "item_3m_ago"] if c in df_tp.columns]
-    if "item_1m_ago" in df_tp.columns and _item_older_cols:
-        _item_older_mat = df_tp[_item_older_cols].apply(pd.to_numeric, errors="coerce")
-        _avg_item_older = _item_older_mat.where(_item_older_mat > 0).mean(axis=1).fillna(0)
-        item_1m = pd.to_numeric(df_tp["item_1m_ago"], errors="coerce").fillna(0)
-        
-        drop_1m = (_avg_item_older > 0) & (item_1m < 0.60 * _avg_item_older)
-        drop_tp = (_avg_item_older > 0) & (item_tp < 0.60 * _avg_item_older)
-        c1 = drop_1m & drop_tp
-    else:
-        # Fallback 1 tháng nếu thiếu history
-        _item_prev_cols = [c for c in ["item_1m_ago", "item_2m_ago", "item_3m_ago"] if c in df_tp.columns]
-        if _item_prev_cols:
-            _item_mat = df_tp[_item_prev_cols].apply(pd.to_numeric, errors="coerce")
-            _avg_item_3m = _item_mat.where(_item_mat > 0).mean(axis=1).fillna(0)
-            c1 = (_avg_item_3m > 0) & (item_tp < 0.60 * _avg_item_3m)
-        else:
-            c1 = pd.Series(False, index=df_tp.index)
+    # Lấy các cột DE đã tính sẵn
+    freq_tp = pd.to_numeric(df_tp.get("frequency", 0), errors="coerce").fillna(0)
+    monetary_tp = pd.to_numeric(df_tp.get("monetary", 0), errors="coerce").fillna(0)
+    rev_slope_tp = pd.to_numeric(df_tp.get("revenue_slope", 0), errors="coerce").fillna(0)
+    
+    rev_1m = pd.to_numeric(df_tp.get("revenue_1m_ago", 0), errors="coerce").fillna(0)
+    item_1m = pd.to_numeric(df_tp.get("item_1m_ago", 0), errors="coerce").fillna(0)
 
-    # C2: revenue-per-item giảm liên tục >= 2 tháng (< 60% rpi trung bình của 2m_ago và 3m_ago)
-    _rev_older_cols = [c for c in ["revenue_2m_ago", "revenue_3m_ago"] if c in df_tp.columns]
-    if "revenue_1m_ago" in df_tp.columns and _item_older_cols and _rev_older_cols:
-        _rev_older_mat = df_tp[_rev_older_cols].apply(pd.to_numeric, errors="coerce")
-        _item_older_mat2 = df_tp[_item_older_cols[:len(_rev_older_cols)]].apply(pd.to_numeric, errors="coerce")
-        
-        _rpi_older_mat = _rev_older_mat.values / _item_older_mat2.values.clip(1)
-        _rpi_older_mat_masked = np.where(_item_older_mat2.values > 0, _rpi_older_mat, np.nan)
-        _avg_rpi_older = pd.DataFrame(_rpi_older_mat_masked, index=df_tp.index).mean(axis=1).fillna(0)
-        
-        rev_1m = pd.to_numeric(df_tp["revenue_1m_ago"], errors="coerce").fillna(0)
-        rpi_1m = np.where(item_1m > 0, rev_1m / item_1m.clip(1), 0)
-        
-        drop_rpi_1m = (_avg_rpi_older > 0) & (rpi_1m < 0.60 * _avg_rpi_older)
-        
-        _rpi_last = np.where(item_tp > 0, rev_tp / item_tp.clip(1), 0)
-        drop_rpi_tp = (_avg_rpi_older > 0) & (_rpi_last < 0.60 * _avg_rpi_older)
-        
-        c2 = drop_rpi_1m & drop_rpi_tp
-    else:
-        c2 = pd.Series(False, index=df_tp.index)
+    # C1: Tần suất gửi hàng giảm mạnh (Giảm > 50% so với tần suất bình quân frequency)
+    # HOẶC giảm > 50% so với tháng liền kề
+    c1_drop_avg = (freq_tp > 0) & (item_tp < 0.50 * freq_tp)
+    c1_drop_1m  = (item_1m > 0) & (item_tp < 0.50 * item_1m)
+    c1 = c1_drop_avg | c1_drop_1m
 
-    y = (c0 | c1 | c2).astype(int)
+    # C2: Doanh thu giảm mạnh (Giảm > 50% so với doanh thu bình quân monetary)
+    # HOẶC giảm > 50% so với tháng liền kề (revenue_1m_ago)
+    c2_drop_avg = (monetary_tp > 0) & (rev_tp < 0.50 * monetary_tp)
+    c2_drop_1m  = (rev_1m > 0) & (rev_tp < 0.50 * rev_1m)
+    c2 = c2_drop_avg | c2_drop_1m
+
+    # C3: Xu hướng doanh thu cắm đầu (revenue_slope âm) kết hợp doanh thu tháng này thấp
+    # Dành cho các khách hàng rớt từ từ nhưng rõ rệt
+    c3 = (rev_slope_tp < -1000) & (rev_tp < 0.80 * monetary_tp)  # threshold -1000 để lọc nhiễu nhẹ
+
+    y = (c0 | c1 | c2 | c3).astype(int)
 
     n_c0    = int(c0.sum())
     n_c1    = int(c1.sum())
     n_c2    = int(c2.sum())
+    n_c3    = int(c3.sum())
     n_total = len(y)
     n_pos   = int(y.sum())
     logger.info(
         "Đã sinh nhãn y_churn_t_plus_%d từ %s: "
-        "Tổng Churn=%d (%.1f%%) | C0(hoàn toàn)=%d | C1(item<60%%)=%d | C2(rpi<60%%)=%d | Active=%d | Total=%d",
+        "Tổng Churn=%d (%.1f%%) | C0(hoàn toàn)=%d | C1(tần suất)=%d | C2(doanh thu)=%d | C3(slope)=%d | Active=%d | Total=%d",
         horizon, table_tp,
         n_pos, 100.0 * n_pos / max(n_total, 1),
-        n_c0, n_c1, n_c2,
+        n_c0, n_c1, n_c2, n_c3,
         n_total - n_pos, n_total,
     )
     # -----------------------------------------------------------
