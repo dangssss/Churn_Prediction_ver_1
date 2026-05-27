@@ -130,8 +130,12 @@ def eval_one_k_train_val(
     pre = make_preprocess(num_cols, cat_cols)
     clf = LogisticRegression(
         max_iter=5000,
-        solver="saga",   # saga hội tụ tốt hơn lbfgs khi feature space lớn
+        solver="saga",   # saga hội tụ tốt hơn lbfgs khi feature space lớn + L1/ElasticNet compatible
+        tol=1e-3,        # relaxed tolerance: K=3 edge case converge nhanh hơn mà không ảnh hưởng chất lượng
         class_weight={0: 1.0, 1: spw},
+        penalty="elasticnet",
+        l1_ratio=0.5,
+        C=0.1
     )
     pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
     pipe.fit(X_tr, y_tr)
