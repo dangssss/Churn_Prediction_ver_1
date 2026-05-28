@@ -1,0 +1,4 @@
+# Tránh push các file model nặng lên Git
+*.joblib
+*.pkl
+src/modeling/bundles/

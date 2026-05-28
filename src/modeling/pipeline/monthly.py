@@ -139,12 +139,28 @@ def run_monthly_pipeline(
     prev_cfg = None
     prev_f1 = None
     prev_k = None
+    prev_f1_db = 0.0
+    prev_f1_bundle = 0.0
     try:
         prev_cfg = load_latest_accepted_best_config(engine, horizon=int(horizon))
-        prev_f1 = float(prev_cfg.get("metric_f1_val")) if prev_cfg.get("metric_f1_val") is not None else None
+        prev_f1_db = float(prev_cfg.get("metric_f1_val") or 0)
         prev_k = int(prev_cfg.get("best_k")) if prev_cfg.get("best_k") is not None else None
     except Exception:
         prev_cfg = None
+
+    # Cross-check với bundle metadata để tránh DB bị overwrite thủ công
+    try:
+        _, bundle_meta = load_bundle(bundle_dir)
+        prev_f1_bundle = float(
+            (bundle_meta or {}).get("cfg", {}).get("metric_f1_val") or 0
+        )
+    except Exception:
+        prev_f1_bundle = 0.0
+
+    prev_f1 = max(prev_f1_db, prev_f1_bundle) if (prev_f1_db > 0 or prev_f1_bundle > 0) else None
+    logger.info("[PREV_F1] DB=%.4f | bundle=%.4f | using=%s",
+                prev_f1_db, prev_f1_bundle,
+                f"{prev_f1:.4f}" if prev_f1 is not None else "None")
 
     start_run(
         engine,
@@ -174,6 +190,19 @@ def run_monthly_pipeline(
         cand_k = int(cand_cfg["best_k"])
         t_current = int(cand_cfg["as_of_month"])
 
+        # Prevalence guard: nếu churn_ratio quá cao → labels chưa sẵn sàng
+        VAL_PREVALENCE_MAX = 0.45
+        prevalence_blocked = False
+        if not df_ab.empty and "churn_ratio_train" in df_ab.columns:
+            max_prev = float(df_ab["churn_ratio_train"].max())
+            if max_prev > VAL_PREVALENCE_MAX:
+                prevalence_blocked = True
+                logger.warning(
+                    "[GUARD] val_month=%d có churn_ratio=%.2f > %.2f. "
+                    "Labels cho tháng này chưa sẵn sàng. HỦY RETRAIN.",
+                    t_current, max_prev, VAL_PREVALENCE_MAX
+                )
+
         # 2) Decide accept
         is_mandatory = is_mandatory_retrain_month(t_current)
         pass_guardrail = True
@@ -199,7 +228,10 @@ def run_monthly_pipeline(
                 logger.warning("[GUARD-RAIL] Gặp lỗi khi tính toán guardrail active customers: %s. Chặn retrain để an toàn.", e)
                 pass_guardrail = False
 
-        if is_mandatory:
+        if prevalence_blocked:
+            accepted = False
+            rule = f"rejected_high_prevalence_{max_prev:.2f}"
+        elif is_mandatory:
             accepted = True
             rule = "accepted_mandatory_cycle"
             logger.info("[CYCLE] Tháng %d thuộc chu kỳ 3 tháng cố định. BẮT BUỘC RETRAIN (bỏ qua check guardrail).", t_current)

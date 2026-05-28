@@ -53,12 +53,8 @@ def cmd_sweep_k(args) -> None:
         k_min=int(args.k_min),
     )
 
-    # manual sweep: mark accepted=True by default (debug)
-    best_cfg["is_accepted"] = True
-    best_cfg["accept_rule"] = "manual_sweep"
-    upsert_best_config(engine, best_cfg)
-
-    logger.info("Saved best_config: %s", best_cfg)
+    # Log only — KHÔNG ghi DB để tránh ghi đè config production
+    logger.info("Sweep result (NOT saved to DB): %s", best_cfg)
     cols = [c for c in ["k", "use_static", "val_month", "f1", "PR_AUC_val", "best_threshold", "spw_used"] if c in df_ab.columns]
     logger.info("TOP-10:\n%s", df_ab[cols].head(10).to_string(index=False))
 

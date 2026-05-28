@@ -118,9 +118,19 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
 
     n_churn_train = int(y_tr.sum())
     n_active_train = len(y_tr) - n_churn_train
+    churn_ratio_train = n_churn_train / max(len(y_tr), 1)
+
+    n_churn_val = int(y_va.sum())
+    n_active_val = len(y_va) - n_churn_val
+    churn_ratio_val = n_churn_val / max(len(y_va), 1)
+
     logger.info(
-        "[MAIN MODEL] Tập huấn luyện: Churn=%d | Active=%d | Total=%d | scale_pos_weight=%.2f (từ best_config)",
-        n_churn_train, n_active_train, len(y_tr), spw,
+        "[MAIN MODEL] Train: Churn=%d | Active=%d | Total=%d | Tỷ lệ Churn=%.2f%% | spw=%.2f",
+        n_churn_train, n_active_train, len(y_tr), churn_ratio_train * 100, spw,
+    )
+    logger.info(
+        "[MAIN MODEL] Val:   Churn=%d | Active=%d | Total=%d | Tỷ lệ Churn=%.2f%%",
+        n_churn_val, n_active_val, len(y_va), churn_ratio_val * 100,
     )
 
     # detect categorical — exclude date-string columns (YYYY-MM-DD) which change each month
@@ -196,20 +206,34 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
     thr_opt, p_opt, r_opt, f1_opt = best_threshold_by_f1_np(y_va, va_prob, n_grid=600)
     ap = average_precision_np(y_va, va_prob)
     
-    # Calculate and print confusion matrix at optimal threshold
+    # Calculate confusion matrix at optimal threshold
     y_pred_opt = (va_prob >= thr_opt).astype(int)
     cm = confusion_matrix(y_va, y_pred_opt)
     tn, fp, fn, tp = cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
-    print(
-        f"\n{'='*60}\n"
-        f"[MAIN MODEL] Confusion Matrix @ threshold={thr_opt:.4f}\n"
-        f"{'='*60}\n"
-        f"                   Pred Active(0)   Pred Churn(1)\n"
-        f"  Actual Active(0)  TN={tn:<10}   FP={fp}\n"
-        f"  Actual Churn(1)   FN={fn:<10}   TP={tp}\n"
-        f"  Precision={tp/(tp+fp+1e-9):.4f}  Recall={tp/(tp+fn+1e-9):.4f}  F1={f1_opt:.4f}\n"
-        f"{'='*60}"
+    logger.info(
+        "[MAIN MODEL] Confusion Matrix @ threshold=%.4f: "
+        "TN=%d FP=%d FN=%d TP=%d | "
+        "Precision=%.4f Recall=%.4f F1=%.4f",
+        thr_opt, tn, fp, fn, tp,
+        tp / (tp + fp + 1e-9), tp / (tp + fn + 1e-9), f1_opt,
     )
+
+    # Degenerate guard: predict-all-positive → vô dụng cho production
+    if tn + fn == 0:
+        raise ValueError(
+            f"XGBoost degenerate: TN=0, FN=0 (predict-all-positive). "
+            f"K={cfg['best_k']}, threshold={thr_opt:.4f}, "
+            f"val_prevalence={y_va.mean():.3f}. Bỏ qua variant này."
+        )
+
+    # Score compression guard: model không phân biệt được customers
+    score_range = float(np.max(va_prob)) - float(np.min(va_prob))
+    if score_range < 0.05:
+        raise ValueError(
+            f"XGBoost score range quá hẹp: {score_range:.4f}. "
+            f"Scores trong [{va_prob.min():.3f}, {va_prob.max():.3f}]. "
+            f"Model không phân biệt được customers."
+        )
 
     # --- early stop meta
     best_it = getattr(model, "best_iteration", None)
@@ -275,7 +299,13 @@ def run_main_variant(engine, cfg: dict, df_static: pd.DataFrame, use_static_flag
     cfg_tmp = dict(cfg)
     cfg_tmp["use_static"] = bool(use_static_flag)
 
-    model, report, feat_cols, cat_cols, fmap, date_cols = train_main_xgb_option_B(df_tr, df_va, cfg_tmp)
+    try:
+        model, report, feat_cols, cat_cols, fmap, date_cols = train_main_xgb_option_B(df_tr, df_va, cfg_tmp)
+    except ValueError as e:
+        logger.warning("Variant K=%d use_static=%s rejected: %s",
+                       cfg['best_k'], use_static_flag, e)
+        return {"use_static": bool(use_static_flag), "guardrail_warning": str(e),
+                "F1_val": 0.0, "AP_val": 0.0}
 
     # baseline profile for monitoring drift (built on train split)
     feature_profile = compute_feature_profile(df_tr, feat_cols=feat_cols, cat_cols=cat_cols)
