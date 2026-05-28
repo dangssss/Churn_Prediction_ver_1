@@ -147,25 +147,33 @@ def build_labeled_pair(
     freq_tp = pd.to_numeric(df_tp.get("frequency", 0), errors="coerce").fillna(0)
     monetary_tp = pd.to_numeric(df_tp.get("monetary", 0), errors="coerce").fillna(0)
     rev_slope_tp = pd.to_numeric(df_tp.get("revenue_slope", 0), errors="coerce").fillna(0)
-    
+
     rev_1m = pd.to_numeric(df_tp.get("revenue_1m_ago", 0), errors="coerce").fillna(0)
     item_1m = pd.to_numeric(df_tp.get("item_1m_ago", 0), errors="coerce").fillna(0)
 
-    # C1: Tần suất gửi hàng giảm mạnh (Giảm > 50% so với tần suất bình quân frequency)
+    # FIX: freq_tp và monetary_tp là TỔNG của best_k_f tháng (window của bảng label).
+    # Phải chia cho best_k_f để ra mức BÌNH QUÂN 1 tháng trước khi so sánh với
+    # item_tp / rev_tp là giá trị của DUY NHẤT 1 tháng (tháng t+h).
+    # Nếu không normalize: khách hàng đều đặn bình thường cũng bị đánh nhầm là Churn.
+    k_months_label = max(int(best_k_f), 1)
+    avg_freq_per_month     = freq_tp     / k_months_label
+    avg_monetary_per_month = monetary_tp / k_months_label
+
+    # C1: Tần suất gửi hàng giảm mạnh (Giảm > 50% so với bình quân 1 tháng)
     # HOẶC giảm > 50% so với tháng liền kề
-    c1_drop_avg = (freq_tp > 0) & (item_tp < 0.50 * freq_tp)
+    c1_drop_avg = (avg_freq_per_month > 0) & (item_tp < 0.50 * avg_freq_per_month)
     c1_drop_1m  = (item_1m > 0) & (item_tp < 0.50 * item_1m)
     c1 = c1_drop_avg | c1_drop_1m
 
-    # C2: Doanh thu giảm mạnh (Giảm > 50% so với doanh thu bình quân monetary)
+    # C2: Doanh thu giảm mạnh (Giảm > 50% so với bình quân 1 tháng)
     # HOẶC giảm > 50% so với tháng liền kề (revenue_1m_ago)
-    c2_drop_avg = (monetary_tp > 0) & (rev_tp < 0.50 * monetary_tp)
+    c2_drop_avg = (avg_monetary_per_month > 0) & (rev_tp < 0.50 * avg_monetary_per_month)
     c2_drop_1m  = (rev_1m > 0) & (rev_tp < 0.50 * rev_1m)
     c2 = c2_drop_avg | c2_drop_1m
 
     # C3: Xu hướng doanh thu cắm đầu (revenue_slope âm) kết hợp doanh thu tháng này thấp
-    # Dành cho các khách hàng rớt từ từ nhưng rõ rệt
-    c3 = (rev_slope_tp < -1000) & (rev_tp < 0.80 * monetary_tp)  # threshold -1000 để lọc nhiễu nhẹ
+    # Dùng avg_monetary_per_month để so sánh cùng hệ quy chiếu 1 tháng
+    c3 = (rev_slope_tp < -1000) & (rev_tp < 0.80 * avg_monetary_per_month)
 
     y = (c0 | c1 | c2 | c3).astype(int)
 
@@ -176,9 +184,9 @@ def build_labeled_pair(
     n_total = len(y)
     n_pos   = int(y.sum())
     logger.info(
-        "Đã sinh nhãn y_churn_t_plus_%d từ %s: "
+        "Đã sinh nhãn y_churn_t_plus_%d từ %s (k_label=%d tháng): "
         "Tổng Churn=%d (%.1f%%) | C0(hoàn toàn)=%d | C1(tần suất)=%d | C2(doanh thu)=%d | C3(slope)=%d | Active=%d | Total=%d",
-        horizon, table_tp,
+        horizon, table_tp, k_months_label,
         n_pos, 100.0 * n_pos / max(n_total, 1),
         n_c0, n_c1, n_c2, n_c3,
         n_total - n_pos, n_total,
