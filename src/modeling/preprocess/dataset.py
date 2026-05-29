@@ -17,7 +17,7 @@ from .feature_tables import (
     list_tables_for_k,
 )
 from .gating import apply_gate
-from .label_tables import LABEL_SCHEMA, label_table_for_yymm, load_label_keys
+from .label_tables import LABEL_SCHEMA, estimate_observed_label_rate, label_table_for_yymm, load_label_keys
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +234,7 @@ def build_labeled_pair(
     n_c3    = int(c3.sum())
     n_total = len(y)
     n_pos   = int(y.sum())
-    logger.info(
+    logger.debug(
         "Đã sinh nhãn y_churn_t_plus_%d từ %s: "
         "Tổng Churn=%d (%.1f%%) | C0(hoàn toàn)=%d | C1(tần suất)=%d | C2(doanh thu)=%d | C3(slope)=%d | Active=%d | Total=%d",
         horizon, table_tp,
@@ -246,47 +246,72 @@ def build_labeled_pair(
 
 
 
-    min_avg_items = float(os.getenv("RULE_LABEL_MIN_AVG_ITEMS", "3"))
-    min_avg_revenue = float(os.getenv("RULE_LABEL_MIN_AVG_REVENUE", "100000"))
-    severe_drop_pct = float(os.getenv("RULE_LABEL_SEVERE_DROP_PCT", "0.80"))
-    stable_keep_pct = float(os.getenv("RULE_LABEL_STABLE_KEEP_PCT", "0.50"))
-    slope_threshold = float(os.getenv("RULE_LABEL_SLOPE_THRESHOLD", "-1000"))
+    baseline_item = pd.concat([freq_tp, item_1m], axis=1).max(axis=1)
+    baseline_rev = pd.concat([monetary_tp, rev_1m], axis=1).max(axis=1)
 
-    eligible = (freq_tp >= min_avg_items) | (monetary_tp >= min_avg_revenue)
-    keep_after_drop = max(0.0, min(1.0, 1.0 - severe_drop_pct))
+    item_drop = (1.0 - item_tp / baseline_item.replace(0, np.nan)).clip(lower=0, upper=1).fillna(0)
+    rev_drop = (1.0 - rev_tp / baseline_rev.replace(0, np.nan)).clip(lower=0, upper=1).fillna(0)
+    zero_activity = ((item_tp == 0) & (rev_tp == 0)).astype(float)
 
-    rule_c0 = eligible & (item_tp == 0) & (rev_tp == 0)
-    item_drop_avg = (freq_tp > 0) & (item_tp <= keep_after_drop * freq_tp)
-    rev_drop_avg = (monetary_tp > 0) & (rev_tp <= keep_after_drop * monetary_tp)
-    item_drop_1m = (item_1m > 0) & (item_tp <= keep_after_drop * item_1m)
-    rev_drop_1m = (rev_1m > 0) & (rev_tp <= keep_after_drop * rev_1m)
+    neg_slope = (-rev_slope_tp).clip(lower=0)
+    slope_score = pd.Series(0.0, index=df_tp.index)
+    if float(neg_slope.max()) > 0:
+        slope_score = (neg_slope.rank(pct=True) * (neg_slope > 0)).astype(float)
 
-    severe_drop = eligible & ((item_drop_avg & rev_drop_avg) | (item_drop_1m & rev_drop_1m))
-    slope_support = eligible & (rev_slope_tp <= slope_threshold) & (rev_drop_avg | rev_drop_1m)
-    positive = rule_c0 | severe_drop | slope_support
+    baseline_strength = (
+        baseline_item.rank(pct=True).fillna(0) * 0.5
+        + baseline_rev.rank(pct=True).fillna(0) * 0.5
+    )
+    eligible = (baseline_item > 0) | (baseline_rev > 0)
 
-    stable_item = (freq_tp > 0) & (item_tp >= stable_keep_pct * freq_tp)
-    stable_rev = (monetary_tp > 0) & (rev_tp >= stable_keep_pct * monetary_tp)
-    negative = ~positive & (stable_item | stable_rev)
+    risk_score = (
+        0.35 * item_drop
+        + 0.35 * rev_drop
+        + 0.20 * zero_activity
+        + 0.10 * slope_score
+    ) * baseline_strength
+    risk_score = risk_score.where(eligible, np.nan)
 
-    y = pd.Series(np.nan, index=df_tp.index, dtype="float64")
-    y.loc[negative] = 0.0
-    y.loc[positive] = 1.0
+    target_rate_env = os.getenv("RULE_LABEL_TARGET_CHURN_RATE")
+    target_source = "observed_label_rate"
+    if target_rate_env:
+        target_rate = float(target_rate_env)
+        target_source = "env_RULE_LABEL_TARGET_CHURN_RATE"
+    else:
+        target_rate = estimate_observed_label_rate(engine, feature_schema=FEATURE_SCHEMA)
+        if target_rate is None:
+            target_rate = float(os.getenv("RULE_LABEL_FALLBACK_TARGET_CHURN_RATE", "0.15"))
+            target_source = "fallback_RULE_LABEL_FALLBACK_TARGET_CHURN_RATE"
+
+    uncertain_band = float(os.getenv("RULE_LABEL_UNCERTAIN_BAND_RATE", "0.20"))
+    target_rate = max(0.001, min(float(target_rate), 0.50))
+    uncertain_band = max(0.0, min(float(uncertain_band), 0.80))
+
+    scored = risk_score.dropna()
+    if scored.empty:
+        y = pd.Series(np.nan, index=df_tp.index, dtype="float64")
+        pos_cutoff = np.nan
+        neg_cutoff = np.nan
+    else:
+        pos_cutoff = float(scored.quantile(1.0 - target_rate))
+        neg_quantile = max(0.0, 1.0 - target_rate - uncertain_band)
+        neg_cutoff = float(scored.quantile(neg_quantile))
+
+        y = pd.Series(np.nan, index=df_tp.index, dtype="float64")
+        y.loc[risk_score <= neg_cutoff] = 0.0
+        y.loc[risk_score >= pos_cutoff] = 1.0
 
     n_pos = int((y == 1).sum())
     n_neg = int((y == 0).sum())
     n_uncertain = int(y.isna().sum())
     logger.info(
-        "Override fallback labels y_churn_t_plus_%d from %s using strict 1/0/uncertain rules: "
-        "Churn=%d (%.1f%% of labeled) | Active=%d | Uncertain(drop)=%d | "
-        "C0_zero=%d | severe_drop=%d | slope_supported=%d | eligible=%d | total=%d | "
-        "thresholds: min_avg_items=%.2f, min_avg_revenue=%.2f, severe_drop_pct=%.2f, stable_keep_pct=%.2f",
+        "Override fallback labels y_churn_t_plus_%d from %s using adaptive risk-score rules: "
+        "Churn=%d (%.1f%% of labeled) | Active=%d | Uncertain(drop)=%d | eligible=%d | total=%d | "
+        "target_rate=%.4f (%s) | positive_cutoff=%.6f | negative_cutoff=%.6f | uncertain_band=%.2f",
         horizon, table_tp,
         n_pos, 100.0 * n_pos / max(n_pos + n_neg, 1),
-        n_neg, n_uncertain,
-        int(rule_c0.sum()), int(severe_drop.sum()), int((slope_support & ~rule_c0 & ~severe_drop).sum()),
-        int(eligible.sum()), len(y),
-        min_avg_items, min_avg_revenue, severe_drop_pct, stable_keep_pct,
+        n_neg, n_uncertain, int(eligible.sum()), len(y),
+        target_rate, target_source, pos_cutoff, neg_cutoff, uncertain_band,
     )
 
     lab = df_tp[["cms_code_enc"]].copy()
