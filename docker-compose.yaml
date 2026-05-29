@@ -81,6 +81,8 @@ x-airflow-common:
     PG_DB: ${PG_DB}
     PG_USER: ${PG_USER}
     PG_PW: ${PG_PW}
+    LABEL_INCOMING_DIR: ${LABEL_INCOMING_DIR:-/churn_data/label_de}
+    LABEL_SCHEMA: ${LABEL_SCHEMA:-Label}
 
   volumes:
     # --------------------------------------------------------------------------------------
@@ -114,6 +116,8 @@ x-airflow-common:
     - /data/churn_prediction/churn_processing:/churn_process
     # Nap du lieu dau vao (File Zip tu DE) va noi luu File ket qua (churn_de, output_prediction)
     - /data/churn_prediction/ftp_churn/churn_de:/churn_data
+    # Nap file ZIP label chuan tu DE (host: /data/churn_prediction/ftp_churn/churn_de/label_de)
+    - /data/churn_prediction/ftp_churn/churn_de/label_de:/churn_data/label_de
     # Noi luu giu toan bo File text logs trong qua trinh tien xu ly
     - /data/churn_prediction/churn_logs:/logs
     # --------------------------------------------------------------------------------------
