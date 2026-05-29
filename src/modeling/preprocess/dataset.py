@@ -192,12 +192,21 @@ def build_labeled_pair(
 
     out = df_t.merge(lab, on="cms_code_enc", how="left")
 
-    # Khách hàng có ở tháng t nhưng biến mất khỏi bảng tương lai (t+h)
-    # Vì bảng t+h chỉ chứa khách hàng CÓ GIAO DỊCH trong window K đó,
-    # nên vắng mặt ở đây CHẮC CHẮN nghĩa là họ không mua gì -> C0 (Churn hoàn toàn).
+    # Khách hàng có ở tháng t nhưng KHÔNG xuất hiện trong bảng tương lai (t+h):
+    # Không thể xác định được nhãn chính xác — bảng t+h chỉ chứa những người
+    # có GIAO DỊCH trong window K của t+h. Vắng mặt có thể do:
+    #   (a) Thực sự churn (không giao dịch), hoặc
+    #   (b) Dữ liệu chưa được ingest đủ cho window t+h (data lag).
+    # Để tránh nhiễu nhãn và inflate churn_ratio ở K lớn → LOẠI BỎ khỏi training.
     missing_mask = out[f"y_churn_t_plus_{horizon}"].isna()
     if missing_mask.any():
-        out.loc[missing_mask, f"y_churn_t_plus_{horizon}"] = 1
+        n_dropped = int(missing_mask.sum())
+        logger.info(
+            "Loại bỏ %d/%d khách hàng không có nhãn trong bảng tương lai %s "
+            "(không thể xác định churn/active — tránh inflate churn_ratio).",
+            n_dropped, len(out), table_tp,
+        )
+        out = out[~missing_mask].copy()
 
     # enforce window_end exists
     if "window_end" not in out.columns:

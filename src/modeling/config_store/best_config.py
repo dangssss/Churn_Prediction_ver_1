@@ -90,7 +90,11 @@ def upsert_best_config(engine: Engine, best_config: dict) -> None:
         val_month=EXCLUDED.val_month,
         target_month=EXCLUDED.target_month,
         created_at=now(),
-        notes=EXCLUDED.notes;
+        notes=EXCLUDED.notes,
+        is_accepted=EXCLUDED.is_accepted,
+        prev_accepted_f1=EXCLUDED.prev_accepted_f1,
+        accept_rule=EXCLUDED.accept_rule,
+        accepted_at=EXCLUDED.accepted_at;
     """
     with engine.begin() as conn:
         conn.execute(text(upsert_sql), best_config)
