@@ -12,8 +12,10 @@ from Data_pull.resources import (
     get_pg_conn,
 )
 from Data_pull.jobs.ingest_zip_job import ingest_zip_job
+from Data_pull.jobs.ingest_label_zip_job import ingest_label_zip_job
 from Data_pull.ops.naming import parse_zip_and_decide_names
 from Data_pull.logging_config import get_logger
+from Data_pull.resources.fs import list_label_zip_files
 
 logger = get_logger(__name__)
 
@@ -173,6 +175,7 @@ def run_once_scan(
     zip_paths = list_zip_files(fs_cfg)
     if not zip_paths:
         logger.info(f"No ZIP files found in {incoming}")
+        run_once_label_scan(fs_cfg=fs_cfg, pg_cfg=pg_cfg, ingest_schema=ingest_schema)
         return
 
     # Filter files: ch? x? lý file m?i nh?t (snapshot) ho?c 2 tháng m?i nh?t (monthly)
@@ -251,6 +254,62 @@ def run_once_scan(
                 
         except Exception as e:
             logger.error(f"Error processing {zip_name}: {e}")
+
+    run_once_label_scan(fs_cfg=fs_cfg, pg_cfg=pg_cfg, ingest_schema=ingest_schema)
+
+
+def run_once_label_scan(
+    fs_cfg: Optional[FSConfig] = None,
+    pg_cfg: Optional[PostgresConfig] = None,
+    *,
+    ingest_schema: str = "ingest",
+) -> None:
+    if fs_cfg is None:
+        fs_cfg = FSConfig.from_env()
+    if pg_cfg is None:
+        pg_cfg = PostgresConfig.from_env()
+
+    import os
+
+    label_dir = Path(os.getenv("LABEL_INCOMING_DIR", str(fs_cfg.incoming_dir.parent / "label_de")))
+    if not label_dir.exists():
+        logger.info("[LABEL] Label input directory does not exist, skipping: %s", label_dir)
+        return
+
+    zip_paths = list_label_zip_files(label_dir)
+    if not zip_paths:
+        logger.info("[LABEL] No label ZIP files found in: %s", label_dir)
+        return
+
+    force_ingest = os.getenv("FORCE_INGEST", "").lower() in ("1", "true", "yes")
+    for zip_path in zip_paths:
+        zip_name = zip_path.name
+        if not force_ingest:
+            already_processed, logged_mtime = has_success_log(zip_name, pg_cfg, ingest_schema=ingest_schema)
+            if already_processed and zip_path.stat().st_mtime == logged_mtime:
+                logger.info("[LABEL] Skipping %s: already processed (same mtime)", zip_name)
+                continue
+
+        try:
+            result = ingest_label_zip_job(
+                zip_path=zip_path,
+                fs_cfg=fs_cfg,
+                pg_cfg=pg_cfg,
+                ingest_schema=ingest_schema,
+            )
+            if result.get("success"):
+                saved_path = fs_cfg.saved_dir / zip_name
+                if saved_path.exists():
+                    saved_path.unlink()
+                saved_path.parent.mkdir(parents=True, exist_ok=True)
+                import shutil
+
+                shutil.copy2(str(zip_path), str(saved_path))
+                logger.info("[LABEL] Successfully ingested %s: prod_rows=%s", zip_name, result.get("prod_rows"))
+            else:
+                logger.error("[LABEL] Failed %s: %s", zip_name, result.get("error", "unknown error"))
+        except Exception as e:
+            logger.error("[LABEL] Error processing %s: %s", zip_name, e)
 
 
 def main() -> None:

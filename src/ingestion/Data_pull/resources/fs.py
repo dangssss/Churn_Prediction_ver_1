@@ -19,6 +19,8 @@ ZIP_RE = re.compile(
     re.IGNORECASE,
 )
 
+LABEL_ZIP_RE = re.compile(r"label_(?P<yymm>\d{4})\.zip$", re.IGNORECASE)
+
 
 
 @dataclass
@@ -74,4 +76,11 @@ def list_zip_files(src: Union[Path, FSConfig]) -> List[Path]:
     return [
         p for p in sorted(incoming_dir.glob("*.zip"))
         if ZIP_RE.fullmatch(p.name)
+    ]
+
+
+def list_label_zip_files(label_dir: Path) -> List[Path]:
+    return [
+        p for p in sorted(label_dir.glob("*.zip"))
+        if LABEL_ZIP_RE.fullmatch(p.name)
     ]

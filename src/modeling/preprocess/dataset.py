@@ -16,6 +16,7 @@ from .feature_tables import (
     list_tables_for_k,
 )
 from .gating import apply_gate
+from .label_tables import LABEL_SCHEMA, label_table_for_yymm, load_label_keys
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,64 @@ def build_labeled_pair(
         raise ValueError("table_t không thuộc K")
 
     t_plus_h = shift_yymm(end, horizon)
+    df_t = load_feature_table(engine, table_t, limit=limit)
+
+    label_table = label_table_for_yymm(engine, t_plus_h)
+    if label_table:
+        if "cms_code_enc" not in df_t.columns:
+            raise KeyError("Missing cms_code_enc to join label")
+
+        label_col = f"y_churn_t_plus_{horizon}"
+        d = df_t.copy()
+        d["cms_code_enc"] = d["cms_code_enc"].astype(str).str.strip()
+        labels = load_label_keys(engine, label_table)
+
+        cms_keys = set(labels["cms_code_enc"].dropna().astype(str))
+        crm_keys = set(labels["crm_code_enc"].dropna().astype(str))
+
+        matched = d["cms_code_enc"].isin(cms_keys)
+        if crm_keys:
+            if "crm_code_enc" in d.columns:
+                crm_series = d["crm_code_enc"].astype(str).str.strip()
+            else:
+                try:
+                    from sqlalchemy import text
+
+                    q = text("""
+                        SELECT cms_code_enc, crm_code_enc
+                        FROM public.cas_info
+                        WHERE crm_code_enc IS NOT NULL
+                    """)
+                    code_map = pd.read_sql(q, engine)
+                    code_map["cms_code_enc"] = code_map["cms_code_enc"].astype(str).str.strip()
+                    code_map["crm_code_enc"] = code_map["crm_code_enc"].astype(str).str.strip()
+                    code_map = code_map.drop_duplicates("cms_code_enc")
+                    crm_series = d[["cms_code_enc"]].merge(code_map, on="cms_code_enc", how="left")["crm_code_enc"].fillna("")
+                except Exception as exc:
+                    logger.warning("Could not load public.cas_info for crm_code_enc label matching: %s", exc)
+                    crm_series = pd.Series([""] * len(d), index=d.index)
+
+            matched = matched | crm_series.isin(crm_keys).to_numpy()
+
+        d[label_col] = matched.astype(int)
+        if "window_end" not in d.columns:
+            d["window_end"] = end
+        d["source_table_t"] = table_t
+        d["source_table_t_plus_h"] = f'{LABEL_SCHEMA}.{label_table}'
+
+        n_pos = int(d[label_col].sum())
+        logger.info(
+            "Generated %s from %s.%s for window %s: Churn=%d (%.1f%%) | Active=%d | Total=%d",
+            label_col,
+            LABEL_SCHEMA,
+            label_table,
+            table_t,
+            n_pos,
+            100.0 * n_pos / max(len(d), 1),
+            len(d) - n_pos,
+            len(d),
+        )
+        return d
 
     # -------------------------------------------------------------------------
     # SỬA LỖI LOGIC: Không dùng `k` để tìm bảng tương lai (table_tp), vì số lượng 
@@ -123,7 +182,6 @@ def build_labeled_pair(
     future_cands.sort(key=lambda x: x[0], reverse=True)
     best_k_f, table_tp = future_cands[0]
 
-    df_t  = load_feature_table(engine, table_t,  limit=limit)
     df_tp = load_feature_table(engine, table_tp, limit=limit)
 
     if "cms_code_enc" not in df_t.columns or "cms_code_enc" not in df_tp.columns:
