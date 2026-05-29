@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import numpy as np
@@ -244,6 +245,49 @@ def build_labeled_pair(
     # -----------------------------------------------------------
 
 
+
+    min_avg_items = float(os.getenv("RULE_LABEL_MIN_AVG_ITEMS", "3"))
+    min_avg_revenue = float(os.getenv("RULE_LABEL_MIN_AVG_REVENUE", "100000"))
+    severe_drop_pct = float(os.getenv("RULE_LABEL_SEVERE_DROP_PCT", "0.80"))
+    stable_keep_pct = float(os.getenv("RULE_LABEL_STABLE_KEEP_PCT", "0.50"))
+    slope_threshold = float(os.getenv("RULE_LABEL_SLOPE_THRESHOLD", "-1000"))
+
+    eligible = (freq_tp >= min_avg_items) | (monetary_tp >= min_avg_revenue)
+    keep_after_drop = max(0.0, min(1.0, 1.0 - severe_drop_pct))
+
+    rule_c0 = eligible & (item_tp == 0) & (rev_tp == 0)
+    item_drop_avg = (freq_tp > 0) & (item_tp <= keep_after_drop * freq_tp)
+    rev_drop_avg = (monetary_tp > 0) & (rev_tp <= keep_after_drop * monetary_tp)
+    item_drop_1m = (item_1m > 0) & (item_tp <= keep_after_drop * item_1m)
+    rev_drop_1m = (rev_1m > 0) & (rev_tp <= keep_after_drop * rev_1m)
+
+    severe_drop = eligible & ((item_drop_avg & rev_drop_avg) | (item_drop_1m & rev_drop_1m))
+    slope_support = eligible & (rev_slope_tp <= slope_threshold) & (rev_drop_avg | rev_drop_1m)
+    positive = rule_c0 | severe_drop | slope_support
+
+    stable_item = (freq_tp > 0) & (item_tp >= stable_keep_pct * freq_tp)
+    stable_rev = (monetary_tp > 0) & (rev_tp >= stable_keep_pct * monetary_tp)
+    negative = ~positive & (stable_item | stable_rev)
+
+    y = pd.Series(np.nan, index=df_tp.index, dtype="float64")
+    y.loc[negative] = 0.0
+    y.loc[positive] = 1.0
+
+    n_pos = int((y == 1).sum())
+    n_neg = int((y == 0).sum())
+    n_uncertain = int(y.isna().sum())
+    logger.info(
+        "Override fallback labels y_churn_t_plus_%d from %s using strict 1/0/uncertain rules: "
+        "Churn=%d (%.1f%% of labeled) | Active=%d | Uncertain(drop)=%d | "
+        "C0_zero=%d | severe_drop=%d | slope_supported=%d | eligible=%d | total=%d | "
+        "thresholds: min_avg_items=%.2f, min_avg_revenue=%.2f, severe_drop_pct=%.2f, stable_keep_pct=%.2f",
+        horizon, table_tp,
+        n_pos, 100.0 * n_pos / max(n_pos + n_neg, 1),
+        n_neg, n_uncertain,
+        int(rule_c0.sum()), int(severe_drop.sum()), int((slope_support & ~rule_c0 & ~severe_drop).sum()),
+        int(eligible.sum()), len(y),
+        min_avg_items, min_avg_revenue, severe_drop_pct, stable_keep_pct,
+    )
 
     lab = df_tp[["cms_code_enc"]].copy()
     lab[f"y_churn_t_plus_{horizon}"] = y.values
