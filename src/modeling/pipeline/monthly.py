@@ -284,8 +284,29 @@ def run_monthly_pipeline(
         bundle_dir.mkdir(parents=True, exist_ok=True)
 
         if accepted:
-            _train_main_inline(engine, horizon=int(horizon), bundle_dir=bundle_dir)
-            did_retrain = True
+            try:
+                _train_main_inline(engine, horizon=int(horizon), bundle_dir=bundle_dir)
+                did_retrain = True
+            except RuntimeError as e:
+                if "All variants failed guardrail" not in str(e):
+                    raise
+
+                accepted = False
+                rule = "rejected_main_guardrail_all_variants_failed"
+                cand_cfg["is_accepted"] = False
+                cand_cfg["accept_rule"] = rule
+                cand_cfg["accepted_at"] = None
+                cand_cfg["notes"] = (
+                    f"{cand_cfg.get('notes') or ''}; main_train_guardrail={str(e)}"
+                ).strip("; ")
+                upsert_best_config(engine, cand_cfg)
+                logger.warning(
+                    "[GUARD] Main model retrain failed guardrail for K=%d, month=%d. "
+                    "Reject candidate and keep previous accepted model/config if available. Reason: %s",
+                    cand_k,
+                    t_current,
+                    e,
+                )
 
         # 4) Monthly scoring — chỉ chạy nếu có accepted config trong DB
         # (trường hợp bị block ngay lần đầu tiên: chưa có model nào được accepted)
