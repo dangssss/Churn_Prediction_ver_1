@@ -7,6 +7,7 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from logging_config import get_logger
+from infra.yymm import shift_yymm
 
 LABEL_SCHEMA = os.getenv("LABEL_SCHEMA", "Label")
 LABEL_TBL_REGEX = re.compile(r"^label_(\d{4})$", re.IGNORECASE)
@@ -33,6 +34,19 @@ def label_table_for_yymm(engine: Engine, yymm: str | int) -> str | None:
     if not matches:
         return None
     return sorted(matches)[0]
+
+
+def label_tables_for_horizon(
+    engine: Engine,
+    origin_yymm: str | int,
+    horizon: int,
+) -> list[str] | None:
+    """Return all actual label tables for t+1..t+h, or None if coverage is partial."""
+    tables = [
+        label_table_for_yymm(engine, shift_yymm(origin_yymm, offset))
+        for offset in range(1, int(horizon) + 1)
+    ]
+    return None if any(table is None for table in tables) else tables
 
 
 def list_label_tables(engine: Engine) -> list[str]:

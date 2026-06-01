@@ -16,7 +16,7 @@ from .feature_tables import (
     list_tables_for_k,
 )
 from .gating import apply_gate
-from .label_tables import LABEL_SCHEMA, estimate_observed_label_rate, label_table_for_yymm, load_label_keys
+from .label_tables import LABEL_SCHEMA, estimate_observed_label_rate, label_tables_for_horizon, load_label_keys
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -176,18 +176,20 @@ def build_labeled_pair(
     if kk != k:
         raise ValueError("table_t không thuộc K")
 
-    t_plus_h = shift_yymm(end, horizon)
     df_t = load_feature_table(engine, table_t, limit=limit)
 
-    label_table = label_table_for_yymm(engine, t_plus_h)
-    if label_table:
+    label_tables = label_tables_for_horizon(engine, end, horizon)
+    if label_tables:
         if "cms_code_enc" not in df_t.columns:
             raise KeyError("Missing cms_code_enc to join label")
 
         label_col = f"y_churn_t_plus_{horizon}"
         d = df_t.copy()
         d["cms_code_enc"] = d["cms_code_enc"].astype(str).str.strip()
-        labels = load_label_keys(engine, label_table)
+        labels = pd.concat(
+            [load_label_keys(engine, label_table) for label_table in label_tables],
+            ignore_index=True,
+        ).drop_duplicates()
 
         cms_keys = set(labels["cms_code_enc"].dropna().astype(str))
         crm_keys = set(labels["crm_code_enc"].dropna().astype(str))
@@ -220,16 +222,16 @@ def build_labeled_pair(
         if "window_end" not in d.columns:
             d["window_end"] = end
         d["source_table_t"] = table_t
-        d["source_table_t_plus_h"] = f'{LABEL_SCHEMA}.{label_table}'
+        label_sources = ",".join(f"{LABEL_SCHEMA}.{label_table}" for label_table in label_tables)
+        d["source_table_t_plus_h"] = label_sources
         d["label_source"] = "actual"
         d["label_weight"] = 1.0
 
         n_pos = int(d[label_col].sum())
         logger.info(
-            "Generated %s from %s.%s for window %s: Churn=%d (%.1f%%) | Active=%d | Total=%d",
+            "Generated %s from actual labels [%s] for window %s: Churn=%d (%.1f%%) | Active=%d | Total=%d",
             label_col,
-            LABEL_SCHEMA,
-            label_table,
+            label_sources,
             table_t,
             n_pos,
             100.0 * n_pos / max(len(d), 1),

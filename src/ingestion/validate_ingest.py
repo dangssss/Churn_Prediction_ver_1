@@ -200,12 +200,17 @@ def _validate_labels(cur, details: dict) -> list[str]:
     latest_label_table, latest_label_rows = usable[-1]
     latest_label_yymm = LABEL_TABLE_RE.fullmatch(latest_label_table).group(1)
     latest_order_yymm = details.get("latest_order_yymm")
+    horizon_months = _env_int("LABEL_EXPECTED_HORIZON_MONTHS", 2)
     details["latest_label_table"] = latest_label_table
     details["latest_label_rows"] = latest_label_rows
+    details["latest_complete_actual_origin_yymm"] = _shift_yymm(
+        latest_label_yymm,
+        -horizon_months,
+    )
     if latest_order_yymm:
         expected_label_yymm = _shift_yymm(
             latest_order_yymm,
-            -_env_int("LABEL_EXPECTED_HORIZON_MONTHS", 2),
+            -horizon_months,
         )
         details["expected_actual_label_yymm"] = expected_label_yymm
         if _month_index(latest_label_yymm) < _month_index(expected_label_yymm):
