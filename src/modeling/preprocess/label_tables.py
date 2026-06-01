@@ -12,7 +12,7 @@ from infra.yymm import shift_yymm
 LABEL_SCHEMA = os.getenv("LABEL_SCHEMA", "Label")
 LABEL_TBL_REGEX = re.compile(r"^label_(\d{4})$", re.IGNORECASE)
 FEATURE_TBL_REGEX = re.compile(r"^cus_feature_(\d+)m_(\d{4})_(\d{4})$")
-_CALIBRATION_CACHE: dict[tuple[int, str, str], float | None] = {}
+_CALIBRATION_CACHE: dict[tuple[int, str, str, int], float | None] = {}
 logger = get_logger(__name__)
 
 
@@ -84,13 +84,17 @@ def load_label_keys(engine: Engine, table_name: str) -> pd.DataFrame:
     return df
 
 
-def estimate_observed_label_rate(engine: Engine, *, feature_schema: str = "data_window") -> float | None:
-    cache_key = (id(engine), LABEL_SCHEMA, feature_schema)
+def estimate_observed_label_rate(
+    engine: Engine,
+    *,
+    horizon: int,
+    feature_schema: str = "data_window",
+) -> float | None:
+    cache_key = (id(engine), LABEL_SCHEMA, feature_schema, int(horizon))
     if cache_key in _CALIBRATION_CACHE:
         return _CALIBRATION_CACHE[cache_key]
 
-    labels = list_label_tables(engine)
-    if not labels:
+    if not list_label_tables(engine):
         _CALIBRATION_CACHE[cache_key] = None
         return None
 
@@ -117,21 +121,26 @@ def estimate_observed_label_rate(engine: Engine, *, feature_schema: str = "data_
             by_end[end] = (k, table)
 
     rates = []
-    for label_table in labels:
-        label_month = LABEL_TBL_REGEX.match(label_table).group(1)
-        feature_info = by_end.get(label_month)
-        if not feature_info:
+    for origin_month, feature_info in sorted(by_end.items()):
+        label_tables = label_tables_for_horizon(engine, origin_month, horizon)
+        if not label_tables:
             continue
         feature_table = feature_info[1]
         if not FEATURE_TBL_REGEX.match(feature_table):
             continue
-
-        q = text(f'''
-            WITH label_keys AS (
-                SELECT DISTINCT
+        label_union_sql = "\nUNION\n".join(
+            f'''
+                SELECT
                     NULLIF(TRIM(cms_code_enc), '') AS cms_code_enc,
                     NULLIF(TRIM(crm_code_enc), '') AS crm_code_enc
                 FROM "{LABEL_SCHEMA}"."{label_table}"
+            '''
+            for label_table in label_tables
+        )
+
+        q = text(f'''
+            WITH label_keys AS (
+                {label_union_sql}
             ),
             population AS (
                 SELECT
@@ -165,7 +174,7 @@ def estimate_observed_label_rate(engine: Engine, *, feature_schema: str = "data_
             logger.warning(
                 'Ignoring empty or unmatched calibration label table %s.%s',
                 LABEL_SCHEMA,
-                label_table,
+                ",".join(label_tables),
             )
 
     if not rates:

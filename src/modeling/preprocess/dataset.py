@@ -344,7 +344,11 @@ def build_labeled_pair(
         target_rate = float(target_rate_env)
         target_source = "env_RULE_LABEL_TARGET_CHURN_RATE"
     else:
-        target_rate = estimate_observed_label_rate(engine, feature_schema=FEATURE_SCHEMA)
+        target_rate = estimate_observed_label_rate(
+            engine,
+            horizon=horizon,
+            feature_schema=FEATURE_SCHEMA,
+        )
         if target_rate is None:
             target_rate = float(os.getenv("RULE_LABEL_FALLBACK_TARGET_CHURN_RATE", "0.15"))
             target_source = "fallback_RULE_LABEL_FALLBACK_TARGET_CHURN_RATE"
