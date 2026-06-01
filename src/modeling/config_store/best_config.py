@@ -31,6 +31,8 @@ def ensure_best_config_table(engine: Engine) -> None:
         prev_accepted_f1  DOUBLE PRECISION,
         accept_rule       TEXT,
         accepted_at       TIMESTAMP,
+        validation_label_source TEXT,
+        bundle_lifecycle  TEXT NOT NULL DEFAULT 'PRODUCTION',
 
         PRIMARY KEY (as_of_month, horizon)
     );
@@ -54,6 +56,12 @@ def ensure_best_config_table(engine: Engine) -> None:
 
     ALTER TABLE data_static.model_best_config
     ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMP;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS validation_label_source TEXT;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS bundle_lifecycle TEXT NOT NULL DEFAULT 'PRODUCTION';
     """
     with engine.begin() as conn:
         for stmt in alter_sql.strip().split(";"):
@@ -63,6 +71,9 @@ def ensure_best_config_table(engine: Engine) -> None:
 
 def upsert_best_config(engine: Engine, best_config: dict) -> None:
     ensure_best_config_table(engine)
+    best_config = dict(best_config)
+    best_config.setdefault("validation_label_source", "unknown")
+    best_config.setdefault("bundle_lifecycle", "PRODUCTION")
     upsert_sql = """
     INSERT INTO data_static.model_best_config (
         as_of_month, horizon,
@@ -70,7 +81,8 @@ def upsert_best_config(engine: Engine, best_config: dict) -> None:
         best_threshold, best_spw,
         metric_f1_val, metric_pr_auc_val, val_month, target_month,
         notes,
-        is_accepted, prev_accepted_f1, accept_rule, accepted_at
+        is_accepted, prev_accepted_f1, accept_rule, accepted_at,
+        validation_label_source, bundle_lifecycle
     )
     VALUES (
         :as_of_month, :horizon,
@@ -78,7 +90,8 @@ def upsert_best_config(engine: Engine, best_config: dict) -> None:
         :best_threshold, :best_spw,
         :metric_f1_val, :metric_pr_auc_val, :val_month, :target_month,
         :notes,
-        :is_accepted, :prev_accepted_f1, :accept_rule, :accepted_at
+        :is_accepted, :prev_accepted_f1, :accept_rule, :accepted_at,
+        :validation_label_source, :bundle_lifecycle
     )
     ON CONFLICT (as_of_month, horizon) DO UPDATE SET
         best_k=EXCLUDED.best_k,
@@ -94,7 +107,9 @@ def upsert_best_config(engine: Engine, best_config: dict) -> None:
         is_accepted=EXCLUDED.is_accepted,
         prev_accepted_f1=EXCLUDED.prev_accepted_f1,
         accept_rule=EXCLUDED.accept_rule,
-        accepted_at=EXCLUDED.accepted_at;
+        accepted_at=EXCLUDED.accepted_at,
+        validation_label_source=EXCLUDED.validation_label_source,
+        bundle_lifecycle=EXCLUDED.bundle_lifecycle;
     """
     with engine.begin() as conn:
         conn.execute(text(upsert_sql), best_config)

@@ -147,6 +147,23 @@ def eval_one_k_train_val(
     )
     if df_tr is None or df_tr.empty or df_va.empty:
         return None
+    val_label_sources = (
+        sorted(df_va["label_source"].dropna().astype(str).unique())
+        if "label_source" in df_va.columns
+        else []
+    )
+    validation_label_source = (
+        "actual" if val_label_sources == ["actual"] else "rule_based"
+    )
+    bundle_lifecycle = (
+        "PRODUCTION" if validation_label_source == "actual" else "PROVISIONAL"
+    )
+    logger.info(
+        "[VALIDATION PROVENANCE] val_month=%s source=%s lifecycle=%s",
+        val_month,
+        validation_label_source,
+        bundle_lifecycle,
+    )
 
     num_cols, cat_cols = select_feature_cols_mixed(df_k, label_col=label_col)
     X_tr = df_tr[num_cols + cat_cols]
@@ -250,6 +267,8 @@ def eval_one_k_train_val(
         "H": int(horizon),
         "use_static": bool(use_static),
         "val_month": int(val_month),
+        "validation_label_source": validation_label_source,
+        "bundle_lifecycle": bundle_lifecycle,
         "n_rows": int(len(df_k)),
         "n_months": int(df_k["window_end"].nunique()),
         "spw_used": float(class_weight_used.get(1, 1.0)),

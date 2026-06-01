@@ -192,6 +192,8 @@ def cmd_train_main(args) -> None:
     bundle_dir.mkdir(parents=True, exist_ok=True)
     meta = {
         "cfg": cfg,
+        "bundle_lifecycle": str(cfg.get("bundle_lifecycle") or "PRODUCTION").upper(),
+        "validation_label_source": cfg.get("validation_label_source"),
         "main_report": best["report"],
         "feat_cols": best.get("feat_cols"),
         "cat_cols": best.get("cat_cols"),

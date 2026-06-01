@@ -35,6 +35,15 @@ from logging_config import get_logger
 logger = get_logger(__name__)
 
 
+def _bundle_lifecycle(cfg: dict | None) -> str:
+    if not cfg:
+        return "PRODUCTION"
+    value = cfg.get("bundle_lifecycle")
+    if value is None or pd.isna(value):
+        return "PRODUCTION"
+    return str(value).upper()
+
+
 def retrain_due_reason(
     engine: Engine,
     *,
@@ -80,6 +89,8 @@ def retrain_due_reason(
         cfg = load_latest_accepted_best_config(engine, horizon=int(horizon))
     except Exception:
         return True, "first_run_no_accepted_bundle"
+    if _bundle_lifecycle(cfg) == "PROVISIONAL":
+        return True, "provisional_bundle_requires_actual_validation"
 
     accepted_at = cfg.get("accepted_at")
     if accepted_at is None or pd.isna(accepted_at):
@@ -172,6 +183,8 @@ def _train_main_inline(engine: Engine, *, horizon: int, bundle_dir: Path) -> dic
     cfg["use_static"] = bool(best["use_static"])
     meta = {
         "cfg": cfg,
+        "bundle_lifecycle": _bundle_lifecycle(cfg),
+        "validation_label_source": cfg.get("validation_label_source"),
         "main_report": best["report"],
         "feat_cols": best.get("feat_cols"),
         "cat_cols": best.get("cat_cols"),
@@ -222,6 +235,7 @@ def run_monthly_pipeline(
     prev_k = None
     prev_f1_db = 0.0
     prev_f1_bundle = 0.0
+    prev_bundle_lifecycle = None
     try:
         prev_cfg = load_latest_accepted_best_config(engine, horizon=int(horizon))
         prev_f1_db = float(prev_cfg.get("metric_f1_val") or 0)
@@ -232,11 +246,18 @@ def run_monthly_pipeline(
     # Cross-check với bundle metadata để tránh DB bị overwrite thủ công
     try:
         _, bundle_meta = load_bundle(bundle_dir)
+        bundle_cfg = (bundle_meta or {}).get("cfg", {})
         prev_f1_bundle = float(
-            (bundle_meta or {}).get("cfg", {}).get("metric_f1_val") or 0
+            bundle_cfg.get("metric_f1_val") or 0
         )
+        prev_bundle_lifecycle = str(
+            (bundle_meta or {}).get("bundle_lifecycle")
+            or bundle_cfg.get("bundle_lifecycle")
+            or "PRODUCTION"
+        ).upper()
     except Exception:
         prev_f1_bundle = 0.0
+        prev_bundle_lifecycle = None
 
     prev_f1 = max(prev_f1_db, prev_f1_bundle) if (prev_f1_db > 0 or prev_f1_bundle > 0) else None
     logger.info("[PREV_F1] DB=%.4f | bundle=%.4f | using=%s",
@@ -348,10 +369,39 @@ def run_monthly_pipeline(
                 accepted = bool(cand_f1 > (prev_f1 + f1_improve_eps))
                 rule = "accepted_f1_improved" if accepted else "rejected_f1_not_improved"
 
+        candidate_lifecycle = _bundle_lifecycle(cand_cfg)
+        previous_lifecycles = [
+            lifecycle
+            for lifecycle in [
+                _bundle_lifecycle(prev_cfg) if prev_cfg is not None else None,
+                prev_bundle_lifecycle,
+            ]
+            if lifecycle
+        ]
+        previous_lifecycle = (
+            "PRODUCTION"
+            if "PRODUCTION" in previous_lifecycles
+            else (previous_lifecycles[0] if previous_lifecycles else None)
+        )
+        if candidate_lifecycle == "PROVISIONAL" and previous_lifecycle == "PRODUCTION":
+            accepted = False
+            rule = "rejected_provisional_validation_no_actual"
+            logger.warning(
+                "[PROMOTION BLOCKED] Candidate validation uses rule-based labels only. "
+                "Keep the existing PRODUCTION bundle until actual validation labels are available."
+            )
+        elif candidate_lifecycle == "PROVISIONAL" and is_first_run:
+            accepted = True
+            rule = "accepted_provisional_bootstrap"
+            logger.warning(
+                "[PROVISIONAL BOOTSTRAP] No production bundle exists. "
+                "Allow a provisional bundle for scoring, but do not treat it as production."
+            )
+
         cand_cfg["is_accepted"] = bool(accepted)
         cand_cfg["prev_accepted_f1"] = prev_f1
         cand_cfg["accept_rule"] = rule
-        cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime()
+        cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime() if accepted else None
 
         # Store candidate config (accepted or rejected)
         upsert_best_config(engine, cand_cfg)

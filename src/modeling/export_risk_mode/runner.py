@@ -49,6 +49,17 @@ def run_export_risk(
     bundle_path = Path(bundle_path)
     model, metadata = load_bundle(bundle_path)
     print(f"? Loaded model from {bundle_path}")
+    bundle_lifecycle = str(
+        (metadata or {}).get("bundle_lifecycle")
+        or (metadata or {}).get("cfg", {}).get("bundle_lifecycle")
+        or cfg.get("bundle_lifecycle")
+        or "PRODUCTION"
+    ).upper()
+    if bundle_lifecycle == "PROVISIONAL":
+        print(
+            "WARNING: Scoring uses a PROVISIONAL bundle validated with rule-based labels only. "
+            "Keep output under business review until actual-label validation promotes a PRODUCTION bundle."
+        )
 
     # [3/6] Load scoring feature table...
     print("\n[3/6] Load scoring feature table...")

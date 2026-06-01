@@ -85,6 +85,8 @@ def run_sweep_k(
         "metric_f1_val": best_f1_final,
         "metric_pr_auc_val": float(df_ab.iloc[0]["PR_AUC_val"]),
         "val_month": int(df_ab.iloc[0]["val_month"]),
+        "validation_label_source": str(df_ab.iloc[0]["validation_label_source"]),
+        "bundle_lifecycle": str(df_ab.iloc[0]["bundle_lifecycle"]),
         "notes": "picked by F1 then PR_AUC; sweep K window_only then static ablation",
     }
     return best_config, df_ab
