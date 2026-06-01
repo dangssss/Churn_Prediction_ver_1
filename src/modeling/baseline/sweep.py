@@ -6,7 +6,8 @@ from sqlalchemy.engine import Engine
 
 from preprocess.feature_tables import list_k_available, max_window_end_for_k
 from infra.yymm import shift_yymm
-from preprocess.static_features import load_cus_lifetime
+from preprocess.static_features import load_cus_lifetime_snapshots
+from preprocess.dataset import build_dataset_for_k
 from baseline.runner import eval_one_k_train_val
 from logging_config import get_logger
 
@@ -28,10 +29,16 @@ def run_sweep_k(
     if not ks:
         raise ValueError("No K available in feature tables.")
 
-    df_static = load_cus_lifetime(engine)
+    df_static = load_cus_lifetime_snapshots(engine)
 
     ablation = []
     for k in ks:
+        df_k = build_dataset_for_k(
+            engine,
+            int(k),
+            horizon=int(horizon),
+            limit_rows_each=limit_rows_each,
+        )
         for use_static in [False, True]:
             out = eval_one_k_train_val(
                 engine,
@@ -39,7 +46,8 @@ def run_sweep_k(
                 horizon=int(horizon),
                 use_static=bool(use_static),
                 df_static=df_static,
-                limit_rows_each=limit_rows_each
+                limit_rows_each=limit_rows_each,
+                df_k=df_k,
             )
             if out is None:
                 continue

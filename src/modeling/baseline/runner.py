@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional, Dict, Tuple
+import os
 
 import numpy as np
 import pandas as pd
@@ -19,6 +20,7 @@ from sklearn.metrics import (
 
 from preprocess.dataset import build_dataset_for_k
 from preprocess.static_features import attach_static
+from infra.yymm import shift_yymm
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -28,6 +30,7 @@ def select_feature_cols_mixed(df: pd.DataFrame, label_col: str):
         "cms_code_enc", "window_size", "window_start", "window_end",
         "source_table_t", "source_table_t_plus_h",
         "is_active_now", "is_churned_now", "gate_group",
+        "label_source", "label_weight",
         label_col
     }
     num_cols, cat_cols = [], []
@@ -82,15 +85,34 @@ def best_threshold_by_f1(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     # Clamp: không cho threshold xuống dưới 5% để tránh predict all-positive
     return float(max(thr[best_idx], 0.05))
 
-def time_split_train_val_last_month(df: pd.DataFrame, time_col: str = "window_end"):
+def time_split_train_val_last_month(
+    df: pd.DataFrame,
+    time_col: str = "window_end",
+    *,
+    horizon: int = 0,
+):
     df2 = df.copy()
     df2[time_col] = df2[time_col].astype(int)
     months = sorted(df2[time_col].unique())
     if len(months) < 2:
         return None, None, None
-    val_month = months[-1]
-    df_tr = df2[df2[time_col] < val_month].copy()
+    actual_months = []
+    if "label_source" in df2.columns:
+        actual_months = sorted(
+            df2.loc[df2["label_source"] == "actual", time_col].unique()
+        )
+    val_month = actual_months[-1] if actual_months else months[-1]
+    train_max_month = int(shift_yymm(str(val_month), -int(horizon)))
+    df_tr = df2[df2[time_col] <= train_max_month].copy()
     df_va = df2[df2[time_col] == val_month].copy()
+    logger.info(
+        "[PURGED SPLIT] val_month=%s horizon=%s train_origin_max=%s train_rows=%d val_rows=%d",
+        val_month,
+        horizon,
+        train_max_month,
+        len(df_tr),
+        len(df_va),
+    )
     return df_tr, df_va, val_month
 
 def eval_one_k_train_val(
@@ -100,9 +122,11 @@ def eval_one_k_train_val(
     df_static: Optional[pd.DataFrame] = None,
     use_static: bool = False,
     limit_rows_each: Optional[int] = None,
+    df_k: Optional[pd.DataFrame] = None,
 ) -> Optional[Dict]:
     label_col = f"y_churn_t_plus_{horizon}"
-    df_k = build_dataset_for_k(engine, k, horizon=horizon, limit_rows_each=limit_rows_each)
+    if df_k is None:
+        df_k = build_dataset_for_k(engine, k, horizon=horizon, limit_rows_each=limit_rows_each)
     if df_k.empty or label_col not in df_k.columns:
         return None
 
@@ -116,7 +140,11 @@ def eval_one_k_train_val(
             raise ValueError("use_static=True nhưng df_static=None")
         df_k = attach_static(df_k, df_static)
 
-    df_tr, df_va, val_month = time_split_train_val_last_month(df_k, time_col="window_end")
+    df_tr, df_va, val_month = time_split_train_val_last_month(
+        df_k,
+        time_col="window_end",
+        horizon=horizon,
+    )
     if df_tr is None or df_tr.empty or df_va.empty:
         return None
 
@@ -133,6 +161,16 @@ def eval_one_k_train_val(
     # ---------- Guardrail: tự động chọn class_weight ----------
     CHURN_RATIO_THRESHOLD = 0.35
     churn_ratio = n_pos / max(n_pos + n_neg, 1)
+    min_positive_rows = int(os.getenv("BASELINE_MIN_POSITIVE_ROWS", "500"))
+    min_positive_rate = float(os.getenv("BASELINE_MIN_POSITIVE_RATE", "0.001"))
+    if n_pos < min_positive_rows or churn_ratio < min_positive_rate:
+        raise ValueError(
+            "Baseline training aborted before fit: implausibly sparse churn labels "
+            f"for K={k} (positive_rows={n_pos}, total_rows={n_pos + n_neg}, "
+            f"positive_rate={churn_ratio:.6%}). "
+            f"Required: rows>={min_positive_rows} and rate>={min_positive_rate:.4%}. "
+            "Check label ingestion and label generation before running modeling."
+        )
 
     if churn_ratio > CHURN_RATIO_THRESHOLD:
         class_weight_used = {0: 1.0, 1: 1.0}
@@ -158,7 +196,12 @@ def eval_one_k_train_val(
     )
     pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
 
-    pipe.fit(X_tr, y_tr)
+    sample_weight = (
+        pd.to_numeric(df_tr["label_weight"], errors="coerce").fillna(1.0)
+        if "label_weight" in df_tr.columns
+        else pd.Series(1.0, index=df_tr.index)
+    )
+    pipe.fit(X_tr, y_tr, clf__sample_weight=sample_weight.to_numpy())
 
     va_prob = pipe.predict_proba(X_va)[:, 1]
 

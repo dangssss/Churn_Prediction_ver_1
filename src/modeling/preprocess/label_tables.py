@@ -6,11 +6,13 @@ import re
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from logging_config import get_logger
 
 LABEL_SCHEMA = os.getenv("LABEL_SCHEMA", "Label")
 LABEL_TBL_REGEX = re.compile(r"^label_(\d{4})$", re.IGNORECASE)
 FEATURE_TBL_REGEX = re.compile(r"^cus_feature_(\d+)m_(\d{4})_(\d{4})$")
 _CALIBRATION_CACHE: dict[tuple[int, str, str], float | None] = {}
+logger = get_logger(__name__)
 
 
 def label_table_for_yymm(engine: Engine, yymm: str | int) -> str | None:
@@ -62,7 +64,10 @@ def load_label_keys(engine: Engine, table_name: str) -> pd.DataFrame:
             raise KeyError(f'{LABEL_SCHEMA}."{table_name}" missing {col}')
         df[col] = df[col].astype(str).str.strip()
         df.loc[df[col].isin(["", "None", "nan", "NaN"]), col] = pd.NA
-    return df.dropna(how="all", subset=["crm_code_enc", "cms_code_enc"]).drop_duplicates()
+    df = df.dropna(how="all", subset=["crm_code_enc", "cms_code_enc"]).drop_duplicates()
+    if df.empty:
+        raise ValueError(f'{LABEL_SCHEMA}."{table_name}" contains no usable label keys')
+    return df
 
 
 def estimate_observed_label_rate(engine: Engine, *, feature_schema: str = "data_window") -> float | None:
@@ -140,8 +145,14 @@ def estimate_observed_label_rate(engine: Engine, *, feature_schema: str = "data_
             churn_count = int(row["churn_count"] or 0)
         except Exception:
             continue
-        if population_count > 0:
+        if population_count > 0 and churn_count > 0:
             rates.append(churn_count / population_count)
+        elif population_count > 0:
+            logger.warning(
+                'Ignoring empty or unmatched calibration label table %s.%s',
+                LABEL_SCHEMA,
+                label_table,
+            )
 
     if not rates:
         _CALIBRATION_CACHE[cache_key] = None

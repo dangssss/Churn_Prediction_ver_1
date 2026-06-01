@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Iterable, Optional, List
 
 import os
+import re
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
@@ -10,6 +11,17 @@ from sqlalchemy.engine import Engine
 
 STATIC_SCHEMA = os.getenv("STATIC_SCHEMA", "data_static")
 STATIC_TABLE  = os.getenv("STATIC_TABLE", "cus_lifetime")
+SNAPSHOT_TABLE_RE = re.compile(r"^cus_lifetime_(\d{4})$")
+CURRENT_STATE_STATIC_COLUMNS = [
+    "contract_classify",
+    "contract_service",
+    "custype",
+    "contract_sig_first",
+    "tenure",
+    "contract_mgr_org",
+    "cus_poscode",
+    "cus_province",
+]
 
 # ---- Minimal lifetime columns needed to compute requested ratio features.
 # We keep names as "preferred"; attach_static will only select existing columns anyway.
@@ -32,6 +44,41 @@ def load_cus_lifetime(engine: Engine) -> pd.DataFrame:
     df = pd.read_sql(q, engine)
     if "cms_code_enc" not in df.columns:
         raise KeyError("cus_lifetime thiếu cột cms_code_enc")
+    df["cms_code_enc"] = df["cms_code_enc"].astype(str)
+    return df
+
+
+def load_cus_lifetime_snapshots(engine: Engine) -> pd.DataFrame:
+    q = text("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = :schema
+          AND table_type = 'BASE TABLE'
+          AND table_name LIKE 'cus_lifetime_%'
+        ORDER BY table_name
+    """)
+    table_names = pd.read_sql(q, engine, params={"schema": STATIC_SCHEMA})["table_name"].tolist()
+    snapshots = []
+    for table_name in table_names:
+        matched = SNAPSHOT_TABLE_RE.fullmatch(table_name)
+        if not matched:
+            continue
+        frame = pd.read_sql(text(f'SELECT * FROM "{STATIC_SCHEMA}"."{table_name}"'), engine)
+        frame["snapshot_month"] = int(matched.group(1))
+        snapshots.append(frame)
+
+    if not snapshots:
+        raise ValueError(
+            f"No point-in-time lifetime snapshots found in {STATIC_SCHEMA}. "
+            "Run feature generation before retraining."
+        )
+
+    df = pd.concat(snapshots, ignore_index=True)
+    if "cms_code_enc" not in df.columns:
+        raise KeyError("Lifetime snapshots missing cms_code_enc")
+    # public.cas_info is a current-state snapshot, not a monthly history table.
+    # Exclude its mutable fields from historical training to prevent look-ahead leakage.
+    df = df.drop(columns=CURRENT_STATE_STATIC_COLUMNS, errors="ignore")
     df["cms_code_enc"] = df["cms_code_enc"].astype(str)
     return df
 
@@ -153,8 +200,12 @@ def attach_static(
     ds = df_static.copy()
     ds["cms_code_enc"] = ds["cms_code_enc"].astype(str)
 
+    point_in_time = "snapshot_month" in ds.columns and "window_end" in d.columns
     if cols is not None:
-        wanted = ["cms_code_enc"] + [c for c in cols if c != "cms_code_enc" and c in ds.columns]
+        wanted = ["cms_code_enc"]
+        if point_in_time:
+            wanted.append("snapshot_month")
+        wanted += [c for c in cols if c != "cms_code_enc" and c in ds.columns]
         ds = ds[wanted].copy()
 
     # rename collisions
@@ -165,7 +216,17 @@ def attach_static(
             static_ren[c] = f"static_{c}"
     ds = ds.rename(columns=static_ren)
 
-    out = d.merge(ds, on="cms_code_enc", how="left")
+    if point_in_time:
+        d["_snapshot_month"] = pd.to_numeric(d["window_end"], errors="raise").astype(int)
+        out = d.merge(
+            ds,
+            left_on=["cms_code_enc", "_snapshot_month"],
+            right_on=["cms_code_enc", "snapshot_month"],
+            how="left",
+        )
+        out = out.drop(columns=["_snapshot_month", "snapshot_month"], errors="ignore")
+    else:
+        out = d.merge(ds, on="cms_code_enc", how="left")
 
     if add_ratios:
         out = add_lifetime_ratio_features(out)

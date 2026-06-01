@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from airflow import DAG
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator
 from pendulum import datetime
 
 import os
-from airflow.operators.bash import BashOperator
+from airflow.providers.standard.operators.bash import BashOperator
     
 with DAG(
     dag_id="ds_churn_ingest",

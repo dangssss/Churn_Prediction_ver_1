@@ -58,7 +58,11 @@ def build_train_val_for_main(
                 raise ValueError(f"attach_static changed row count: before={before}, after={after}")
 
     # split train/val theo tháng (val = tháng labeled cuối)
-    df_tr, df_va, val_month = time_split_train_val_last_month(df, time_col="window_end")
+    df_tr, df_va, val_month = time_split_train_val_last_month(
+        df,
+        time_col="window_end",
+        horizon=h,
+    )
     if df_tr is None or df_tr.empty or df_va is None or df_va.empty:
         raise ValueError("Không đủ tháng để split train/val cho main")
 

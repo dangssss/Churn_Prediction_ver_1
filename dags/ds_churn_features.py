@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from airflow import DAG
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator
 from pendulum import datetime
 
 with DAG(
@@ -15,7 +15,7 @@ with DAG(
 ) as dag:
 
     # GI? NGUYÊN LOGIC: dùng dúng entrypoint hi?n t?i
-    from airflow.operators.bash import BashOperator
+    from airflow.providers.standard.operators.bash import BashOperator
 
     # GI? NGUYÊN LOGIC: dùng dúng entrypoint hi?n t?i
     # Assumes code is at /churn_source/Preprocess/src/operations/run/run_feature_generation.py
@@ -31,9 +31,9 @@ with DAG(
         append_env=True,
     )
 
-    trigger_model = TriggerDagRunOperator(
-        task_id="trigger_model",
-        trigger_dag_id="ds_churn_model_monthly",
+    trigger_scoring = TriggerDagRunOperator(
+        task_id="trigger_scoring",
+        trigger_dag_id="ds_churn_model_scoring_only",
         conf={
             "upstream_features_run_id": "{{ run_id }}",
             "logical_date": "{{ ds }}",
@@ -42,4 +42,4 @@ with DAG(
         reset_dag_run=True,
     )
 
-    run_features >> trigger_model
+    run_features >> trigger_scoring

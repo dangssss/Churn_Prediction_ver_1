@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import os
 from typing import Optional
 
@@ -18,8 +17,81 @@ from .feature_tables import (
 )
 from .gating import apply_gate
 from .label_tables import LABEL_SCHEMA, estimate_observed_label_rate, label_table_for_yymm, load_label_keys
+from logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+
+def _load_post_origin_activity(
+    engine: Engine,
+    df_origin: pd.DataFrame,
+    *,
+    origin_yymm: str,
+    horizon: int,
+) -> tuple[pd.DataFrame, str]:
+    """Build fallback outcome signals strictly from raw order months t+1..t+h."""
+    from sqlalchemy import text
+    from .gating import resolve_now_cols
+
+    future_yymms = [shift_yymm(origin_yymm, offset) for offset in range(1, horizon + 1)]
+    future_tables = [f"bccp_orderitem_{yymm}" for yymm in future_yymms]
+    with engine.connect() as conn:
+        for table in future_tables:
+            exists = conn.execute(
+                text("SELECT to_regclass(:table_name)"),
+                {"table_name": f"public.{table}"},
+            ).scalar()
+            if exists is None:
+                logger.info(
+                    "Censor fallback origin=%s: missing required post-origin table public.%s",
+                    origin_yymm,
+                    table,
+                )
+                return pd.DataFrame(), ""
+
+    origin_cols = resolve_now_cols(df_origin)
+    origin = df_origin[["cms_code_enc"]].copy()
+    origin["cms_code_enc"] = origin["cms_code_enc"].astype(str).str.strip()
+    origin["origin_item"] = pd.to_numeric(
+        df_origin[origin_cols["item_now"]], errors="coerce"
+    ).fillna(0)
+    origin["origin_revenue"] = pd.to_numeric(
+        df_origin[origin_cols["rev_now"]], errors="coerce"
+    ).fillna(0)
+    origin = origin.drop_duplicates("cms_code_enc")
+
+    monthly_frames = []
+    for table in future_tables:
+        query = text(
+            f"""
+            SELECT cms_code_enc,
+                   COUNT(*)::bigint AS item_count,
+                   COALESCE(SUM(total_fee), 0)::double precision AS revenue
+            FROM public."{table}"
+            WHERE cms_code_enc IS NOT NULL
+            GROUP BY cms_code_enc
+            """
+        )
+        frame = pd.read_sql(query, engine)
+        frame["cms_code_enc"] = frame["cms_code_enc"].astype(str).str.strip()
+        monthly_frames.append(frame)
+
+    activity = pd.concat(monthly_frames, ignore_index=True)
+    activity = (
+        activity.groupby("cms_code_enc", as_index=False)
+        .agg(item_count=("item_count", "sum"), revenue=("revenue", "sum"))
+    )
+    out = origin.merge(activity, on="cms_code_enc", how="left")
+    out[["item_count", "revenue"]] = out[["item_count", "revenue"]].fillna(0)
+    out["item_last"] = out["item_count"] / max(int(horizon), 1)
+    out["revenue_last"] = out["revenue"] / max(int(horizon), 1)
+    out["frequency"] = out["origin_item"]
+    out["monetary"] = out["origin_revenue"]
+    out["item_1m_ago"] = out["origin_item"]
+    out["revenue_1m_ago"] = out["origin_revenue"]
+    out["revenue_slope"] = out["revenue_last"] - out["origin_revenue"]
+    return out, ",".join(f"public.{table}" for table in future_tables)
+
 
 def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 0.1, percentile_upper: float = 99.9) -> pd.DataFrame:
     df_clipped = df.copy()
@@ -28,7 +100,8 @@ def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 0.1, perce
     # Bỏ qua các cột metadata và nhãn
     skip_cols = {"cms_code_enc", "window_size", "window_start", "window_end", 
                  "source_table_t", "source_table_t_plus_h", 
-                 "is_active_now", "is_churned_now", "gate_group"}
+                 "is_active_now", "is_churned_now", "gate_group",
+                 "label_source", "label_weight"}
     
     num_cols = []
     for c in df_clipped.columns:
@@ -148,6 +221,8 @@ def build_labeled_pair(
             d["window_end"] = end
         d["source_table_t"] = table_t
         d["source_table_t_plus_h"] = f'{LABEL_SCHEMA}.{label_table}'
+        d["label_source"] = "actual"
+        d["label_weight"] = 1.0
 
         n_pos = int(d[label_col].sum())
         logger.info(
@@ -163,28 +238,17 @@ def build_labeled_pair(
         )
         return d
 
-    # -------------------------------------------------------------------------
-    # SỬA LỖI LOGIC: Không dùng `k` để tìm bảng tương lai (table_tp), vì số lượng 
-    # cột lịch sử (item_1m_ago,...) sẽ thay đổi theo `k`, làm nhãn bị thay đổi.
-    # Giải pháp: Tìm bảng có end == t_plus_h và có K LỚN NHẤT để đảm bảo luôn 
-    # có đủ 3 tháng lịch sử tính nhãn (nhãn sẽ đồng nhất cho mọi vòng sweep K).
-    # -------------------------------------------------------------------------
-    from .feature_tables import list_feature_tables
-    all_tbls = list_feature_tables(engine)
-    future_cands = []
-    for t in all_tbls:
-        k_f, st_f, en_f = parse_feature_table_name(t)
-        if en_f == t_plus_h:
-            future_cands.append((k_f, t))
+    # Rule fallback uses raw order tables strictly after the prediction origin.
+    df_tp, table_tp = _load_post_origin_activity(
+        engine,
+        df_t,
+        origin_yymm=end,
+        horizon=horizon,
+    )
             
-    if not future_cands:
+    if df_tp.empty:
         return pd.DataFrame()  # censor window này (không có label tương lai)
         
-    future_cands.sort(key=lambda x: x[0], reverse=True)
-    best_k_f, table_tp = future_cands[0]
-
-    df_tp = load_feature_table(engine, table_tp, limit=limit)
-
     if "cms_code_enc" not in df_t.columns or "cms_code_enc" not in df_tp.columns:
         raise KeyError("Thiếu cms_code_enc để join label")
 
@@ -341,6 +405,8 @@ def build_labeled_pair(
 
     out["source_table_t"] = table_t
     out["source_table_t_plus_h"] = table_tp
+    out["label_source"] = "rule_based"
+    out["label_weight"] = float(os.getenv("RULE_LABEL_SAMPLE_WEIGHT", "0.35"))
     return out
 
 def build_dataset_for_k(engine: Engine, k: int, horizon: int = 1, limit_rows_each: Optional[int] = None) -> pd.DataFrame:
@@ -352,6 +418,25 @@ def build_dataset_for_k(engine: Engine, k: int, horizon: int = 1, limit_rows_eac
             frames.append(df)
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if not out.empty:
+        label_col = f"y_churn_t_plus_{horizon}"
+        if label_col in out.columns and "source_table_t_plus_h" in out.columns:
+            group_cols = ["source_table_t_plus_h"]
+            if "label_source" in out.columns:
+                group_cols.append("label_source")
+            audit = (
+                out.groupby(group_cols, dropna=False)[label_col]
+                .agg(total_rows="size", churn_rows="sum")
+                .reset_index()
+            )
+            audit["churn_rate_pct"] = (
+                100.0 * audit["churn_rows"] / audit["total_rows"].clip(lower=1)
+            )
+            logger.info(
+                "[LABEL AUDIT K=%d H=%d]\n%s",
+                k,
+                horizon,
+                audit.to_string(index=False),
+            )
         out = apply_gate(out)
         out = clip_and_log_outliers(out)
     return out

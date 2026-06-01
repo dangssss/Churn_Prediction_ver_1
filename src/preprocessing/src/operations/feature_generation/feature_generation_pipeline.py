@@ -2,11 +2,13 @@
 
 import argparse
 from pathlib import Path
+import pandas as pd
 
 from config.app_config import get_config
 from logging_config import get_logger
 from logging_config import setup_logging
 from src.features.static_features.static_runner import run_static_aggregate
+from src.features.static_features.static_runner import run_static_snapshots
 from src.features.window_features.window_runner import render_and_run_all
 from src.operations.feature_generation.feature_generation_database import create_pipeline_engine
 from src.operations.feature_generation.feature_generation_database import validate_source_tables
@@ -55,16 +57,25 @@ def run(args: argparse.Namespace) -> None:
 
         logger.info("\n[STEP 5] Static Feature Aggregation")
         logger.info("-" * 60)
-        run_static_aggregate(engine)
+        static_end_date = end_date + pd.offsets.MonthEnd(0)
+        run_static_aggregate(engine, end_date=static_end_date)
         count = count_static_customers(engine)
         if count == 0:
             logger.warning("[WARN] Static feature table is empty after first run. Retrying static aggregation once...")
-            run_static_aggregate(engine)
+            run_static_aggregate(engine, end_date=static_end_date)
             count = count_static_customers(engine)
         if count == 0:
             logger.error("[FAILED] Static feature table is empty after retry! Check data_static aggregation.")
             raise ValueError("Static feature table is empty after retry!")
         logger.info("[OK] Static phase completed. Proceeding to window phase...")
+
+        logger.info("\n[STEP 5.1] Point-in-time Lifetime Snapshots")
+        logger.info("-" * 60)
+        run_static_snapshots(
+            engine,
+            months,
+            recompute_last_n=cfg.features.recompute_last_n_windows,
+        )
 
         logger.info("\n[STEP 6] Window Feature Aggregation")
         logger.info("-" * 60)

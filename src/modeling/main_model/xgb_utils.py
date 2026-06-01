@@ -69,7 +69,15 @@ def onehot_align_train_val(X_tr: pd.DataFrame, X_va: pd.DataFrame, cat_cols: lis
     X_va_oh = X_va_oh.rename(columns=map_tr)
     return X_tr_oh, X_va_oh, map_tr
 
-def fit_xgb_with_early_stopping(model, X_tr, y_tr, X_va, y_va, es_rounds: int):
+def fit_xgb_with_early_stopping(
+    model,
+    X_tr,
+    y_tr,
+    X_va,
+    y_va,
+    es_rounds: int,
+    sample_weight=None,
+):
     """Compatible old/new xgboost early stopping usage."""
     fit_sig = inspect.signature(model.fit)
     kwargs = {}
@@ -78,6 +86,8 @@ def fit_xgb_with_early_stopping(model, X_tr, y_tr, X_va, y_va, es_rounds: int):
         kwargs["eval_set"] = [(X_va, y_va)]
     if "verbose" in fit_sig.parameters:
         kwargs["verbose"] = False
+    if sample_weight is not None and "sample_weight" in fit_sig.parameters:
+        kwargs["sample_weight"] = sample_weight
 
     # Old versions: early_stopping_rounds is a fit kwarg
     if "early_stopping_rounds" in fit_sig.parameters:

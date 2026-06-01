@@ -25,7 +25,7 @@ with DAG(
     tags=["ds_churn", "model", "scoring"],
 ) as dag:
 
-    from airflow.operators.bash import BashOperator
+    from airflow.providers.standard.operators.bash import BashOperator
 
     # Chỉ chạy lệnh export-risk: nạp model bundle cũ và xuất danh sách rủi ro Churn
     # Không bao giờ kích hoạt bước sweep-k hay train-main

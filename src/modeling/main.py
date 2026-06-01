@@ -15,11 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from infra.db import get_engine, smoke_test
 from baseline.sweep import run_sweep_k
 from config_store.best_config import ensure_best_config_table, upsert_best_config
-from pipeline.monthly import run_monthly_pipeline
+from pipeline.monthly import retrain_due_reason, run_monthly_pipeline
 from export_risk_mode.runner import run_export_risk_mode
 from config_store.best_config import load_latest_accepted_best_config
 from config.paths import CHURN_MODEL_DIR
-from preprocess.static_features import load_cus_lifetime
+from preprocess.static_features import load_cus_lifetime_snapshots
 from main_model.runner import run_main_variant
 from common.artifacts import save_bundle
 from logging_config import get_logger
@@ -39,6 +39,31 @@ def cmd_run_monthly(args) -> None:
         k_min=int(args.k_min),
     )
     logger.info("DONE run-monthly: %s", out)
+
+
+def cmd_retrain_if_due(args) -> None:
+    engine = get_engine()
+    logger.info("DB: %s", smoke_test(engine))
+    due, reason = retrain_due_reason(
+        engine,
+        horizon=int(args.horizon),
+        interval_months=int(args.interval_months),
+    )
+    if not due:
+        logger.info("SKIP retrain: %s", reason)
+        return
+
+    logger.info("START retrain: %s", reason)
+    out = run_monthly_pipeline(
+        engine,
+        horizon=int(args.horizon),
+        bundle_dir=args.bundle_dir,
+        limit_rows_each=args.limit_rows_each,
+        k_min=int(args.k_min),
+        do_scoring=False,
+        force_cycle_retrain=reason.startswith("accepted_bundle_age_gte_"),
+    )
+    logger.info("DONE retrain-if-due: %s", out)
 
 
 def cmd_sweep_k(args) -> None:
@@ -63,7 +88,7 @@ def cmd_train_main(args) -> None:
     engine = get_engine()
     logger.info("DB: %s", smoke_test(engine))
     cfg = load_latest_accepted_best_config(engine, horizon=int(args.horizon))
-    df_static = load_cus_lifetime(engine)
+    df_static = load_cus_lifetime_snapshots(engine)
 
     variants = [
         run_main_variant(engine, cfg, df_static, use_static_flag=False),
@@ -137,6 +162,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit-rows-each", type=int, default=None)
     p.add_argument("--k-min", type=int, default=3)
     p.set_defaults(func=cmd_run_monthly)
+
+    p = sub.add_parser("retrain-if-due", help="Retrain-only gate: freshness PASS and interval/drift trigger")
+    p.add_argument("--horizon", type=int, required=True)
+    p.add_argument("--interval-months", type=int, default=3)
+    p.add_argument("--bundle-dir", type=str, default=str(CHURN_MODEL_DIR / "bundles/latest"))
+    p.add_argument("--limit-rows-each", type=int, default=None)
+    p.add_argument("--k-min", type=int, default=3)
+    p.set_defaults(func=cmd_retrain_if_due)
 
     p = sub.add_parser("sweep-k", help="Sweep K (debug). Saves best_config (accepted=True).")
     p.add_argument("--horizon", type=int, required=True)

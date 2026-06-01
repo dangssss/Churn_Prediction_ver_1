@@ -10,7 +10,7 @@ from sqlalchemy.engine import Engine
 from infra.yymm import shift_yymm
 from infra.db import smoke_test
 from preprocess.feature_tables import max_window_end_for_k
-from preprocess.static_features import load_cus_lifetime
+from preprocess.static_features import load_cus_lifetime_snapshots
 from baseline.sweep import run_sweep_k
 from config_store.best_config import (
     ensure_best_config_table,
@@ -32,6 +32,66 @@ from monitoring.backtest import run_backtest_precision_in_list
 from logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+def retrain_due_reason(engine: Engine, *, horizon: int, interval_months: int = 3) -> tuple[bool, str]:
+    """Return whether a retrain run may start and the audit reason."""
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        has_validation_table = conn.execute(
+            text("SELECT to_regclass('ingest.validation_status')")
+        ).scalar()
+        if has_validation_table is None:
+            return False, "blocked_missing_freshness_status"
+        freshness_status = conn.execute(
+            text(
+                """
+                SELECT status
+                FROM ingest.validation_status
+                ORDER BY checked_at DESC, id DESC
+                LIMIT 1
+                """
+            )
+        ).scalar()
+    if freshness_status != "PASS":
+        return False, f"blocked_freshness_{str(freshness_status).lower()}"
+
+    try:
+        cfg = load_latest_accepted_best_config(engine, horizon=int(horizon))
+    except Exception:
+        return True, "first_run_no_accepted_bundle"
+
+    accepted_at = cfg.get("accepted_at")
+    if accepted_at is None or pd.isna(accepted_at):
+        return True, "accepted_bundle_missing_timestamp"
+
+    accepted_ts = pd.Timestamp(accepted_at)
+    if accepted_ts.tzinfo is not None:
+        accepted_ts = accepted_ts.tz_convert(None)
+    now_ts = pd.Timestamp.utcnow().tz_localize(None)
+    if now_ts >= accepted_ts + pd.DateOffset(months=int(interval_months)):
+        return True, f"accepted_bundle_age_gte_{interval_months}_months"
+
+    ensure_monitoring_schema(engine)
+    with engine.connect() as conn:
+        has_alert = bool(
+            conn.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM ml_monitor.feature_drift
+                        WHERE horizon = :horizon
+                          AND severity = 'ALERT'
+                          AND created_at > :accepted_at
+                    )
+                    """
+                ),
+                {"horizon": int(horizon), "accepted_at": accepted_ts.to_pydatetime()},
+            ).scalar()
+        )
+    return (True, "feature_drift_alert") if has_alert else (False, "not_due")
 
 
 def is_mandatory_retrain_month(window_end: int, anchor_yymm: int = 2603, interval: int = 3) -> bool:
@@ -77,7 +137,7 @@ def _train_main_inline(engine: Engine, *, horizon: int, bundle_dir: Path) -> dic
     from config_store.best_config import load_latest_accepted_best_config as load_cfg
     cfg = load_cfg(engine, horizon=int(horizon))
     cfg = dict(cfg)
-    df_static = load_cus_lifetime(engine)
+    df_static = load_cus_lifetime_snapshots(engine)
     variants = [run_main_variant(engine, cfg, df_static, use_static_flag=False),
                 run_main_variant(engine, cfg, df_static, use_static_flag=True)]
     ok = [v for v in variants if not v.get("guardrail_warning")]
@@ -117,6 +177,8 @@ def run_monthly_pipeline(
     f1_improve_eps: float = 1e-6,
     do_backtest: bool = True,
     do_feature_drift: bool = True,
+    do_scoring: bool = True,
+    force_cycle_retrain: bool = False,
 ) -> dict:
     """
     FULL monthly pipeline (run once):
@@ -211,7 +273,7 @@ def run_monthly_pipeline(
                 )
 
         # 2) Decide accept
-        is_mandatory = is_mandatory_retrain_month(t_current)
+        is_mandatory = force_cycle_retrain or is_mandatory_retrain_month(t_current)
         pass_guardrail = True
         active_ratio = 1.0
         active_cnt_cur = 0
@@ -311,7 +373,11 @@ def run_monthly_pipeline(
         # 4) Monthly scoring — chỉ chạy nếu có accepted config trong DB
         # (trường hợp bị block ngay lần đầu tiên: chưa có model nào được accepted)
         has_accepted_in_db = prev_cfg is not None or accepted
-        if not has_accepted_in_db:
+        if not do_scoring:
+            logger.info("[SKIP SCORING] Retrain DAG is isolated from business scoring.")
+            res = {"status": "skipped_retrain_only", "active_cnt": 0, "risk_cnt": 0, "churned_now_cnt": 0}
+            bt = None
+        elif not has_accepted_in_db:
             logger.warning(
                 "[SKIP SCORING] Không có accepted best_config nào trong DB và tháng này bị block "
                 "(prevalence_blocked=%s, accepted=%s). "

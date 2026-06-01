@@ -32,6 +32,7 @@ def select_feature_cols_for_model(df: pd.DataFrame, label_col: str):
         "cms_code_enc", "window_size", "window_start", "window_end",
         "source_table_t", "source_table_t_plus_h",
         "is_active_now", "is_churned_now", "gate_group",
+        "label_source", "label_weight",
         label_col
     }
     return [c for c in df.columns if c not in drop_cols]
@@ -110,6 +111,11 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
     X_va = df_va[feat_cols].copy()
     y_tr = df_tr[label_col].astype(int).to_numpy()
     y_va = df_va[label_col].astype(int).to_numpy()
+    sample_weight = (
+        pd.to_numeric(df_tr["label_weight"], errors="coerce").fillna(1.0).to_numpy()
+        if "label_weight" in df_tr.columns
+        else np.ones(len(df_tr), dtype=float)
+    )
 
     # scale_pos_weight đã được baseline sweep tính + guardrail sẵn → dùng thẳng
     spw = float(cfg["best_spw"])
@@ -180,7 +186,15 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
         X_va_s = X_va.rename(columns=map_native)
 
         model = xgb.XGBClassifier(**params, enable_categorical=True, early_stopping_rounds=es_rounds)
-        model = fit_xgb_with_early_stopping(model, X_tr_s, y_tr, X_va_s, y_va, es_rounds=es_rounds)
+        model = fit_xgb_with_early_stopping(
+            model,
+            X_tr_s,
+            y_tr,
+            X_va_s,
+            y_va,
+            es_rounds=es_rounds,
+            sample_weight=sample_weight,
+        )
 
         used_mode = "native_categorical"
         feature_name_map = map_native
@@ -192,7 +206,15 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
         X_tr_oh, X_va_oh, map_oh = onehot_align_train_val(X_tr, X_va, cat_cols=cat_cols)
 
         model = xgb.XGBClassifier(**params, early_stopping_rounds=es_rounds)
-        model = fit_xgb_with_early_stopping(model, X_tr_oh, y_tr, X_va_oh, y_va, es_rounds=es_rounds)
+        model = fit_xgb_with_early_stopping(
+            model,
+            X_tr_oh,
+            y_tr,
+            X_va_oh,
+            y_va,
+            es_rounds=es_rounds,
+            sample_weight=sample_weight,
+        )
 
         used_mode = "one_hot"
         feature_name_map = map_oh

@@ -6,7 +6,7 @@ Các thư mục chạy trong docker nên lấy thông tin từ env.dev và env.p
 """
 
 from airflow import DAG
-from airflow.operators.bash import BashOperator
+from airflow.providers.standard.operators.bash import BashOperator
 from pendulum import datetime
 import os
 

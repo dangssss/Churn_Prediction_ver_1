@@ -7,7 +7,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from infra.db import get_engine, smoke_test
-from preprocess.static_features import load_cus_lifetime
+from preprocess.static_features import load_cus_lifetime_snapshots
 from config_store.best_config import load_latest_accepted_best_config as load_latest_best_config, update_main_metrics
 from main_model.runner import run_main_variant
 from common.artifacts import save_bundle
@@ -25,7 +25,7 @@ def main():
 
     engine = get_engine()
     print("DB:", smoke_test(engine))
-    df_static = load_cus_lifetime(engine)
+    df_static = load_cus_lifetime_snapshots(engine)
 
     cfg = load_latest_best_config(engine, horizon=args.horizon)
     cfg["main_es_rounds"] = int(args.main_es_rounds)

@@ -4,6 +4,7 @@ import hashlib
 import os
 import shutil
 import zipfile
+import csv
 from pathlib import Path
 from typing import Any, Dict
 
@@ -91,6 +92,25 @@ def _ensure_ingest_log(cur, ingest_schema: str) -> None:
     cur.execute(sql.SQL("ALTER TABLE {}.ingest_log ADD COLUMN IF NOT EXISTS file_mtime double precision;").format(sql.Identifier(ingest_schema)))
 
 
+def _validate_label_header(csv_file: Path) -> str:
+    with csv_file.open("r", encoding="utf-8-sig", newline="") as handle:
+        first_line = handle.readline()
+
+    detected_headers: dict[str, list[str]] = {}
+    for delimiter in (",", ";"):
+        reader = csv.reader([first_line], delimiter=delimiter)
+        detected_columns = [str(column).strip() for column in next(reader, [])]
+        detected_headers[delimiter] = detected_columns
+        if all(column in detected_columns for column in LABEL_COLUMNS):
+            return delimiter
+
+    raise ValueError(
+        f"Missing required label columns in {csv_file.name}. "
+        f"Detected columns by delimiter: {detected_headers}. "
+        "Expected a comma- or semicolon-delimited CSV with the canonical label header."
+    )
+
+
 def ingest_label_zip_job(
     zip_path: Path,
     fs_cfg: FSConfig,
@@ -117,6 +137,7 @@ def ingest_label_zip_job(
     try:
         csv_file, _, file_sha256 = _extract_label_csv(zip_path, fs_cfg, yymm)
         logger.info("Extracted label CSV %s from %s", csv_file.name, zip_path.name)
+        delimiter = _validate_label_header(csv_file)
     except Exception as exc:
         result["error"] = str(exc)
         fail_path = fs_cfg.fail_dir / zip_path.name
@@ -145,12 +166,11 @@ def ingest_label_zip_job(
             );
         """).format(prod_tbl))
         cur.execute(sql.SQL("TRUNCATE TABLE {};").format(prod_tbl))
-        conn.commit()
 
         total_inserted = 0
         for chunk in pd.read_csv(
             csv_file,
-            sep=";",
+            sep=delimiter,
             chunksize=batch_rows,
             dtype=str,
             keep_default_na=False,
@@ -159,7 +179,11 @@ def ingest_label_zip_job(
             chunk.columns = [str(c).strip() for c in chunk.columns]
             missing = [c for c in LABEL_COLUMNS if c not in chunk.columns]
             if missing:
-                raise ValueError(f"Missing required label columns in {csv_file.name}: {missing}")
+                raise ValueError(
+                    f"Missing required label columns in {csv_file.name}: {missing}. "
+                    f"Detected columns: {chunk.columns.tolist()}. "
+                    "Expected a comma- or semicolon-delimited CSV with the canonical label header."
+                )
 
             rows = chunk[LABEL_COLUMNS].copy()
             rows["crm_code_enc"] = rows["crm_code_enc"].astype(str).str.strip()
@@ -177,6 +201,9 @@ def ingest_label_zip_job(
             )
             execute_values(cur, insert_sql.as_string(conn), values, page_size=10_000)
             total_inserted += len(values)
+
+        if total_inserted == 0:
+            raise ValueError(f"Label CSV {csv_file.name} contains no data rows")
 
         cur.execute(sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} (cms_code_enc);").format(
             sql.Identifier(f"idx_{table_name}_cms_code_enc"),
@@ -232,7 +259,13 @@ def ingest_label_zip_job(
         result["prod_rows"] = total_inserted
         result["staging_rows"] = total_inserted
         result["success"] = True
-        logger.info("[LABEL] Loaded %s.%s: %d rows", LABEL_SCHEMA, table_name, total_inserted)
+        logger.info(
+            "[LABEL] Loaded %s.%s: %d rows (delimiter=%r)",
+            LABEL_SCHEMA,
+            table_name,
+            total_inserted,
+            delimiter,
+        )
         return result
     except Exception as exc:
         conn.rollback()

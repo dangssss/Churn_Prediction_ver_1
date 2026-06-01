@@ -171,11 +171,30 @@ def run_once_scan(
 
     incoming = fs_cfg.incoming_dir
     logger.info(f"Scanning ZIP files in: {incoming}")
+    failures = []
 
     zip_paths = list_zip_files(fs_cfg)
+    valid_zip_names = {path.name for path in zip_paths}
+    invalid_zip_names = sorted(
+        path.name for path in incoming.glob("*.zip")
+        if path.name not in valid_zip_names
+    )
+    if invalid_zip_names:
+        failures.append(
+            "Unsupported ZIP filename(s) in incoming directory: "
+            + ", ".join(invalid_zip_names)
+        )
+
     if not zip_paths:
         logger.info(f"No ZIP files found in {incoming}")
-        run_once_label_scan(fs_cfg=fs_cfg, pg_cfg=pg_cfg, ingest_schema=ingest_schema)
+        try:
+            run_once_label_scan(fs_cfg=fs_cfg, pg_cfg=pg_cfg, ingest_schema=ingest_schema)
+        except Exception as exc:
+            logger.warning("[LABEL] Label ingestion is DEGRADED: %s", exc)
+        if failures:
+            raise RuntimeError(
+                "Ingestion scan failed for one or more files:\n- " + "\n- ".join(failures)
+            )
         return
 
     # Filter files: ch? x? lý file m?i nh?t (snapshot) ho?c 2 tháng m?i nh?t (monthly)
@@ -248,14 +267,27 @@ def run_once_scan(
                 logger.info(f"Copied {zip_name} to saved_data (kept original in incoming_dir)")
                 
             elif result.get("skipped"):
-                logger.info(f"Skipped {zip_name}: {result.get('reason', 'unknown')}")
+                reason = result.get("reason", "unknown")
+                logger.error(f"Skipped {zip_name}: {reason}")
+                failures.append(f"{zip_name}: skipped ({reason})")
             else:
-                logger.error(f"Failed {zip_name}: {result.get('error', 'unknown error')}")
+                error = result.get("error", "unknown error")
+                logger.error(f"Failed {zip_name}: {error}")
+                failures.append(f"{zip_name}: {error}")
                 
         except Exception as e:
             logger.error(f"Error processing {zip_name}: {e}")
+            failures.append(f"{zip_name}: {e}")
 
-    run_once_label_scan(fs_cfg=fs_cfg, pg_cfg=pg_cfg, ingest_schema=ingest_schema)
+    try:
+        run_once_label_scan(fs_cfg=fs_cfg, pg_cfg=pg_cfg, ingest_schema=ingest_schema)
+    except Exception as exc:
+        logger.warning("[LABEL] Label ingestion is DEGRADED: %s", exc)
+
+    if failures:
+        raise RuntimeError(
+            "Ingestion scan failed for one or more files:\n- " + "\n- ".join(failures)
+        )
 
 
 def run_once_label_scan(
@@ -282,6 +314,7 @@ def run_once_label_scan(
         return
 
     force_ingest = os.getenv("FORCE_INGEST", "").lower() in ("1", "true", "yes")
+    failures = []
     for zip_path in zip_paths:
         zip_name = zip_path.name
         if not force_ingest:
@@ -307,9 +340,17 @@ def run_once_label_scan(
                 shutil.copy2(str(zip_path), str(saved_path))
                 logger.info("[LABEL] Successfully ingested %s: prod_rows=%s", zip_name, result.get("prod_rows"))
             else:
-                logger.error("[LABEL] Failed %s: %s", zip_name, result.get("error", "unknown error"))
+                error = result.get("error", "unknown error")
+                logger.error("[LABEL] Failed %s: %s", zip_name, error)
+                failures.append(f"{zip_name}: {error}")
         except Exception as e:
             logger.error("[LABEL] Error processing %s: %s", zip_name, e)
+            failures.append(f"{zip_name}: {e}")
+
+    if failures:
+        raise RuntimeError(
+            "Label ingestion failed for one or more files:\n- " + "\n- ".join(failures)
+        )
 
 
 def main() -> None:
