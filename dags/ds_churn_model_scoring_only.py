@@ -32,10 +32,11 @@ with DAG(
     run_scoring_only = BashOperator(
         task_id="run_export_risk_only",
         bash_command=(
-            "cd /churn_source && "
+            "python /churn_source/modeling/ops_lock.py --wait-seconds 0 -- "
+            "bash -lc 'cd /churn_source && "
             "python modeling/main.py export-risk "
             "--horizon 2 "
-            "--risk-threshold-pct 95"
+            "--risk-threshold-pct 95'"
         ),
         env={
             "TZ": "Asia/Ho_Chi_Minh",

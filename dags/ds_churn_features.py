@@ -21,7 +21,11 @@ with DAG(
     # Assumes code is at /churn_source/Preprocess/src/operations/run/run_feature_generation.py
     run_features = BashOperator(
         task_id="run_features",
-        bash_command="cd /churn_source/preprocessing && python src/operations/run/run_feature_generation.py --start 2025-01-01",
+        bash_command=(
+            "python /churn_source/modeling/ops_lock.py --wait-seconds 0 -- "
+            "bash -lc 'cd /churn_source/preprocessing && "
+            "python src/operations/run/run_feature_generation.py --start 2025-01-01'"
+        ),
         env={
             "WINDOW_SCHEMA": "data_window",
             "TZ": "Asia/Ho_Chi_Minh",

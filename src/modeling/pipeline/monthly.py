@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import traceback
 import pandas as pd
@@ -44,18 +45,29 @@ def retrain_due_reason(engine: Engine, *, horizon: int, interval_months: int = 3
         ).scalar()
         if has_validation_table is None:
             return False, "blocked_missing_freshness_status"
-        freshness_status = conn.execute(
+        freshness_row = conn.execute(
             text(
                 """
-                SELECT status
+                SELECT status,
+                       EXTRACT(EPOCH FROM (now() - checked_at)) / 3600.0 AS age_hours
                 FROM ingest.validation_status
                 ORDER BY checked_at DESC, id DESC
                 LIMIT 1
                 """
             )
-        ).scalar()
+        ).fetchone()
+    if freshness_row is None:
+        return False, "blocked_missing_freshness_status"
+    freshness_status = freshness_row[0]
+    freshness_age_hours = float(freshness_row[1])
     if freshness_status != "PASS":
         return False, f"blocked_freshness_{str(freshness_status).lower()}"
+    min_freshness_age_hours = float(os.getenv("RETRAIN_MIN_FRESHNESS_AGE_HOURS", "12"))
+    max_freshness_age_hours = float(os.getenv("RETRAIN_MAX_FRESHNESS_AGE_HOURS", "96"))
+    if freshness_age_hours < min_freshness_age_hours:
+        return False, f"blocked_freshness_not_stable_{freshness_age_hours:.1f}h"
+    if freshness_age_hours > max_freshness_age_hours:
+        return False, f"blocked_freshness_stale_{freshness_age_hours:.1f}h"
 
     try:
         cfg = load_latest_accepted_best_config(engine, horizon=int(horizon))

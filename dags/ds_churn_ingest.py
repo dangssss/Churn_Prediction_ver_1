@@ -26,7 +26,10 @@ with DAG(
     # Assumes code is at {PROJECT_ROOT}/src/ingestion/run_job_now.py
     ingest_scan_and_load = BashOperator(
         task_id="ingest_scan_and_load",
-        bash_command=f"python /churn_source/ingestion/run_job_now.py",
+        bash_command=(
+            "python /churn_source/modeling/ops_lock.py --wait-seconds 0 -- "
+            "python /churn_source/ingestion/run_job_now.py"
+        ),
         env={
             # Env vars are loaded from .env by Airflow, append_env=True, but specific overrides can go here
             "TZ": "Asia/Ho_Chi_Minh",
