@@ -292,14 +292,14 @@ def build_labeled_pair(
     # Dành cho các khách hàng rớt từ từ nhưng rõ rệt
     c3 = (rev_slope_tp < -1000) & (rev_tp < 0.80 * monetary_tp)  # threshold -1000 để lọc nhiễu nhẹ
 
-    y = (c0 | c1 | c2 | c3).astype(int)
+    rule_y = (c0 | c1 | c2 | c3).astype(int)
 
     n_c0    = int(c0.sum())
     n_c1    = int(c1.sum())
     n_c2    = int(c2.sum())
     n_c3    = int(c3.sum())
-    n_total = len(y)
-    n_pos   = int(y.sum())
+    n_total = len(rule_y)
+    n_pos   = int(rule_y.sum())
     logger.debug(
         "Đã sinh nhãn y_churn_t_plus_%d từ %s: "
         "Tổng Churn=%d (%.1f%%) | C0(hoàn toàn)=%d | C1(tần suất)=%d | C2(doanh thu)=%d | C3(slope)=%d | Active=%d | Total=%d",
@@ -358,6 +358,7 @@ def build_labeled_pair(
     uncertain_band = max(0.0, min(float(uncertain_band), 0.80))
 
     scored = risk_score.dropna()
+    uncertain_mask = pd.Series(False, index=df_tp.index)
     if scored.empty:
         y = pd.Series(np.nan, index=df_tp.index, dtype="float64")
         pos_cutoff = np.nan
@@ -370,17 +371,21 @@ def build_labeled_pair(
         y = pd.Series(np.nan, index=df_tp.index, dtype="float64")
         y.loc[risk_score <= neg_cutoff] = 0.0
         y.loc[risk_score >= pos_cutoff] = 1.0
+        # Resolve the mid-band with explicit business rules instead of dropping it.
+        uncertain_mask = y.isna() & risk_score.notna()
+        y.loc[uncertain_mask] = rule_y.loc[uncertain_mask].astype(float)
 
     n_pos = int((y == 1).sum())
     n_neg = int((y == 0).sum())
     n_uncertain = int(y.isna().sum())
+    n_rule_resolved = int(uncertain_mask.sum())
     logger.info(
         "Override fallback labels y_churn_t_plus_%d from %s using adaptive risk-score rules: "
-        "Churn=%d (%.1f%% of labeled) | Active=%d | Uncertain(drop)=%d | eligible=%d | total=%d | "
+        "Churn=%d (%.1f%% of labeled) | Active=%d | Rule-resolved(mid-band)=%d | Unlabeled(drop)=%d | eligible=%d | total=%d | "
         "target_rate=%.4f (%s) | positive_cutoff=%.6f | negative_cutoff=%.6f | uncertain_band=%.2f",
         horizon, table_tp,
         n_pos, 100.0 * n_pos / max(n_pos + n_neg, 1),
-        n_neg, n_uncertain, int(eligible.sum()), len(y),
+        n_neg, n_rule_resolved, n_uncertain, int(eligible.sum()), len(y),
         target_rate, target_source, pos_cutoff, neg_cutoff, uncertain_band,
     )
 
