@@ -153,10 +153,21 @@ def eval_one_k_train_val(
     y_tr = df_tr[label_col].astype(int)
     X_va = df_va[num_cols + cat_cols]
     y_va = df_va[label_col].astype(int)
+    sample_weight = (
+        pd.to_numeric(df_tr["label_weight"], errors="coerce").fillna(1.0)
+        if "label_weight" in df_tr.columns
+        else pd.Series(1.0, index=df_tr.index)
+    )
 
     n_pos = int((y_tr == 1).sum())
     n_neg = int((y_tr == 0).sum())
-    spw = (n_neg / max(n_pos, 1))
+    weighted_pos = float(sample_weight[y_tr == 1].sum())
+    weighted_neg = float(sample_weight[y_tr == 0].sum())
+    spw_raw = weighted_neg / max(weighted_pos, 1.0)
+    max_positive_class_weight = float(
+        os.getenv("BASELINE_MAX_POSITIVE_CLASS_WEIGHT", "100")
+    )
+    spw = min(spw_raw, max_positive_class_weight)
 
     # ---------- Guardrail: tự động chọn class_weight ----------
     CHURN_RATIO_THRESHOLD = 0.35
@@ -179,11 +190,30 @@ def eval_one_k_train_val(
         class_weight_used = {0: 1.0, 1: spw}
         spw_rule = f"churn_ratio <= 35% → class_weight={{1:{spw:.2f}}} (bù mất cân bằng)"
 
+    if churn_ratio <= CHURN_RATIO_THRESHOLD:
+        spw_rule = (
+            f"churn_ratio <= 35% -> weighted class_weight={{1:{spw:.2f}}} "
+            f"(raw={spw_raw:.2f}, cap={max_positive_class_weight:.2f})"
+        )
+
     logger.info(
         "[BASELINE K=%d] Tập huấn luyện: Churn=%d | Active=%d | Total=%d | "
         "Tỷ lệ Churn=%.2f%% | Quyết định: %s",
         k, n_pos, n_neg, n_pos + n_neg, churn_ratio * 100, spw_rule,
     )
+
+    if "label_source" in df_tr.columns:
+        provenance = (
+            df_tr.assign(_label_weight=sample_weight)
+            .groupby("label_source", dropna=False)
+            .agg(
+                rows=(label_col, "size"),
+                positives=(label_col, "sum"),
+                effective_weight=("_label_weight", "sum"),
+            )
+            .reset_index()
+        )
+        logger.info("[BASELINE K=%d] Label provenance:\n%s", k, provenance.to_string(index=False))
 
     pre = make_preprocess(num_cols, cat_cols)
     clf = LogisticRegression(
@@ -196,11 +226,6 @@ def eval_one_k_train_val(
     )
     pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
 
-    sample_weight = (
-        pd.to_numeric(df_tr["label_weight"], errors="coerce").fillna(1.0)
-        if "label_weight" in df_tr.columns
-        else pd.Series(1.0, index=df_tr.index)
-    )
     pipe.fit(X_tr, y_tr, clf__sample_weight=sample_weight.to_numpy())
 
     va_prob = pipe.predict_proba(X_va)[:, 1]
@@ -228,7 +253,7 @@ def eval_one_k_train_val(
         "n_rows": int(len(df_k)),
         "n_months": int(df_k["window_end"].nunique()),
         "spw_used": float(class_weight_used.get(1, 1.0)),
-        "spw_raw": float(spw),
+        "spw_raw": float(spw_raw),
         "churn_ratio_train": float(churn_ratio),
         "n_num": int(len(num_cols)),
         "n_cat": int(len(cat_cols)),

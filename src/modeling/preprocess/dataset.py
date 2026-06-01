@@ -412,7 +412,7 @@ def build_labeled_pair(
     out["source_table_t"] = table_t
     out["source_table_t_plus_h"] = table_tp
     out["label_source"] = "rule_based"
-    out["label_weight"] = float(os.getenv("RULE_LABEL_SAMPLE_WEIGHT", "0.35"))
+    out["label_weight"] = float(os.getenv("RULE_LABEL_SAMPLE_WEIGHT", "0.20"))
     return out
 
 def build_dataset_for_k(engine: Engine, k: int, horizon: int = 1, limit_rows_each: Optional[int] = None) -> pd.DataFrame:
