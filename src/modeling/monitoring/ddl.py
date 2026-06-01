@@ -93,14 +93,33 @@ def ensure_monitoring_schema(engine: Engine, schema: str = DEFAULT_SCHEMA) -> No
         best_k            INT,
         risk_threshold_pct INT,
 
+        label_source       TEXT,
+        label_tables       TEXT,
+
         active_cnt        INT,
         list_size         INT,
         churn_true_total  INT,
         churn_true_in_list INT,
+        actual_churn_total INT,
+        actual_churn_in_list INT,
 
+        true_positive      INT,
+        false_positive     INT,
+        false_negative     INT,
+        true_negative      INT,
+
+        actual_churn_rate  DOUBLE PRECISION,
+        predicted_risk_rate DOUBLE PRECISION,
         precision_in_list DOUBLE PRECISION,
         recall_in_list    DOUBLE PRECISION,
+        specificity       DOUBLE PRECISION,
         f1_in_list        DOUBLE PRECISION,
+        lift_vs_random     DOUBLE PRECISION,
+
+        guardrail_status   TEXT,
+        blocks_model_promotion BOOLEAN NOT NULL DEFAULT FALSE,
+        guardrail_reasons  TEXT,
+        recommended_action TEXT,
 
         created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -110,6 +129,23 @@ def ensure_monitoring_schema(engine: Engine, schema: str = DEFAULT_SCHEMA) -> No
     CREATE INDEX IF NOT EXISTS idx_score_drift_created_at ON {schema}.score_drift (created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_feature_drift_created_at ON {schema}.feature_drift (created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_backtest_created_at ON {schema}.backtest (created_at DESC);
+
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS label_source TEXT;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS label_tables TEXT;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS actual_churn_total INT;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS actual_churn_in_list INT;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS true_positive INT;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS false_positive INT;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS false_negative INT;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS true_negative INT;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS actual_churn_rate DOUBLE PRECISION;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS predicted_risk_rate DOUBLE PRECISION;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS specificity DOUBLE PRECISION;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS lift_vs_random DOUBLE PRECISION;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS guardrail_status TEXT;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS blocks_model_promotion BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS guardrail_reasons TEXT;
+    ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS recommended_action TEXT;
     """
     with engine.begin() as conn:
         for stmt in ddl.strip().split(";"):

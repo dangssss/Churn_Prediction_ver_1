@@ -133,6 +133,30 @@ def cmd_export_risk(args) -> None:
     logger.info("DONE export-risk: %s", res)
 
 
+def cmd_backtest_actual(args) -> None:
+    from monitoring.backtest import run_backtests_for_available_actual_labels
+
+    engine = get_engine()
+    logger.info("DB: %s", smoke_test(engine))
+    results = run_backtests_for_available_actual_labels(
+        engine,
+        horizon=int(args.horizon),
+        risk_threshold_pct=int(args.risk_threshold_pct),
+    )
+    logger.info("DONE backtest-actual: evaluated_origins=%d", len(results))
+    for result in results:
+        logger.info(
+            "[BACKTEST] origin=%s labels=%s precision=%s recall=%s lift=%s status=%s action=%s",
+            result["pred_window_end"],
+            result["label_tables"],
+            result["precision_in_list"],
+            result["recall_in_list"],
+            result["lift_vs_random"],
+            result["guardrail_status"],
+            result["recommended_action"],
+        )
+
+
 
 def load_config_defaults() -> dict:
     """Load defaults from config/job_config.json if exists."""
@@ -190,6 +214,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit-rows", type=int, default=None)
     p.add_argument("--make-dossier", action="store_true")
     p.set_defaults(func=cmd_export_risk)
+
+    p = sub.add_parser("backtest-actual", help="Evaluate stored scoring origins with complete actual-label coverage")
+    p.add_argument("--horizon", type=int, required=True)
+    p.add_argument("--risk-threshold-pct", type=int, default=70)
+    p.set_defaults(func=cmd_backtest_actual)
 
     return ap
 
