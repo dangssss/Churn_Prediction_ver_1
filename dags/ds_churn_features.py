@@ -35,9 +35,9 @@ with DAG(
         append_env=True,
     )
 
-    trigger_scoring = TriggerDagRunOperator(
-        task_id="trigger_scoring",
-        trigger_dag_id="ds_churn_model_scoring_only",
+    trigger_post_feature = TriggerDagRunOperator(
+        task_id="trigger_post_feature",
+        trigger_dag_id="ds_churn_model_post_feature",
         conf={
             "upstream_features_run_id": "{{ run_id }}",
             "logical_date": "{{ ds }}",
@@ -46,4 +46,4 @@ with DAG(
         reset_dag_run=True,
     )
 
-    run_features >> trigger_scoring
+    run_features >> trigger_post_feature

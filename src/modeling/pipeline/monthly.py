@@ -35,7 +35,13 @@ from logging_config import get_logger
 logger = get_logger(__name__)
 
 
-def retrain_due_reason(engine: Engine, *, horizon: int, interval_months: int = 3) -> tuple[bool, str]:
+def retrain_due_reason(
+    engine: Engine,
+    *,
+    horizon: int,
+    interval_months: int = 3,
+    min_freshness_age_hours: float | None = None,
+) -> tuple[bool, str]:
     """Return whether a retrain run may start and the audit reason."""
     from sqlalchemy import text
 
@@ -62,7 +68,8 @@ def retrain_due_reason(engine: Engine, *, horizon: int, interval_months: int = 3
     freshness_age_hours = float(freshness_row[1])
     if freshness_status != "PASS":
         return False, f"blocked_freshness_{str(freshness_status).lower()}"
-    min_freshness_age_hours = float(os.getenv("RETRAIN_MIN_FRESHNESS_AGE_HOURS", "12"))
+    if min_freshness_age_hours is None:
+        min_freshness_age_hours = float(os.getenv("RETRAIN_MIN_FRESHNESS_AGE_HOURS", "12"))
     max_freshness_age_hours = float(os.getenv("RETRAIN_MAX_FRESHNESS_AGE_HOURS", "96"))
     if freshness_age_hours < min_freshness_age_hours:
         return False, f"blocked_freshness_not_stable_{freshness_age_hours:.1f}h"
