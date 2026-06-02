@@ -18,7 +18,7 @@ def main():
     ap.add_argument("--main-es-rounds", type=int, default=200)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--choose-static", choices=["false","true","both"], default="both",
-                   help="Train use_static variants. 'both' will train False/True and auto choose by AP then F1.")
+                   help="Train use_static variants. 'both' will train False/True and auto choose by Lift@N.")
     ap.add_argument("--save-bundle", type=str, default=None,
                    help="Folder to save model + metadata (joblib + json).")
     args = ap.parse_args()
@@ -43,12 +43,12 @@ def main():
     if not ok:
         raise SystemExit("All variants failed guardrail. Stop.")
 
-    ok.sort(key=lambda r: (r["F1_val"], r["AP_val"]), reverse=True)
+    ok.sort(key=lambda r: (r["Lift_at_n"], r["AP_val"], r["F1_val"]), reverse=True)
     best = ok[0]
     if len(ok) == 2:
-        f1_gap = ok[0]["F1_val"] - ok[1]["F1_val"]
-        if abs(f1_gap) <= 0.002:
-            # if F1 is effectively tied, prefer no_static (simpler & less leakage risk)
+        lift_gap = ok[0]["Lift_at_n"] - ok[1]["Lift_at_n"]
+        if abs(lift_gap) <= 0.05:
+            # If Lift@N is effectively tied, prefer no_static (simpler & less leakage risk).
             best = next((v for v in ok if v["use_static"] is False), best)
 
     cfg["use_static"] = bool(best["use_static"])
@@ -56,7 +56,7 @@ def main():
     main_model = best["model"]
 
     print("==> CHOSEN use_static =", cfg["use_static"])
-    print("AP_val:", best["AP_val"], "| F1_val:", best["F1_val"])
+    print("Lift@N:", best["Lift_at_n"], "| AP_val:", best["AP_val"], "| F1_val:", best["F1_val"])
     print("Warnings:", best.get("guardrail_warning"))
 
     # update DB

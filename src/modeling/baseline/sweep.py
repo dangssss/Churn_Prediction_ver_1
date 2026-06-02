@@ -21,7 +21,7 @@ def run_sweep_k(
     k_min: int = 3,
 ) -> tuple[dict, pd.DataFrame]:
     """
-    Always sweep K to find the best K for current data (picked by F1 then PR_AUC).
+    Always sweep K to find the best K for current data (picked by Lift@N).
     Returns:
       (best_config_candidate, df_ablation_sorted)
     """
@@ -69,14 +69,26 @@ def run_sweep_k(
                 continue
             ablation.append(out)
             logger.info(
-                "K=%d | use_static=%s | val=%s | F1=%.4f | PR_AUC=%.4f",
-                k, use_static, out.get('val_month'), out['f1'], out['PR_AUC_val']
+                "K=%d | use_static=%s | val=%s | Lift@%d=%.2fx | "
+                "Precision@%d=%.4f%% | Recall@%d=%.2f%% | hits=%d | F1=%.4f | PR_AUC=%.4f",
+                k, use_static, out.get("val_month"),
+                out["ranking_top_n"], out["lift_at_n"],
+                out["ranking_top_n"], 100.0 * out["precision_at_n"],
+                out["ranking_top_n"], 100.0 * out["recall_at_n"],
+                out["hits_at_n"], out["f1"], out["PR_AUC_val"],
             )
 
     if not ablation:
         raise ValueError("Ablation produced no result.")
 
-    df_ab = pd.DataFrame(ablation).sort_values(["f1", "PR_AUC_val"], ascending=False).reset_index(drop=True)
+    df_ab = (
+        pd.DataFrame(ablation)
+        .sort_values(
+            ["lift_at_n", "precision_at_n", "recall_at_n", "PR_AUC_val", "f1"],
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
 
     best_k = int(df_ab.iloc[0]["K"])
     use_static_best = bool(df_ab.iloc[0]["use_static"])
@@ -97,9 +109,15 @@ def run_sweep_k(
         "best_spw": best_spw_final,
         "metric_f1_val": best_f1_final,
         "metric_pr_auc_val": float(df_ab.iloc[0]["PR_AUC_val"]),
+        "ranking_top_n": int(df_ab.iloc[0]["ranking_top_n"]),
+        "metric_hits_at_n": int(df_ab.iloc[0]["hits_at_n"]),
+        "metric_precision_at_n": float(df_ab.iloc[0]["precision_at_n"]),
+        "metric_recall_at_n": float(df_ab.iloc[0]["recall_at_n"]),
+        "metric_lift_at_n": float(df_ab.iloc[0]["lift_at_n"]),
+        "metric_val_prevalence": float(df_ab.iloc[0]["val_prevalence"]),
         "val_month": int(df_ab.iloc[0]["val_month"]),
         "validation_label_source": str(df_ab.iloc[0]["validation_label_source"]),
         "bundle_lifecycle": str(df_ab.iloc[0]["bundle_lifecycle"]),
-        "notes": "picked by F1 then PR_AUC; sweep K window_only then static ablation",
+        "notes": "picked by Lift@N then Precision@N, Recall@N, PR_AUC, F1; sweep K window_only then static ablation",
     }
     return best_config, df_ab
