@@ -108,13 +108,23 @@ def time_split_train_val_last_month(
         )
     val_month = actual_months[-1] if actual_months else months[-1]
     train_max_month = int(shift_yymm(str(val_month), -int(horizon)))
-    df_tr = df2[df2[time_col] <= train_max_month].copy()
+    historical_train = df2[time_col] <= train_max_month
+    future_rule_train = pd.Series(False, index=df2.index)
+    if actual_months and "label_source" in df2.columns:
+        future_rule_train = (
+            (df2["label_source"] == "rule_based")
+            & (df2[time_col] > val_month)
+        )
+    df_tr = df2[historical_train | future_rule_train].copy()
     df_va = df2[df2[time_col] == val_month].copy()
     logger.info(
-        "[PURGED SPLIT] val_month=%s horizon=%s train_origin_max=%s train_rows=%d val_rows=%d",
+        "[PURGED SPLIT] val_month=%s horizon=%s train_origin_max=%s "
+        "historical_train_rows=%d future_rule_train_rows=%d train_rows=%d val_rows=%d",
         val_month,
         horizon,
         train_max_month,
+        int(historical_train.sum()),
+        int(future_rule_train.sum()),
         len(df_tr),
         len(df_va),
     )
