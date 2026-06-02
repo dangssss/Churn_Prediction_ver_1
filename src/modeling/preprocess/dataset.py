@@ -93,6 +93,89 @@ def _load_post_origin_activity(
     return out, ",".join(f"public.{table}" for table in future_tables)
 
 
+def _has_post_origin_activity_tables(
+    engine: Engine,
+    *,
+    origin_yymm: str | int,
+    horizon: int,
+) -> bool:
+    """Return whether raw order tables exist for every required future month."""
+    from sqlalchemy import text
+
+    future_yymms = [shift_yymm(origin_yymm, offset) for offset in range(1, int(horizon) + 1)]
+    with engine.connect() as conn:
+        return all(
+            conn.execute(
+                text("SELECT to_regclass(:table_name)"),
+                {"table_name": f"public.bccp_orderitem_{yymm}"},
+            ).scalar()
+            is not None
+            for yymm in future_yymms
+        )
+
+
+def select_train_val_tables_for_k(
+    engine: Engine,
+    k: int,
+    *,
+    horizon: int,
+) -> tuple[list[str], int, int]:
+    """Select only labeled train origins and one validation origin for a purged split."""
+    tables = list_tables_for_k(engine, int(k))
+    if not tables:
+        raise ValueError(f"No feature tables for K={k}")
+
+    labelable = []
+    actual_origins = []
+    for table in tables:
+        _, _, end = parse_feature_table_name(table)
+        has_actual = bool(label_tables_for_horizon(engine, end, int(horizon)))
+        has_fallback = False if has_actual else _has_post_origin_activity_tables(
+            engine,
+            origin_yymm=end,
+            horizon=int(horizon),
+        )
+        if has_actual or has_fallback:
+            labelable.append((table, int(end)))
+        if has_actual:
+            actual_origins.append(int(end))
+
+    if not labelable:
+        raise ValueError(f"No labelable feature tables for K={k}, H={horizon}")
+
+    val_month = max(actual_origins) if actual_origins else max(end for _, end in labelable)
+    train_max_month = int(shift_yymm(str(val_month), -int(horizon)))
+    selected = [
+        table
+        for table, end in labelable
+        if end <= train_max_month or end == val_month
+    ]
+    train_tables = [
+        table
+        for table, end in labelable
+        if end <= train_max_month
+    ]
+    if not train_tables:
+        raise ValueError(
+            f"No purged training origins for K={k}, H={horizon}: "
+            f"val_month={val_month}, train_origin_max={train_max_month}"
+        )
+
+    logger.info(
+        "[PURGED PREFLIGHT] K=%d H=%d val_month=%d train_origin_max=%d "
+        "selected_tables=%d/%d train_tables=%d validation_source=%s",
+        k,
+        horizon,
+        val_month,
+        train_max_month,
+        len(selected),
+        len(tables),
+        len(train_tables),
+        "actual" if actual_origins else "rule_based",
+    )
+    return selected, val_month, train_max_month
+
+
 def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 0.1, percentile_upper: float = 99.9) -> pd.DataFrame:
     df_clipped = df.copy()
     outlier_summary = []
@@ -420,8 +503,14 @@ def build_labeled_pair(
     out["label_weight"] = float(os.getenv("RULE_LABEL_SAMPLE_WEIGHT", "0.20"))
     return out
 
-def build_dataset_for_k(engine: Engine, k: int, horizon: int = 1, limit_rows_each: Optional[int] = None) -> pd.DataFrame:
-    tbls = list_tables_for_k(engine, k)
+def build_dataset_for_k(
+    engine: Engine,
+    k: int,
+    horizon: int = 1,
+    limit_rows_each: Optional[int] = None,
+    tables: Optional[list[str]] = None,
+) -> pd.DataFrame:
+    tbls = list_tables_for_k(engine, k) if tables is None else list(tables)
     frames = []
     for t in tbls:
         df = build_labeled_pair(engine, k, t, horizon=horizon, limit=limit_rows_each)
