@@ -165,7 +165,7 @@ def cmd_sweep_k(args) -> None:
 
     # Log only — KHÔNG ghi DB để tránh ghi đè config production
     logger.info("Sweep result (NOT saved to DB): %s", best_cfg)
-    cols = [c for c in ["k", "use_static", "val_month", "f1", "PR_AUC_val", "best_threshold", "spw_used"] if c in df_ab.columns]
+    cols = [c for c in ["K", "use_static", "val_month", "ranking_top_n", "hits_at_n", "precision_at_n", "recall_at_n", "lift_at_n", "f1", "PR_AUC_val", "best_threshold", "spw_used"] if c in df_ab.columns]
     logger.info("TOP-10:\n%s", df_ab[cols].head(10).to_string(index=False))
 
 
@@ -182,7 +182,7 @@ def cmd_train_main(args) -> None:
     ok = [v for v in variants if not v.get("guardrail_warning")]
     if not ok:
         raise RuntimeError("All variants failed guardrail. Stop training.")
-    ok.sort(key=lambda r: (r["F1_val"], r["AP_val"]), reverse=True)
+    ok.sort(key=lambda r: (r["Lift_at_n"], r["AP_val"], r["F1_val"]), reverse=True)
     best = ok[0]
 
     cfg = dict(cfg)

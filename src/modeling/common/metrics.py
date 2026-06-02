@@ -2,6 +2,45 @@ from __future__ import annotations
 
 import numpy as np
 
+
+def ranking_metrics_at_n(y_true: np.ndarray, y_prob: np.ndarray, n: int = 5000) -> dict:
+    """Compute business ranking metrics for the highest-risk N customers."""
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob, dtype=float)
+    if len(y_true) != len(y_prob):
+        raise ValueError("y_true and y_prob must have the same length")
+
+    requested_n = max(int(n), 1)
+    effective_n = min(requested_n, len(y_true))
+    total_positives = int((y_true == 1).sum())
+    prevalence = total_positives / max(len(y_true), 1)
+    if effective_n == 0:
+        return {
+            "ranking_top_n": requested_n,
+            "ranking_effective_n": 0,
+            "hits_at_n": 0,
+            "precision_at_n": 0.0,
+            "recall_at_n": 0.0,
+            "lift_at_n": 0.0,
+            "val_prevalence": float(prevalence),
+        }
+
+    order = np.argsort(-y_prob, kind="stable")[:effective_n]
+    hits = int((y_true[order] == 1).sum())
+    precision = hits / effective_n
+    recall = hits / max(total_positives, 1)
+    lift = precision / prevalence if prevalence > 0 else 0.0
+    return {
+        "ranking_top_n": requested_n,
+        "ranking_effective_n": effective_n,
+        "hits_at_n": hits,
+        "precision_at_n": float(precision),
+        "recall_at_n": float(recall),
+        "lift_at_n": float(lift),
+        "val_prevalence": float(prevalence),
+    }
+
+
 def prf1_at_threshold(y_true: np.ndarray, y_prob: np.ndarray, thr: float):
     y_true = y_true.astype(int)
     y_pred = (y_prob >= thr).astype(int)

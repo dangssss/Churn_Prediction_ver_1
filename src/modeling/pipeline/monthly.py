@@ -173,11 +173,11 @@ def _train_main_inline(engine: Engine, *, horizon: int, bundle_dir: Path) -> dic
     ok = [v for v in variants if not v.get("guardrail_warning")]
     if not ok:
         raise RuntimeError("All variants failed guardrail. Stop training.")
-    ok.sort(key=lambda r: (r["F1_val"], r["AP_val"]), reverse=True)
+    ok.sort(key=lambda r: (r["Lift_at_n"], r["AP_val"], r["F1_val"]), reverse=True)
     best = ok[0]
     if len(ok) == 2:
-        f1_gap = ok[0]["F1_val"] - ok[1]["F1_val"]
-        if abs(f1_gap) <= 0.002:
+        lift_gap = ok[0]["Lift_at_n"] - ok[1]["Lift_at_n"]
+        if abs(lift_gap) <= 0.05:
             best = next((v for v in ok if v["use_static"] is False), best)
 
     cfg["use_static"] = bool(best["use_static"])
@@ -206,7 +206,7 @@ def run_monthly_pipeline(
     bundle_dir: str | Path = CHURN_MODEL_DIR / "bundles/latest",
     limit_rows_each: int | None = None,
     k_min: int = 3,
-    f1_improve_eps: float = 1e-6,
+    lift_improve_eps: float = 1e-6,
     do_backtest: bool = True,
     do_feature_drift: bool = True,
     do_scoring: bool = True,
@@ -215,7 +215,7 @@ def run_monthly_pipeline(
     """
     FULL monthly pipeline (run once):
       1) Sweep K (candidate)
-      2) Compare candidate F1 vs previous accepted F1
+      2) Compare candidate Lift@N vs previous accepted Lift@N
          - accept if improved
          - else keep previous accepted config/model
       3) If accepted -> retrain main model + overwrite bundle
@@ -232,13 +232,20 @@ def run_monthly_pipeline(
     # previous accepted config (can be None)
     prev_cfg = None
     prev_f1 = None
+    prev_lift_at_n = None
     prev_k = None
     prev_f1_db = 0.0
     prev_f1_bundle = 0.0
+    prev_lift_db = None
+    prev_lift_bundle = None
+    previous_lift_records = []
     prev_bundle_lifecycle = None
     try:
         prev_cfg = load_latest_accepted_best_config(engine, horizon=int(horizon))
         prev_f1_db = float(prev_cfg.get("metric_f1_val") or 0)
+        if prev_cfg.get("metric_lift_at_n") is not None and not pd.isna(prev_cfg["metric_lift_at_n"]):
+            prev_lift_db = float(prev_cfg["metric_lift_at_n"])
+            previous_lift_records.append((int(prev_cfg.get("ranking_top_n") or 5000), prev_lift_db))
         prev_k = int(prev_cfg.get("best_k")) if prev_cfg.get("best_k") is not None else None
     except Exception:
         prev_cfg = None
@@ -250,6 +257,9 @@ def run_monthly_pipeline(
         prev_f1_bundle = float(
             bundle_cfg.get("metric_f1_val") or 0
         )
+        if bundle_cfg.get("metric_lift_at_n") is not None and not pd.isna(bundle_cfg["metric_lift_at_n"]):
+            prev_lift_bundle = float(bundle_cfg["metric_lift_at_n"])
+            previous_lift_records.append((int(bundle_cfg.get("ranking_top_n") or 5000), prev_lift_bundle))
         prev_bundle_lifecycle = str(
             (bundle_meta or {}).get("bundle_lifecycle")
             or bundle_cfg.get("bundle_lifecycle")
@@ -260,9 +270,17 @@ def run_monthly_pipeline(
         prev_bundle_lifecycle = None
 
     prev_f1 = max(prev_f1_db, prev_f1_bundle) if (prev_f1_db > 0 or prev_f1_bundle > 0) else None
+    previous_lifts = [value for value in [prev_lift_db, prev_lift_bundle] if value is not None]
+    prev_lift_at_n = max(previous_lifts) if previous_lifts else None
     logger.info("[PREV_F1] DB=%.4f | bundle=%.4f | using=%s",
                 prev_f1_db, prev_f1_bundle,
                 f"{prev_f1:.4f}" if prev_f1 is not None else "None")
+    logger.info(
+        "[PREV_LIFT_AT_N] DB=%s | bundle=%s | using=%s",
+        f"{prev_lift_db:.4f}" if prev_lift_db is not None else "None",
+        f"{prev_lift_bundle:.4f}" if prev_lift_bundle is not None else "None",
+        f"{prev_lift_at_n:.4f}" if prev_lift_at_n is not None else "None",
+    )
 
     start_run(
         engine,
@@ -271,6 +289,7 @@ def run_monthly_pipeline(
         risk_threshold_pct=int(risk_threshold_pct),
         prev_best_k=prev_k,
         prev_best_f1=prev_f1,
+        prev_best_lift_at_n=prev_lift_at_n,
         notes=f"smoke_test={smoke_test(engine)}",
     )
 
@@ -289,6 +308,18 @@ def run_monthly_pipeline(
             k_min=int(k_min),
         )
         cand_f1 = float(cand_cfg["metric_f1_val"])
+        cand_lift_at_n = float(cand_cfg["metric_lift_at_n"])
+        ranking_top_n = int(cand_cfg["ranking_top_n"])
+        compatible_previous_lifts = [
+            lift for top_n, lift in previous_lift_records if top_n == ranking_top_n
+        ]
+        if prev_lift_at_n is not None and not compatible_previous_lifts:
+            logger.warning(
+                "[RANKING BASELINE RESET] No previous Lift@%d is available. "
+                "Accept the next eligible candidate to establish a comparable baseline.",
+                ranking_top_n,
+            )
+        prev_lift_at_n = max(compatible_previous_lifts) if compatible_previous_lifts else None
         cand_k = int(cand_cfg["best_k"])
         t_current = int(cand_cfg["as_of_month"])
 
@@ -326,8 +357,8 @@ def run_monthly_pipeline(
             rule = "accepted_first_run"
             logger.info(
                 "[FIRST RUN] Chưa có model nào trong DB. Chấp nhận ngay config mới "
-                "(K=%d, F1=%.4f) và train fresh. Bỏ qua mọi guard.",
-                cand_k, cand_f1,
+                "(K=%d, Lift@%d=%.2fx, F1=%.4f) và train fresh. Bỏ qua mọi guard.",
+                cand_k, ranking_top_n, cand_lift_at_n, cand_f1,
             )
         elif prevalence_blocked:
             accepted = False
@@ -362,12 +393,12 @@ def run_monthly_pipeline(
                     "HỦY RETRAIN, giữ nguyên model cũ và chỉ chạy scoring.",
                     t_current, active_cnt_cur, t_prev, active_cnt_prev, active_ratio
                 )
-            elif prev_f1 is None:
+            elif prev_lift_at_n is None:
                 accepted = True
-                rule = "accepted_no_prev"
+                rule = "accepted_missing_prev_lift_at_n"
             else:
-                accepted = bool(cand_f1 > (prev_f1 + f1_improve_eps))
-                rule = "accepted_f1_improved" if accepted else "rejected_f1_not_improved"
+                accepted = bool(cand_lift_at_n > (prev_lift_at_n + lift_improve_eps))
+                rule = "accepted_lift_at_n_improved" if accepted else "rejected_lift_at_n_not_improved"
 
         candidate_lifecycle = _bundle_lifecycle(cand_cfg)
         previous_lifecycles = [
@@ -400,6 +431,7 @@ def run_monthly_pipeline(
 
         cand_cfg["is_accepted"] = bool(accepted)
         cand_cfg["prev_accepted_f1"] = prev_f1
+        cand_cfg["prev_accepted_lift_at_n"] = prev_lift_at_n
         cand_cfg["accept_rule"] = rule
         cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime() if accepted else None
 
@@ -547,11 +579,13 @@ def run_monthly_pipeline(
             window_end=int(t_current),
             cand_best_k=int(cand_k),
             cand_best_f1=float(cand_f1),
+            cand_best_lift_at_n=float(cand_lift_at_n),
             cand_is_accepted=bool(accepted),
             did_retrain=bool(did_retrain),
             did_score=bool(did_score),
             notes=(
                 f"accept_rule={rule}; "
+                f"Lift@{ranking_top_n}={cand_lift_at_n:.4f}x; "
                 f"mandatory={is_mandatory}; "
                 f"guardrail={'pass' if pass_guardrail else 'blocked'}; "
                 f"active_ratio={active_ratio:.2f}; "
@@ -578,6 +612,7 @@ def run_monthly_pipeline(
             window_end=int(t_current) if t_current is not None else None,
             cand_best_k=int(cand_cfg["best_k"]) if cand_cfg else None,
             cand_best_f1=float(cand_cfg["metric_f1_val"]) if cand_cfg else None,
+            cand_best_lift_at_n=float(cand_cfg["metric_lift_at_n"]) if cand_cfg else None,
             cand_is_accepted=bool(accepted) if accepted is not None else None,
             did_retrain=bool(did_retrain),
             did_score=bool(did_score),

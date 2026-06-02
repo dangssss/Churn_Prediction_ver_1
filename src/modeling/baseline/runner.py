@@ -21,6 +21,7 @@ from sklearn.metrics import (
 from preprocess.dataset import build_dataset_for_k, preflight_purged_train_val_for_k
 from preprocess.static_features import attach_static
 from infra.yymm import shift_yymm
+from common.metrics import ranking_metrics_at_n
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -270,6 +271,21 @@ def eval_one_k_train_val(
 
     pr_auc  = average_precision_score(y_va, va_prob)
     roc_auc = roc_auc_score(y_va, va_prob)
+    ranking_top_n = int(os.getenv("MODEL_RANKING_TOP_N", "5000"))
+    ranking = ranking_metrics_at_n(y_va.to_numpy(), va_prob, n=ranking_top_n)
+    logger.info(
+        "[RANKING METRICS] K=%d use_static=%s top_n=%d effective_n=%d "
+        "hits=%d precision=%.4f%% recall=%.2f%% lift=%.2fx prevalence=%.4f%%",
+        k,
+        use_static,
+        ranking["ranking_top_n"],
+        ranking["ranking_effective_n"],
+        ranking["hits_at_n"],
+        100.0 * ranking["precision_at_n"],
+        100.0 * ranking["recall_at_n"],
+        ranking["lift_at_n"],
+        100.0 * ranking["val_prevalence"],
+    )
 
     thr = best_threshold_by_f1(y_va.to_numpy(), va_prob)
     yhat = (va_prob >= thr).astype(int)
@@ -299,6 +315,7 @@ def eval_one_k_train_val(
         "n_cat": int(len(cat_cols)),
         "PR_AUC_val": float(pr_auc),
         "ROC_AUC_val": float(roc_auc),
+        **ranking,
         "best_threshold": float(thr),
         "precision": float(precision_score(y_va, yhat, zero_division=0)),
         "recall": float(recall_score(y_va, yhat, zero_division=0)),

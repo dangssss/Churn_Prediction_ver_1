@@ -31,9 +31,11 @@ def ensure_monitoring_schema(engine: Engine, schema: str = DEFAULT_SCHEMA) -> No
 
         prev_best_k       INT,
         prev_best_f1      DOUBLE PRECISION,
+        prev_best_lift_at_n DOUBLE PRECISION,
 
         cand_best_k       INT,
         cand_best_f1      DOUBLE PRECISION,
+        cand_best_lift_at_n DOUBLE PRECISION,
         cand_is_accepted  BOOLEAN,
 
         did_retrain       BOOLEAN,
@@ -146,6 +148,8 @@ def ensure_monitoring_schema(engine: Engine, schema: str = DEFAULT_SCHEMA) -> No
     ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS blocks_model_promotion BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS guardrail_reasons TEXT;
     ALTER TABLE {schema}.backtest ADD COLUMN IF NOT EXISTS recommended_action TEXT;
+    ALTER TABLE {schema}.churn_ops_runs ADD COLUMN IF NOT EXISTS prev_best_lift_at_n DOUBLE PRECISION;
+    ALTER TABLE {schema}.churn_ops_runs ADD COLUMN IF NOT EXISTS cand_best_lift_at_n DOUBLE PRECISION;
     """
     with engine.begin() as conn:
         for stmt in ddl.strip().split(";"):

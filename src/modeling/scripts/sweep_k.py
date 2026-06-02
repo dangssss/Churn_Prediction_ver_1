@@ -34,7 +34,7 @@ def main():
 
     # Optional: print top-10
     print("\nTOP-10 sweep results:")
-    cols = [c for c in ["k","use_static","val_month","f1","PR_AUC_val","best_threshold","spw_used"] if c in df_ab.columns]
+    cols = [c for c in ["K","use_static","val_month","ranking_top_n","hits_at_n","precision_at_n","recall_at_n","lift_at_n","f1","PR_AUC_val","best_threshold","spw_used"] if c in df_ab.columns]
     print(df_ab[cols].head(10).to_string(index=False))
 
 

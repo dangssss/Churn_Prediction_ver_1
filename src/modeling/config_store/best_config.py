@@ -20,6 +20,12 @@ def ensure_best_config_table(engine: Engine) -> None:
 
         metric_f1_val     DOUBLE PRECISION,
         metric_pr_auc_val DOUBLE PRECISION,
+        ranking_top_n     INT,
+        metric_hits_at_n  INT,
+        metric_precision_at_n DOUBLE PRECISION,
+        metric_recall_at_n DOUBLE PRECISION,
+        metric_lift_at_n  DOUBLE PRECISION,
+        metric_val_prevalence DOUBLE PRECISION,
         val_month         INT,
         target_month      INT,
 
@@ -29,6 +35,7 @@ def ensure_best_config_table(engine: Engine) -> None:
         -- production gating
         is_accepted       BOOLEAN NOT NULL DEFAULT TRUE,
         prev_accepted_f1  DOUBLE PRECISION,
+        prev_accepted_lift_at_n DOUBLE PRECISION,
         accept_rule       TEXT,
         accepted_at       TIMESTAMP,
         validation_label_source TEXT,
@@ -50,6 +57,27 @@ def ensure_best_config_table(engine: Engine) -> None:
 
     ALTER TABLE data_static.model_best_config
     ADD COLUMN IF NOT EXISTS prev_accepted_f1 DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS ranking_top_n INT;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_hits_at_n INT;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_precision_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_recall_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_lift_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_val_prevalence DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS prev_accepted_lift_at_n DOUBLE PRECISION;
 
     ALTER TABLE data_static.model_best_config
     ADD COLUMN IF NOT EXISTS accept_rule TEXT;
@@ -74,23 +102,40 @@ def upsert_best_config(engine: Engine, best_config: dict) -> None:
     best_config = dict(best_config)
     best_config.setdefault("validation_label_source", "unknown")
     best_config.setdefault("bundle_lifecycle", "PRODUCTION")
+    best_config.setdefault("ranking_top_n", 5000)
+    best_config.setdefault("metric_hits_at_n", None)
+    best_config.setdefault("metric_precision_at_n", None)
+    best_config.setdefault("metric_recall_at_n", None)
+    best_config.setdefault("metric_lift_at_n", None)
+    best_config.setdefault("metric_val_prevalence", None)
+    best_config.setdefault("prev_accepted_lift_at_n", None)
+    best_config.setdefault("is_accepted", True)
+    best_config.setdefault("prev_accepted_f1", None)
+    best_config.setdefault("accept_rule", "accepted_manual_upsert")
+    best_config.setdefault("accepted_at", None)
     upsert_sql = """
     INSERT INTO data_static.model_best_config (
         as_of_month, horizon,
         best_k, use_static,
         best_threshold, best_spw,
-        metric_f1_val, metric_pr_auc_val, val_month, target_month,
+        metric_f1_val, metric_pr_auc_val,
+        ranking_top_n, metric_hits_at_n, metric_precision_at_n,
+        metric_recall_at_n, metric_lift_at_n, metric_val_prevalence,
+        val_month, target_month,
         notes,
-        is_accepted, prev_accepted_f1, accept_rule, accepted_at,
+        is_accepted, prev_accepted_f1, prev_accepted_lift_at_n, accept_rule, accepted_at,
         validation_label_source, bundle_lifecycle
     )
     VALUES (
         :as_of_month, :horizon,
         :best_k, :use_static,
         :best_threshold, :best_spw,
-        :metric_f1_val, :metric_pr_auc_val, :val_month, :target_month,
+        :metric_f1_val, :metric_pr_auc_val,
+        :ranking_top_n, :metric_hits_at_n, :metric_precision_at_n,
+        :metric_recall_at_n, :metric_lift_at_n, :metric_val_prevalence,
+        :val_month, :target_month,
         :notes,
-        :is_accepted, :prev_accepted_f1, :accept_rule, :accepted_at,
+        :is_accepted, :prev_accepted_f1, :prev_accepted_lift_at_n, :accept_rule, :accepted_at,
         :validation_label_source, :bundle_lifecycle
     )
     ON CONFLICT (as_of_month, horizon) DO UPDATE SET
@@ -100,12 +145,19 @@ def upsert_best_config(engine: Engine, best_config: dict) -> None:
         best_spw=EXCLUDED.best_spw,
         metric_f1_val=EXCLUDED.metric_f1_val,
         metric_pr_auc_val=EXCLUDED.metric_pr_auc_val,
+        ranking_top_n=EXCLUDED.ranking_top_n,
+        metric_hits_at_n=EXCLUDED.metric_hits_at_n,
+        metric_precision_at_n=EXCLUDED.metric_precision_at_n,
+        metric_recall_at_n=EXCLUDED.metric_recall_at_n,
+        metric_lift_at_n=EXCLUDED.metric_lift_at_n,
+        metric_val_prevalence=EXCLUDED.metric_val_prevalence,
         val_month=EXCLUDED.val_month,
         target_month=EXCLUDED.target_month,
         created_at=now(),
         notes=EXCLUDED.notes,
         is_accepted=EXCLUDED.is_accepted,
         prev_accepted_f1=EXCLUDED.prev_accepted_f1,
+        prev_accepted_lift_at_n=EXCLUDED.prev_accepted_lift_at_n,
         accept_rule=EXCLUDED.accept_rule,
         accepted_at=EXCLUDED.accepted_at,
         validation_label_source=EXCLUDED.validation_label_source,
@@ -166,6 +218,21 @@ def ensure_main_columns(engine: Engine) -> None:
     ADD COLUMN IF NOT EXISTS main_ap_val DOUBLE PRECISION;
 
     ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS main_ranking_top_n INT;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS main_hits_at_n INT;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS main_precision_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS main_recall_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS main_lift_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
     ADD COLUMN IF NOT EXISTS model_type TEXT;
 
     -- early stopping meta
@@ -213,6 +280,11 @@ def update_main_metrics(engine: Engine, as_of_month: int, horizon: int, main_rep
     SET main_threshold = :main_thr,
         main_f1_val = :main_f1,
         main_ap_val = :main_ap,
+        main_ranking_top_n = :main_ranking_top_n,
+        main_hits_at_n = :main_hits_at_n,
+        main_precision_at_n = :main_precision_at_n,
+        main_recall_at_n = :main_recall_at_n,
+        main_lift_at_n = :main_lift_at_n,
         model_type = :model_type,
 
         xgb_best_iteration = :xgb_best_iteration,
@@ -233,6 +305,11 @@ def update_main_metrics(engine: Engine, as_of_month: int, horizon: int, main_rep
         "main_thr": float(main_report["thr_main_opt"]),
         "main_f1": float(main_report["f1@main_thr"]),
         "main_ap": float(main_report["AP_val"]),
+        "main_ranking_top_n": int(main_report["ranking_top_n"]),
+        "main_hits_at_n": int(main_report["hits_at_n"]),
+        "main_precision_at_n": float(main_report["precision_at_n"]),
+        "main_recall_at_n": float(main_report["recall_at_n"]),
+        "main_lift_at_n": float(main_report["lift_at_n"]),
         "model_type": "xgboost",
 
         "xgb_best_iteration": main_report.get("xgb_best_iteration"),
