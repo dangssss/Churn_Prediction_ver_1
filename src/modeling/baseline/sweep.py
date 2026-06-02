@@ -7,7 +7,7 @@ from sqlalchemy.engine import Engine
 from preprocess.feature_tables import list_k_available, max_window_end_for_k
 from infra.yymm import shift_yymm
 from preprocess.static_features import load_cus_lifetime_snapshots
-from preprocess.dataset import build_dataset_for_k, select_train_val_tables_for_k
+from preprocess.dataset import build_dataset_for_k, preflight_purged_train_val_for_k
 from baseline.runner import SparseChurnLabelsError, eval_one_k_train_val
 from logging_config import get_logger
 
@@ -34,7 +34,7 @@ def run_sweep_k(
     ablation = []
     for k in ks:
         try:
-            tables, _, _ = select_train_val_tables_for_k(
+            preflight_purged_train_val_for_k(
                 engine,
                 int(k),
                 horizon=int(horizon),
@@ -47,7 +47,6 @@ def run_sweep_k(
             int(k),
             horizon=int(horizon),
             limit_rows_each=limit_rows_each,
-            tables=tables,
         )
         for use_static in [False, True]:
             try:

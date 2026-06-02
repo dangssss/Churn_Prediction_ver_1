@@ -114,13 +114,13 @@ def _has_post_origin_activity_tables(
         )
 
 
-def select_train_val_tables_for_k(
+def preflight_purged_train_val_for_k(
     engine: Engine,
     k: int,
     *,
     horizon: int,
-) -> tuple[list[str], int, int]:
-    """Select only labeled train origins and one validation origin for a purged split."""
+) -> tuple[int, int]:
+    """Validate that a K candidate has train and validation origins after purging."""
     tables = list_tables_for_k(engine, int(k))
     if not tables:
         raise ValueError(f"No feature tables for K={k}")
@@ -145,11 +145,6 @@ def select_train_val_tables_for_k(
 
     val_month = max(actual_origins) if actual_origins else max(end for _, end in labelable)
     train_max_month = int(shift_yymm(str(val_month), -int(horizon)))
-    selected = [
-        table
-        for table, end in labelable
-        if end <= train_max_month or end == val_month
-    ]
     train_tables = [
         table
         for table, end in labelable
@@ -163,17 +158,16 @@ def select_train_val_tables_for_k(
 
     logger.info(
         "[PURGED PREFLIGHT] K=%d H=%d val_month=%d train_origin_max=%d "
-        "selected_tables=%d/%d train_tables=%d validation_source=%s",
+        "available_tables=%d train_tables=%d validation_source=%s",
         k,
         horizon,
         val_month,
         train_max_month,
-        len(selected),
         len(tables),
         len(train_tables),
         "actual" if actual_origins else "rule_based",
     )
-    return selected, val_month, train_max_month
+    return val_month, train_max_month
 
 
 def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 0.1, percentile_upper: float = 99.9) -> pd.DataFrame:
@@ -503,14 +497,8 @@ def build_labeled_pair(
     out["label_weight"] = float(os.getenv("RULE_LABEL_SAMPLE_WEIGHT", "0.20"))
     return out
 
-def build_dataset_for_k(
-    engine: Engine,
-    k: int,
-    horizon: int = 1,
-    limit_rows_each: Optional[int] = None,
-    tables: Optional[list[str]] = None,
-) -> pd.DataFrame:
-    tbls = list_tables_for_k(engine, k) if tables is None else list(tables)
+def build_dataset_for_k(engine: Engine, k: int, horizon: int = 1, limit_rows_each: Optional[int] = None) -> pd.DataFrame:
+    tbls = list_tables_for_k(engine, k)
     frames = []
     for t in tbls:
         df = build_labeled_pair(engine, k, t, horizon=horizon, limit=limit_rows_each)
