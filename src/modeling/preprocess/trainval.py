@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 from sqlalchemy.engine import Engine
 
-from .dataset import build_dataset_for_k
+from .dataset import build_dataset_for_k, select_train_val_tables_for_k
 from baseline.runner import time_split_train_val_last_month
 from .static_features import attach_static, LIFETIME_RATIO_REQUIRED_COLS
 
@@ -19,7 +19,8 @@ def build_train_val_for_main(
     use_static = use_static_cfg if use_static_override is None else bool(use_static_override)
     label_col = f"y_churn_t_plus_{h}"
 
-    df = build_dataset_for_k(engine, k, horizon=h, limit_rows_each=None)
+    tables, _, _ = select_train_val_tables_for_k(engine, k, horizon=h)
+    df = build_dataset_for_k(engine, k, horizon=h, limit_rows_each=None, tables=tables)
     if df is None or df.empty:
         raise ValueError(f"Dataset empty for K={k}, H={h}")
 

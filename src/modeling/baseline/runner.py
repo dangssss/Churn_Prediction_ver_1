@@ -18,7 +18,7 @@ from sklearn.metrics import (
     f1_score, precision_score, recall_score
 )
 
-from preprocess.dataset import build_dataset_for_k
+from preprocess.dataset import build_dataset_for_k, select_train_val_tables_for_k
 from preprocess.static_features import attach_static
 from infra.yymm import shift_yymm
 from logging_config import get_logger
@@ -131,7 +131,14 @@ def eval_one_k_train_val(
 ) -> Optional[Dict]:
     label_col = f"y_churn_t_plus_{horizon}"
     if df_k is None:
-        df_k = build_dataset_for_k(engine, k, horizon=horizon, limit_rows_each=limit_rows_each)
+        tables, _, _ = select_train_val_tables_for_k(engine, k, horizon=horizon)
+        df_k = build_dataset_for_k(
+            engine,
+            k,
+            horizon=horizon,
+            limit_rows_each=limit_rows_each,
+            tables=tables,
+        )
     if df_k.empty or label_col not in df_k.columns:
         return None
 
