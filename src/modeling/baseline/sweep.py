@@ -8,7 +8,7 @@ from preprocess.feature_tables import list_k_available, max_window_end_for_k
 from infra.yymm import shift_yymm
 from preprocess.static_features import load_cus_lifetime_snapshots
 from preprocess.dataset import build_dataset_for_k
-from baseline.runner import eval_one_k_train_val
+from baseline.runner import SparseChurnLabelsError, eval_one_k_train_val
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -40,15 +40,19 @@ def run_sweep_k(
             limit_rows_each=limit_rows_each,
         )
         for use_static in [False, True]:
-            out = eval_one_k_train_val(
-                engine,
-                k=int(k),
-                horizon=int(horizon),
-                use_static=bool(use_static),
-                df_static=df_static,
-                limit_rows_each=limit_rows_each,
-                df_k=df_k,
-            )
+            try:
+                out = eval_one_k_train_val(
+                    engine,
+                    k=int(k),
+                    horizon=int(horizon),
+                    use_static=bool(use_static),
+                    df_static=df_static,
+                    limit_rows_each=limit_rows_each,
+                    df_k=df_k,
+                )
+            except SparseChurnLabelsError as exc:
+                logger.warning("Skipping K=%d: %s", k, exc)
+                break
             if out is None:
                 continue
             if out.get('degenerate'):

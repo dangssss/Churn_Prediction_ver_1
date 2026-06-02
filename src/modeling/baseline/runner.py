@@ -25,6 +25,11 @@ from logging_config import get_logger
 
 logger = get_logger(__name__)
 
+
+class SparseChurnLabelsError(ValueError):
+    """Raised when a K candidate does not have enough positive labels to fit safely."""
+
+
 def select_feature_cols_mixed(df: pd.DataFrame, label_col: str):
     drop_cols = {
         "cms_code_enc", "window_size", "window_start", "window_end",
@@ -192,7 +197,7 @@ def eval_one_k_train_val(
     min_positive_rows = int(os.getenv("BASELINE_MIN_POSITIVE_ROWS", "500"))
     min_positive_rate = float(os.getenv("BASELINE_MIN_POSITIVE_RATE", "0.001"))
     if n_pos < min_positive_rows or churn_ratio < min_positive_rate:
-        raise ValueError(
+        raise SparseChurnLabelsError(
             "Baseline training aborted before fit: implausibly sparse churn labels "
             f"for K={k} (positive_rows={n_pos}, total_rows={n_pos + n_neg}, "
             f"positive_rate={churn_ratio:.6%}). "
