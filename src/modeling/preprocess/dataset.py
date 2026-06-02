@@ -136,35 +136,47 @@ def preflight_purged_train_val_for_k(
             horizon=int(horizon),
         )
         if has_actual or has_fallback:
-            labelable.append((table, int(end)))
+            labelable.append((table, int(end), "actual" if has_actual else "rule_based"))
         if has_actual:
             actual_origins.append(int(end))
 
     if not labelable:
         raise ValueError(f"No labelable feature tables for K={k}, H={horizon}")
 
-    val_month = max(actual_origins) if actual_origins else max(end for _, end in labelable)
+    val_month = max(actual_origins) if actual_origins else max(end for _, end, _ in labelable)
     train_max_month = int(shift_yymm(str(val_month), -int(horizon)))
     train_tables = [
         table
-        for table, end in labelable
+        for table, end, source in labelable
         if end <= train_max_month
+        or (actual_origins and source == "rule_based" and end > val_month)
     ]
-    if not train_tables:
+    min_train_origins = int(os.getenv("BASELINE_MIN_PURGED_TRAIN_ORIGINS", "2"))
+    train_origins = {
+        end
+        for _, end, source in labelable
+        if end <= train_max_month
+        or (actual_origins and source == "rule_based" and end > val_month)
+    }
+    if len(train_origins) < min_train_origins:
         raise ValueError(
-            f"No purged training origins for K={k}, H={horizon}: "
+            f"Insufficient purged training origins for K={k}, H={horizon}: "
+            f"origins={len(train_origins)}, required>={min_train_origins}, "
             f"val_month={val_month}, train_origin_max={train_max_month}"
         )
 
     logger.info(
         "[PURGED PREFLIGHT] K=%d H=%d val_month=%d train_origin_max=%d "
-        "available_tables=%d train_tables=%d validation_source=%s",
+        "available_tables=%d train_tables=%d train_origins=%d required_origins=%d "
+        "validation_source=%s",
         k,
         horizon,
         val_month,
         train_max_month,
         len(tables),
         len(train_tables),
+        len(train_origins),
+        min_train_origins,
         "actual" if actual_origins else "rule_based",
     )
     return val_month, train_max_month
