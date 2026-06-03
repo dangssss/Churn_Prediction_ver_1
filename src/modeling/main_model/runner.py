@@ -19,6 +19,7 @@ from common.metrics import (
     prf1_at_threshold,
     ranking_metrics_at_n,
 )
+from baseline.runner import auxiliary_rule_holdout, label_source_ranking_metrics
 
 from monitoring.drift import compute_feature_profile
 
@@ -103,7 +104,12 @@ def guardrail_sanity(df_tr, df_va, label_col: str, feat_cols: list, main_prob: n
 
     return rep
 
-def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict):
+def train_main_xgb_option_B(
+    df_tr: pd.DataFrame,
+    df_va: pd.DataFrame,
+    cfg: dict,
+    df_rule_aux: pd.DataFrame | None = None,
+):
     h = int(cfg["horizon"])
     label_col = f"y_churn_t_plus_{h}"
 
@@ -234,9 +240,50 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
     ap = average_precision_np(y_va, va_prob)
     ranking_top_n = int(cfg.get("ranking_top_n") or 5000)
     ranking = ranking_metrics_at_n(y_va, va_prob, n=ranking_top_n)
+    aux_prob = np.array([], dtype=float)
+    if df_rule_aux is not None and not df_rule_aux.empty:
+        X_aux = df_rule_aux[feat_cols].copy()
+        for c in date_cols:
+            X_aux[c] = date_col_to_ordinal(X_aux[c])
+        for c in cat_cols:
+            X_aux[c] = safe_to_category(X_aux[c])
+        for c in feat_cols:
+            if c not in cat_cols and c not in date_cols:
+                X_aux[c] = pd.to_numeric(X_aux[c], errors="coerce")
+
+        if used_mode == "native_categorical":
+            X_aux_s = X_aux.rename(columns=feature_name_map)
+            aux_prob = predict_proba_best_iteration(model, X_aux_s)[:, 1]
+        else:
+            _, X_aux_oh, _ = onehot_align_train_val(X_tr, X_aux, cat_cols=cat_cols)
+            aux_prob = predict_proba_best_iteration(model, X_aux_oh)[:, 1]
+        logger.info(
+            "[MAIN AUX RULE HOLDOUT] rows=%d origins=%s",
+            len(df_rule_aux),
+            sorted(df_rule_aux["window_end"].astype(int).unique()),
+        )
+    eval_df = (
+        pd.concat([df_va, df_rule_aux], axis=0, ignore_index=True)
+        if df_rule_aux is not None and not df_rule_aux.empty
+        else df_va.reset_index(drop=True)
+    )
+    eval_prob = np.concatenate([va_prob, aux_prob]) if len(aux_prob) else va_prob
+    source_ranking = label_source_ranking_metrics(
+        eval_df,
+        eval_prob,
+        label_col=label_col,
+        ranking_top_n=ranking_top_n,
+    )
+    primary_sources = (
+        sorted(df_va["label_source"].dropna().astype(str).unique())
+        if "label_source" in df_va.columns
+        else []
+    )
+    primary_label_source = "actual" if primary_sources == ["actual"] else "rule_based"
     logger.info(
-        "[MAIN RANKING METRICS] top_n=%d effective_n=%d hits=%d "
+        "[MAIN RANKING METRICS][PRIMARY %s] top_n=%d effective_n=%d hits=%d "
         "precision=%.4f%% recall=%.2f%% lift=%.2fx prevalence=%.4f%%",
+        primary_label_source.upper(),
         ranking["ranking_top_n"],
         ranking["ranking_effective_n"],
         ranking["hits_at_n"],
@@ -244,6 +291,29 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
         100.0 * ranking["recall_at_n"],
         ranking["lift_at_n"],
         100.0 * ranking["val_prevalence"],
+    )
+    if "rule_lift_at_n" in source_ranking:
+        logger.info(
+            "[MAIN RANKING METRICS][AUX RULE] top_n=%d effective_n=%d hits=%d "
+            "precision=%.4f%% recall=%.2f%% lift=%.2fx prevalence=%.4f%%",
+            source_ranking["rule_ranking_top_n"],
+            source_ranking["rule_ranking_effective_n"],
+            source_ranking["rule_hits_at_n"],
+            100.0 * source_ranking["rule_precision_at_n"],
+            100.0 * source_ranking["rule_recall_at_n"],
+            source_ranking["rule_lift_at_n"],
+            100.0 * source_ranking["rule_val_prevalence"],
+        )
+    logger.info(
+        "[MAIN RANKING METRICS][WEIGHTED COMBINED] top_n=%d effective_n=%d "
+        "weighted_hits=%.2f precision=%.4f%% recall=%.2f%% lift=%.2fx prevalence=%.4f%%",
+        source_ranking["combined_weighted_ranking_top_n"],
+        source_ranking["combined_weighted_ranking_effective_n"],
+        source_ranking["combined_weighted_hits_at_n"],
+        100.0 * source_ranking["combined_weighted_precision_at_n"],
+        100.0 * source_ranking["combined_weighted_recall_at_n"],
+        source_ranking["combined_weighted_lift_at_n"],
+        100.0 * source_ranking["combined_weighted_val_prevalence"],
     )
     
     # Calculate confusion matrix at optimal threshold
@@ -307,6 +377,7 @@ def train_main_xgb_option_B(df_tr: pd.DataFrame, df_va: pd.DataFrame, cfg: dict)
 
         "AP_val": float(ap),
         **ranking,
+        **source_ranking,
 
         "xgb_es_rounds": int(es_rounds),
         "xgb_best_iteration": int(best_it) if best_it is not None else None,
@@ -339,9 +410,15 @@ def run_main_variant(engine, cfg: dict, df_static: pd.DataFrame, use_static_flag
     )
     cfg_tmp = dict(cfg)
     cfg_tmp["use_static"] = bool(use_static_flag)
+    df_rule_aux = auxiliary_rule_holdout(df_all, int(val_month_main), time_col="window_end")
 
     try:
-        model, report, feat_cols, cat_cols, fmap, date_cols = train_main_xgb_option_B(df_tr, df_va, cfg_tmp)
+        model, report, feat_cols, cat_cols, fmap, date_cols = train_main_xgb_option_B(
+            df_tr,
+            df_va,
+            cfg_tmp,
+            df_rule_aux=df_rule_aux,
+        )
     except ValueError as e:
         logger.warning("Variant K=%d use_static=%s rejected: %s",
                        cfg['best_k'], use_static_flag, e)

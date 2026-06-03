@@ -70,12 +70,18 @@ def run_sweep_k(
             ablation.append(out)
             logger.info(
                 "K=%d | use_static=%s | val=%s | Lift@%d=%.2fx | "
-                "Precision@%d=%.4f%% | Recall@%d=%.2f%% | hits=%d | F1=%.4f | PR_AUC=%.4f",
+                "Precision@%d=%.4f%% | Recall@%d=%.2f%% | hits=%d | "
+                "RuleLift@%d=%s | WeightedCombinedLift@%d=%.2fx | F1=%.4f | PR_AUC=%.4f",
                 k, use_static, out.get("val_month"),
                 out["ranking_top_n"], out["lift_at_n"],
                 out["ranking_top_n"], 100.0 * out["precision_at_n"],
                 out["ranking_top_n"], 100.0 * out["recall_at_n"],
-                out["hits_at_n"], out["f1"], out["PR_AUC_val"],
+                out["hits_at_n"],
+                out["ranking_top_n"],
+                f"{out['rule_lift_at_n']:.2f}x" if "rule_lift_at_n" in out else "n/a",
+                out["ranking_top_n"],
+                out.get("combined_weighted_lift_at_n", 0.0),
+                out["f1"], out["PR_AUC_val"],
             )
 
     if not ablation:
@@ -115,6 +121,18 @@ def run_sweep_k(
         "metric_recall_at_n": float(df_ab.iloc[0]["recall_at_n"]),
         "metric_lift_at_n": float(df_ab.iloc[0]["lift_at_n"]),
         "metric_val_prevalence": float(df_ab.iloc[0]["val_prevalence"]),
+        "metric_actual_hits_at_n": int(df_ab.iloc[0].get("actual_hits_at_n", df_ab.iloc[0]["hits_at_n"])),
+        "metric_actual_precision_at_n": float(df_ab.iloc[0].get("actual_precision_at_n", df_ab.iloc[0]["precision_at_n"])),
+        "metric_actual_recall_at_n": float(df_ab.iloc[0].get("actual_recall_at_n", df_ab.iloc[0]["recall_at_n"])),
+        "metric_actual_lift_at_n": float(df_ab.iloc[0].get("actual_lift_at_n", df_ab.iloc[0]["lift_at_n"])),
+        "metric_rule_hits_at_n": None if pd.isna(df_ab.iloc[0].get("rule_hits_at_n")) else int(df_ab.iloc[0].get("rule_hits_at_n")),
+        "metric_rule_precision_at_n": None if pd.isna(df_ab.iloc[0].get("rule_precision_at_n")) else float(df_ab.iloc[0].get("rule_precision_at_n")),
+        "metric_rule_recall_at_n": None if pd.isna(df_ab.iloc[0].get("rule_recall_at_n")) else float(df_ab.iloc[0].get("rule_recall_at_n")),
+        "metric_rule_lift_at_n": None if pd.isna(df_ab.iloc[0].get("rule_lift_at_n")) else float(df_ab.iloc[0].get("rule_lift_at_n")),
+        "metric_combined_weighted_hits_at_n": float(df_ab.iloc[0].get("combined_weighted_hits_at_n", df_ab.iloc[0]["hits_at_n"])),
+        "metric_combined_weighted_precision_at_n": float(df_ab.iloc[0].get("combined_weighted_precision_at_n", df_ab.iloc[0]["precision_at_n"])),
+        "metric_combined_weighted_recall_at_n": float(df_ab.iloc[0].get("combined_weighted_recall_at_n", df_ab.iloc[0]["recall_at_n"])),
+        "metric_combined_weighted_lift_at_n": float(df_ab.iloc[0].get("combined_weighted_lift_at_n", df_ab.iloc[0]["lift_at_n"])),
         "val_month": int(df_ab.iloc[0]["val_month"]),
         "validation_label_source": str(df_ab.iloc[0]["validation_label_source"]),
         "bundle_lifecycle": str(df_ab.iloc[0]["bundle_lifecycle"]),

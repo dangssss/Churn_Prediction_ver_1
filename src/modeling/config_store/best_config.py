@@ -26,6 +26,18 @@ def ensure_best_config_table(engine: Engine) -> None:
         metric_recall_at_n DOUBLE PRECISION,
         metric_lift_at_n  DOUBLE PRECISION,
         metric_val_prevalence DOUBLE PRECISION,
+        metric_actual_hits_at_n INT,
+        metric_actual_precision_at_n DOUBLE PRECISION,
+        metric_actual_recall_at_n DOUBLE PRECISION,
+        metric_actual_lift_at_n DOUBLE PRECISION,
+        metric_rule_hits_at_n INT,
+        metric_rule_precision_at_n DOUBLE PRECISION,
+        metric_rule_recall_at_n DOUBLE PRECISION,
+        metric_rule_lift_at_n DOUBLE PRECISION,
+        metric_combined_weighted_hits_at_n DOUBLE PRECISION,
+        metric_combined_weighted_precision_at_n DOUBLE PRECISION,
+        metric_combined_weighted_recall_at_n DOUBLE PRECISION,
+        metric_combined_weighted_lift_at_n DOUBLE PRECISION,
         val_month         INT,
         target_month      INT,
 
@@ -77,6 +89,42 @@ def ensure_best_config_table(engine: Engine) -> None:
     ADD COLUMN IF NOT EXISTS metric_val_prevalence DOUBLE PRECISION;
 
     ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_actual_hits_at_n INT;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_actual_precision_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_actual_recall_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_actual_lift_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_rule_hits_at_n INT;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_rule_precision_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_rule_recall_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_rule_lift_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_combined_weighted_hits_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_combined_weighted_precision_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_combined_weighted_recall_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
+    ADD COLUMN IF NOT EXISTS metric_combined_weighted_lift_at_n DOUBLE PRECISION;
+
+    ALTER TABLE data_static.model_best_config
     ADD COLUMN IF NOT EXISTS prev_accepted_lift_at_n DOUBLE PRECISION;
 
     ALTER TABLE data_static.model_best_config
@@ -108,6 +156,18 @@ def upsert_best_config(engine: Engine, best_config: dict) -> None:
     best_config.setdefault("metric_recall_at_n", None)
     best_config.setdefault("metric_lift_at_n", None)
     best_config.setdefault("metric_val_prevalence", None)
+    best_config.setdefault("metric_actual_hits_at_n", best_config.get("metric_hits_at_n"))
+    best_config.setdefault("metric_actual_precision_at_n", best_config.get("metric_precision_at_n"))
+    best_config.setdefault("metric_actual_recall_at_n", best_config.get("metric_recall_at_n"))
+    best_config.setdefault("metric_actual_lift_at_n", best_config.get("metric_lift_at_n"))
+    best_config.setdefault("metric_rule_hits_at_n", None)
+    best_config.setdefault("metric_rule_precision_at_n", None)
+    best_config.setdefault("metric_rule_recall_at_n", None)
+    best_config.setdefault("metric_rule_lift_at_n", None)
+    best_config.setdefault("metric_combined_weighted_hits_at_n", best_config.get("metric_hits_at_n"))
+    best_config.setdefault("metric_combined_weighted_precision_at_n", best_config.get("metric_precision_at_n"))
+    best_config.setdefault("metric_combined_weighted_recall_at_n", best_config.get("metric_recall_at_n"))
+    best_config.setdefault("metric_combined_weighted_lift_at_n", best_config.get("metric_lift_at_n"))
     best_config.setdefault("prev_accepted_lift_at_n", None)
     best_config.setdefault("is_accepted", True)
     best_config.setdefault("prev_accepted_f1", None)
@@ -121,6 +181,12 @@ def upsert_best_config(engine: Engine, best_config: dict) -> None:
         metric_f1_val, metric_pr_auc_val,
         ranking_top_n, metric_hits_at_n, metric_precision_at_n,
         metric_recall_at_n, metric_lift_at_n, metric_val_prevalence,
+        metric_actual_hits_at_n, metric_actual_precision_at_n,
+        metric_actual_recall_at_n, metric_actual_lift_at_n,
+        metric_rule_hits_at_n, metric_rule_precision_at_n,
+        metric_rule_recall_at_n, metric_rule_lift_at_n,
+        metric_combined_weighted_hits_at_n, metric_combined_weighted_precision_at_n,
+        metric_combined_weighted_recall_at_n, metric_combined_weighted_lift_at_n,
         val_month, target_month,
         notes,
         is_accepted, prev_accepted_f1, prev_accepted_lift_at_n, accept_rule, accepted_at,
@@ -133,6 +199,12 @@ def upsert_best_config(engine: Engine, best_config: dict) -> None:
         :metric_f1_val, :metric_pr_auc_val,
         :ranking_top_n, :metric_hits_at_n, :metric_precision_at_n,
         :metric_recall_at_n, :metric_lift_at_n, :metric_val_prevalence,
+        :metric_actual_hits_at_n, :metric_actual_precision_at_n,
+        :metric_actual_recall_at_n, :metric_actual_lift_at_n,
+        :metric_rule_hits_at_n, :metric_rule_precision_at_n,
+        :metric_rule_recall_at_n, :metric_rule_lift_at_n,
+        :metric_combined_weighted_hits_at_n, :metric_combined_weighted_precision_at_n,
+        :metric_combined_weighted_recall_at_n, :metric_combined_weighted_lift_at_n,
         :val_month, :target_month,
         :notes,
         :is_accepted, :prev_accepted_f1, :prev_accepted_lift_at_n, :accept_rule, :accepted_at,
@@ -151,6 +223,18 @@ def upsert_best_config(engine: Engine, best_config: dict) -> None:
         metric_recall_at_n=EXCLUDED.metric_recall_at_n,
         metric_lift_at_n=EXCLUDED.metric_lift_at_n,
         metric_val_prevalence=EXCLUDED.metric_val_prevalence,
+        metric_actual_hits_at_n=EXCLUDED.metric_actual_hits_at_n,
+        metric_actual_precision_at_n=EXCLUDED.metric_actual_precision_at_n,
+        metric_actual_recall_at_n=EXCLUDED.metric_actual_recall_at_n,
+        metric_actual_lift_at_n=EXCLUDED.metric_actual_lift_at_n,
+        metric_rule_hits_at_n=EXCLUDED.metric_rule_hits_at_n,
+        metric_rule_precision_at_n=EXCLUDED.metric_rule_precision_at_n,
+        metric_rule_recall_at_n=EXCLUDED.metric_rule_recall_at_n,
+        metric_rule_lift_at_n=EXCLUDED.metric_rule_lift_at_n,
+        metric_combined_weighted_hits_at_n=EXCLUDED.metric_combined_weighted_hits_at_n,
+        metric_combined_weighted_precision_at_n=EXCLUDED.metric_combined_weighted_precision_at_n,
+        metric_combined_weighted_recall_at_n=EXCLUDED.metric_combined_weighted_recall_at_n,
+        metric_combined_weighted_lift_at_n=EXCLUDED.metric_combined_weighted_lift_at_n,
         val_month=EXCLUDED.val_month,
         target_month=EXCLUDED.target_month,
         created_at=now(),

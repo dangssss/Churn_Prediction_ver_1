@@ -149,14 +149,12 @@ def preflight_purged_train_val_for_k(
         table
         for table, end, source in labelable
         if end <= train_max_month
-        or (actual_origins and source == "rule_based" and end > val_month)
     ]
     min_train_origins = int(os.getenv("BASELINE_MIN_PURGED_TRAIN_ORIGINS", "2"))
     train_origins = {
         end
         for _, end, source in labelable
         if end <= train_max_month
-        or (actual_origins and source == "rule_based" and end > val_month)
     }
     if len(train_origins) < min_train_origins:
         raise ValueError(
