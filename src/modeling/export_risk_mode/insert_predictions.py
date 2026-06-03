@@ -165,6 +165,264 @@ def _get_bucket(feature_name: str) -> int | None:
     return None
 
 
+REASON_SLOTS = 3
+
+
+def _num_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce").fillna(default)
+    return pd.Series(default, index=df.index, dtype="float64")
+
+
+def _avg_prev_3m_active(df: pd.DataFrame, base_col: str) -> pd.Series:
+    cols = [f"{base_col}_{i}m_ago" for i in [1, 2, 3]]
+    available = [c for c in cols if c in df.columns]
+    if not available:
+        return pd.Series(0.0, index=df.index, dtype="float64")
+    mat = df[available].apply(pd.to_numeric, errors="coerce")
+    return mat.where(mat > 0).mean(axis=1, skipna=True).fillna(0)
+
+
+def _safe_ratio_delta_pct(metric: float, baseline: float, *, decrease: bool = False) -> float | None:
+    if baseline <= 0:
+        return None
+    if decrease:
+        return float(1 - metric / baseline)
+    return float(metric / baseline - 1)
+
+
+def _candidate(
+    *,
+    priority: float,
+    code: str,
+    text: str,
+    metric: float,
+    baseline: float | None = None,
+    delta: float | None = None,
+    delta_pct: float | None = None,
+    severity: float | None = None,
+) -> dict:
+    if delta is None and baseline is not None:
+        delta = float(metric - baseline)
+    if severity is None:
+        severity = float(priority + max(delta_pct or 0.0, 0.0))
+    return {
+        "priority": float(priority),
+        "code": code,
+        "text": text,
+        "metric": None if pd.isna(metric) else float(metric),
+        "baseline": None if baseline is None or pd.isna(baseline) else float(baseline),
+        "delta": None if delta is None or pd.isna(delta) else float(delta),
+        "delta_pct": None if delta_pct is None or pd.isna(delta_pct) else float(delta_pct),
+        "severity": None if severity is None or pd.isna(severity) else float(severity),
+    }
+
+
+def _build_reason_candidates(
+    df: pd.DataFrame,
+    df_static: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[list[dict]], pd.Series]:
+    d = df.copy()
+
+    if "tenure" not in d.columns and "cms_code_enc" in d.columns and "tenure" in df_static.columns:
+        tenure_map = df_static[["cms_code_enc", "tenure"]].drop_duplicates("cms_code_enc")
+        d = d.merge(tenure_map, on="cms_code_enc", how="left")
+
+    item_last = _num_series(d, "item_last")
+    item_1m_ago = _num_series(d, "item_1m_ago")
+    complaint_last = _num_series(d, "complaint_last")
+    delay_last = _num_series(d, "delay_last")
+    nodone_last = _num_series(d, "nodone_last")
+    revenue_last = _num_series(d, "revenue_last")
+    cv_item = _num_series(d, "cv_item")
+    service_types = _num_series(d, "service_types_used")
+    service_types_prev = _num_series(d, "service_types_used_prev") if "service_types_used_prev" in d.columns else service_types
+    tenure = _num_series(d, "tenure", 999)
+
+    avg_item_3m = _avg_prev_3m_active(d, "item")
+    avg_complaint_3m = _avg_prev_3m_active(d, "complaint")
+    avg_delay_3m = _avg_prev_3m_active(d, "delay")
+    avg_nodone_3m = _avg_prev_3m_active(d, "nodone")
+    avg_revenue_3m = _avg_prev_3m_active(d, "revenue")
+
+    rpi_last = np.where(item_last > 0, revenue_last / item_last, 0)
+    rpi_3m = np.where(avg_item_3m > 0, avg_revenue_3m / avg_item_3m, 0)
+    active_mask = (item_last > 0) & (item_1m_ago > 0)
+
+    all_candidates: list[list[dict]] = []
+    for i in range(len(d)):
+        candidates: list[dict] = []
+        if not active_mask.iloc[i]:
+            all_candidates.append(candidates)
+            continue
+
+        metric = float(item_last.iloc[i])
+        baseline = float(avg_item_3m.iloc[i])
+        if baseline > 0 and metric < 0.6 * baseline:
+            delta_pct = _safe_ratio_delta_pct(metric, baseline, decrease=True)
+            candidates.append(_candidate(
+                priority=10,
+                code="item_drop",
+                text=f"Số bưu gửi tháng hiện tại thấp hơn {(delta_pct or 0) * 100:.0f}% so với trung bình 3 tháng liền trước",
+                metric=metric,
+                baseline=baseline,
+                delta_pct=delta_pct,
+            ))
+
+        metric = float(complaint_last.iloc[i])
+        baseline = float(avg_complaint_3m.iloc[i])
+        if baseline > 0 and metric > 1.15 * baseline:
+            delta_pct = _safe_ratio_delta_pct(metric, baseline)
+            candidates.append(_candidate(
+                priority=9,
+                code="complaint_increase",
+                text=f"Số lượng khiếu nại nhận được tăng {(delta_pct or 0) * 100:.0f}% so với trung bình 3 tháng liền trước",
+                metric=metric,
+                baseline=baseline,
+                delta_pct=delta_pct,
+            ))
+
+        metric = float(delay_last.iloc[i])
+        baseline = float(avg_delay_3m.iloc[i])
+        if baseline > 0 and metric > 1.15 * baseline:
+            delta_pct = _safe_ratio_delta_pct(metric, baseline)
+            candidates.append(_candidate(
+                priority=8,
+                code="delay_rate_increase",
+                text=f"Tỷ lệ số đơn giao muộn tăng {(delta_pct or 0) * 100:.0f}% so với trung bình 3 tháng liền trước",
+                metric=metric,
+                baseline=baseline,
+                delta_pct=delta_pct,
+            ))
+
+        metric = float(nodone_last.iloc[i])
+        baseline = float(avg_nodone_3m.iloc[i])
+        if baseline > 0 and metric > 1.15 * baseline:
+            delta_pct = _safe_ratio_delta_pct(metric, baseline)
+            candidates.append(_candidate(
+                priority=7,
+                code="nodone_rate_increase",
+                text=f"Tỷ lệ số đơn không hoàn thành tăng {(delta_pct or 0) * 100:.0f}% so với trung bình 3 tháng liền trước",
+                metric=metric,
+                baseline=baseline,
+                delta_pct=delta_pct,
+            ))
+
+        metric = float(cv_item.iloc[i])
+        if metric > 0.7:
+            candidates.append(_candidate(
+                priority=6,
+                code="volume_volatility",
+                text=f"Biến động số lượng bưu gửi cao (CV={metric:.2f})",
+                metric=metric,
+                baseline=0.7,
+                delta_pct=max(metric / 0.7 - 1, 0),
+            ))
+
+        metric = float(rpi_last[i])
+        baseline = float(rpi_3m[i])
+        if baseline > 0 and metric < baseline:
+            delta_pct = _safe_ratio_delta_pct(metric, baseline, decrease=True)
+            candidates.append(_candidate(
+                priority=5,
+                code="order_value_drop",
+                text=f"Giá trị đơn hàng trung bình giảm {(delta_pct or 0) * 100:.0f}% theo thời gian",
+                metric=metric,
+                baseline=baseline,
+                delta_pct=delta_pct,
+            ))
+
+        metric = float(service_types.iloc[i])
+        baseline = float(service_types_prev.iloc[i])
+        if baseline > 0 and metric < baseline:
+            delta_pct = _safe_ratio_delta_pct(metric, baseline, decrease=True)
+            candidates.append(_candidate(
+                priority=4,
+                code="service_diversity_drop",
+                text=f"Giảm đa dạng dịch vụ (giảm từ {int(baseline)} còn {int(metric)} loại)",
+                metric=metric,
+                baseline=baseline,
+                delta_pct=delta_pct,
+            ))
+
+        metric = float(tenure.iloc[i])
+        if metric < 6:
+            delta_pct = _safe_ratio_delta_pct(metric, 6, decrease=True)
+            candidates.append(_candidate(
+                priority=3,
+                code="low_tenure",
+                text=f"Khách hàng mới, mức độ gắn bó thấp ({int(metric)} tháng)",
+                metric=metric,
+                baseline=6,
+                delta_pct=delta_pct,
+            ))
+
+        candidates.sort(key=lambda r: (r["priority"], r["severity"] or 0.0), reverse=True)
+        all_candidates.append(candidates)
+
+    return d, all_candidates, active_mask
+
+
+def _assign_reason_columns(d: pd.DataFrame, ranked_reasons: list[list[dict]]) -> pd.DataFrame:
+    out = d.copy()
+    for slot in range(1, REASON_SLOTS + 1):
+        texts = []
+        codes = []
+        metrics = []
+        baselines = []
+        deltas = []
+        delta_pcts = []
+        severities = []
+        for reasons in ranked_reasons:
+            reason = reasons[slot - 1] if len(reasons) >= slot else None
+            texts.append(reason["text"] if reason else None)
+            codes.append(reason["code"] if reason else None)
+            metrics.append(reason["metric"] if reason else None)
+            baselines.append(reason["baseline"] if reason else None)
+            deltas.append(reason["delta"] if reason else None)
+            delta_pcts.append(reason["delta_pct"] if reason else None)
+            severities.append(reason["severity"] if reason else None)
+        out[f"reason_{slot}"] = texts
+        out[f"reason_{slot}_code"] = codes
+        out[f"reason_{slot}_metric"] = metrics
+        out[f"reason_{slot}_baseline"] = baselines
+        out[f"reason_{slot}_delta"] = deltas
+        out[f"reason_{slot}_delta_pct"] = delta_pcts
+        out[f"reason_{slot}_severity"] = severities
+    return out
+
+
+def _rank_reasons_by_buckets(candidates: list[dict], buckets: list[int]) -> list[dict]:
+    if not buckets:
+        return candidates[:REASON_SLOTS]
+    code_by_bucket = {
+        1: "item_drop",
+        2: "complaint_increase",
+        3: "delay_rate_increase",
+        4: "nodone_rate_increase",
+        5: "volume_volatility",
+        6: "order_value_drop",
+        7: "service_diversity_drop",
+        8: "low_tenure",
+    }
+    bucket_rank = {
+        code_by_bucket[bid]: idx
+        for idx, bid in enumerate(buckets)
+        if bid in code_by_bucket
+    }
+    ranked = sorted(
+        candidates,
+        key=lambda r: (
+            1 if r["code"] in bucket_rank else 0,
+            -bucket_rank.get(r["code"], 999),
+            r["priority"],
+            r["severity"] or 0.0,
+        ),
+        reverse=True,
+    )
+    return ranked[:REASON_SLOTS]
+
+
 def compute_shap_reasons(
     model,
     X_scored: pd.DataFrame,
@@ -229,6 +487,15 @@ def compute_shap_reasons(
         return compute_simple_reasons(df_with_raw, df_static), None
 
     # ---------- Render reason text giống compute_simple_reasons ----------
+    d, candidates, active_mask = _build_reason_candidates(df_with_raw, df_static)
+    ranked = [
+        _rank_reasons_by_buckets(row_candidates, top_buckets_per_row[i])
+        for i, row_candidates in enumerate(candidates)
+    ]
+    d = _assign_reason_columns(d, ranked)
+    d = d[active_mask].copy()
+    return d, df_shap_raw
+
     d = df_with_raw.copy()
 
     # Merge tenure từ static nếu chưa có
@@ -334,6 +601,11 @@ def compute_shap_reasons(
 
 
 def compute_simple_reasons(df: pd.DataFrame, df_static: pd.DataFrame) -> pd.DataFrame:
+    """Build business-rule reasons with CRM text plus structured evidence columns."""
+    d, candidates, active_mask = _build_reason_candidates(df, df_static)
+    ranked = [row[:REASON_SLOTS] for row in candidates]
+    d = _assign_reason_columns(d, ranked)
+    return d[active_mask].copy()
 
     """
     Tính reasons chi ti?t theo yêu c?u:
