@@ -49,6 +49,17 @@ def run_export_risk(
     bundle_path = Path(bundle_path)
     model, metadata = load_bundle(bundle_path)
     print(f"? Loaded model from {bundle_path}")
+    bundle_lifecycle = str(
+        (metadata or {}).get("bundle_lifecycle")
+        or (metadata or {}).get("cfg", {}).get("bundle_lifecycle")
+        or cfg.get("bundle_lifecycle")
+        or "PRODUCTION"
+    ).upper()
+    if bundle_lifecycle == "PROVISIONAL":
+        print(
+            "WARNING: Scoring uses a PROVISIONAL bundle validated with rule-based labels only. "
+            "Keep output under business review until actual-label validation promotes a PRODUCTION bundle."
+        )
 
     # [3/6] Load scoring feature table...
     print("\n[3/6] Load scoring feature table...")
@@ -161,6 +172,52 @@ def run_export_risk(
     num_customers = insert_predictions_to_risk_table(
         engine, df_pred, risk_threshold=risk_threshold, horizon=horizon
     )
+
+    # Store the scoring origin and K used by scoring-only for drift and later backtests.
+    try:
+        from monitoring.score import upsert_score_drift
+
+        upsert_score_drift(
+            engine,
+            window_end=int(month_used),
+            horizon=int(horizon),
+            best_k=int(k),
+            active_cnt=int(len(df_active)),
+            churned_now_cnt=int(
+                pd.to_numeric(
+                    df_raw.get("is_churned_now", pd.Series(0, index=df_raw.index)),
+                    errors="coerce",
+                )
+                .fillna(0)
+                .sum()
+            ),
+            scores=scores,
+            risk_threshold_pct=int(risk_threshold),
+            risk_cnt=int(num_customers),
+        )
+    except Exception as score_drift_error:
+        print(f"? WARNING: Score drift monitoring skipped: {score_drift_error}")
+
+    # Evaluate previously stored prediction origins only when complete actual labels exist.
+    # Backtest monitoring must never block the business scoring export.
+    try:
+        from monitoring.backtest import run_backtests_for_available_actual_labels
+
+        backtests = run_backtests_for_available_actual_labels(
+            engine,
+            horizon=int(horizon),
+            risk_threshold_pct=int(risk_threshold),
+        )
+        if backtests:
+            latest_backtest = backtests[-1]
+            print(
+                "? Backtest updated: "
+                f"origin={latest_backtest['pred_window_end']} "
+                f"status={latest_backtest['guardrail_status']} "
+                f"action={latest_backtest['recommended_action']}"
+            )
+    except Exception as backtest_error:
+        print(f"? WARNING: Backtest monitoring skipped: {backtest_error}")
 
     df_ins = df_pred[df_pred.get('churn_rate', 0) >= float(risk_threshold)].copy()
     num_with_reasons = int(df_ins['reason_1'].notna().sum()) if 'reason_1' in df_ins.columns else 0

@@ -1,32 +1,29 @@
 from __future__ import annotations
 
 from airflow import DAG
+from airflow.providers.standard.operators.bash import BashOperator
 from pendulum import datetime
 
 with DAG(
-    dag_id="ds_churn_model_monthly",
+    dag_id="ds_churn_model_retrain",
+    description="Retrain gate: Monday after the weekly pipeline, every 3 accepted months or drift ALERT",
     start_date=datetime(2026, 1, 1, tz="Asia/Ho_Chi_Minh"),
-    schedule=None,          # chỉ chạy khi features trigger
+    schedule="0 1 * * 1",
     catchup=False,
     max_active_runs=1,
     default_args={"retries": 0},
-    tags=["ds_churn", "model"],
+    tags=["ds_churn", "model", "retrain"],
 ) as dag:
-
-    from airflow.operators.bash import BashOperator
-
-    # Run model training locally
-    # Assumes code is at /churn_source/modeling/main.py
-    # Note: bundle-dir default is now handled in python code -> src.config.paths.CHURN_MODEL_DIR/bundles/latest
-    # But we can override if needed.
-    run_monthly_churn = BashOperator(
-        task_id="run_monthly_churn",
-        bash_command="cd /churn_source && python modeling/main.py run-monthly --horizon 2 --risk-threshold-pct 95",
+    run_retrain_if_due = BashOperator(
+        task_id="run_retrain_if_due",
+        bash_command=(
+            "python /churn_source/modeling/ops_lock.py --skip-if-busy -- "
+            "bash -lc 'cd /churn_source && python modeling/main.py retrain-if-due --horizon 2'"
+        ),
         env={
-            "TZ": "Asia/Ho_Chi_Minh", 
+            "TZ": "Asia/Ho_Chi_Minh",
             "PYTHONUNBUFFERED": "1",
-            "PYTHONPATH": "/churn_source/modeling", # Ensure imports work
-            # DB Connection is loaded from .env or airflow connection
+            "PYTHONPATH": "/churn_source/modeling",
         },
         append_env=True,
     )

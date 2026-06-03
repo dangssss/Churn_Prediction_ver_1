@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+import os
 from typing import Optional
 
 import numpy as np
@@ -16,61 +16,223 @@ from .feature_tables import (
     list_tables_for_k,
 )
 from .gating import apply_gate
+from .label_tables import LABEL_SCHEMA, estimate_observed_label_rate, label_tables_for_horizon, load_label_keys
+from logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+
+def _load_post_origin_activity(
+    engine: Engine,
+    df_origin: pd.DataFrame,
+    *,
+    origin_yymm: str,
+    horizon: int,
+) -> tuple[pd.DataFrame, str]:
+    """Build fallback outcome signals strictly from raw order months t+1..t+h."""
+    from sqlalchemy import text
+    from .gating import resolve_now_cols
+
+    future_yymms = [shift_yymm(origin_yymm, offset) for offset in range(1, horizon + 1)]
+    future_tables = [f"bccp_orderitem_{yymm}" for yymm in future_yymms]
+    with engine.connect() as conn:
+        for table in future_tables:
+            exists = conn.execute(
+                text("SELECT to_regclass(:table_name)"),
+                {"table_name": f"public.{table}"},
+            ).scalar()
+            if exists is None:
+                logger.info(
+                    "Censor fallback origin=%s: missing required post-origin table public.%s",
+                    origin_yymm,
+                    table,
+                )
+                return pd.DataFrame(), ""
+
+    origin_cols = resolve_now_cols(df_origin)
+    origin = df_origin[["cms_code_enc"]].copy()
+    origin["cms_code_enc"] = origin["cms_code_enc"].astype(str).str.strip()
+    origin["origin_item"] = pd.to_numeric(
+        df_origin[origin_cols["item_now"]], errors="coerce"
+    ).fillna(0)
+    origin["origin_revenue"] = pd.to_numeric(
+        df_origin[origin_cols["rev_now"]], errors="coerce"
+    ).fillna(0)
+    origin = origin.drop_duplicates("cms_code_enc")
+
+    monthly_frames = []
+    for table in future_tables:
+        query = text(
+            f"""
+            SELECT cms_code_enc,
+                   COUNT(*)::bigint AS item_count,
+                   COALESCE(SUM(total_fee), 0)::double precision AS revenue
+            FROM public."{table}"
+            WHERE cms_code_enc IS NOT NULL
+            GROUP BY cms_code_enc
+            """
+        )
+        frame = pd.read_sql(query, engine)
+        frame["cms_code_enc"] = frame["cms_code_enc"].astype(str).str.strip()
+        monthly_frames.append(frame)
+
+    activity = pd.concat(monthly_frames, ignore_index=True)
+    activity = (
+        activity.groupby("cms_code_enc", as_index=False)
+        .agg(item_count=("item_count", "sum"), revenue=("revenue", "sum"))
+    )
+    out = origin.merge(activity, on="cms_code_enc", how="left")
+    out[["item_count", "revenue"]] = out[["item_count", "revenue"]].fillna(0)
+    out["item_last"] = out["item_count"] / max(int(horizon), 1)
+    out["revenue_last"] = out["revenue"] / max(int(horizon), 1)
+    out["frequency"] = out["origin_item"]
+    out["monetary"] = out["origin_revenue"]
+    out["item_1m_ago"] = out["origin_item"]
+    out["revenue_1m_ago"] = out["origin_revenue"]
+    out["revenue_slope"] = out["revenue_last"] - out["origin_revenue"]
+    return out, ",".join(f"public.{table}" for table in future_tables)
+
+
+def _has_post_origin_activity_tables(
+    engine: Engine,
+    *,
+    origin_yymm: str | int,
+    horizon: int,
+) -> bool:
+    """Return whether raw order tables exist for every required future month."""
+    from sqlalchemy import text
+
+    future_yymms = [shift_yymm(origin_yymm, offset) for offset in range(1, int(horizon) + 1)]
+    with engine.connect() as conn:
+        return all(
+            conn.execute(
+                text("SELECT to_regclass(:table_name)"),
+                {"table_name": f"public.bccp_orderitem_{yymm}"},
+            ).scalar()
+            is not None
+            for yymm in future_yymms
+        )
+
+
+def preflight_purged_train_val_for_k(
+    engine: Engine,
+    k: int,
+    *,
+    horizon: int,
+) -> tuple[int, int]:
+    """Validate that a K candidate has train and validation origins after purging."""
+    tables = list_tables_for_k(engine, int(k))
+    if not tables:
+        raise ValueError(f"No feature tables for K={k}")
+
+    labelable = []
+    actual_origins = []
+    for table in tables:
+        _, _, end = parse_feature_table_name(table)
+        has_actual = bool(label_tables_for_horizon(engine, end, int(horizon)))
+        has_fallback = False if has_actual else _has_post_origin_activity_tables(
+            engine,
+            origin_yymm=end,
+            horizon=int(horizon),
+        )
+        if has_actual or has_fallback:
+            labelable.append((table, int(end), "actual" if has_actual else "rule_based"))
+        if has_actual:
+            actual_origins.append(int(end))
+
+    if not labelable:
+        raise ValueError(f"No labelable feature tables for K={k}, H={horizon}")
+
+    val_month = max(actual_origins) if actual_origins else max(end for _, end, _ in labelable)
+    train_max_month = int(shift_yymm(str(val_month), -int(horizon)))
+    train_tables = [
+        table
+        for table, end, source in labelable
+        if end <= train_max_month
+    ]
+    min_train_origins = int(os.getenv("BASELINE_MIN_PURGED_TRAIN_ORIGINS", "2"))
+    train_origins = {
+        end
+        for _, end, source in labelable
+        if end <= train_max_month
+    }
+    if len(train_origins) < min_train_origins:
+        raise ValueError(
+            f"Insufficient purged training origins for K={k}, H={horizon}: "
+            f"origins={len(train_origins)}, required>={min_train_origins}, "
+            f"val_month={val_month}, train_origin_max={train_max_month}"
+        )
+
+    logger.info(
+        "[PURGED PREFLIGHT] K=%d H=%d val_month=%d train_origin_max=%d "
+        "available_tables=%d train_tables=%d train_origins=%d required_origins=%d "
+        "validation_source=%s",
+        k,
+        horizon,
+        val_month,
+        train_max_month,
+        len(tables),
+        len(train_tables),
+        len(train_origins),
+        min_train_origins,
+        "actual" if actual_origins else "rule_based",
+    )
+    return val_month, train_max_month
+
 
 def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 0.1, percentile_upper: float = 99.9) -> pd.DataFrame:
     df_clipped = df.copy()
     outlier_summary = []
-    
-    # Bỏ qua các cột metadata và nhãn
-    skip_cols = {"cms_code_enc", "window_size", "window_start", "window_end", 
-                 "source_table_t", "source_table_t_plus_h", 
-                 "is_active_now", "is_churned_now", "gate_group"}
-    
+
+    # Bá» qua cÃ¡c cá»™t metadata vÃ  nhÃ£n
+    skip_cols = {"cms_code_enc", "window_size", "window_start", "window_end",
+                 "source_table_t", "source_table_t_plus_h",
+                 "is_active_now", "is_churned_now", "gate_group",
+                 "label_source", "label_weight"}
+
     num_cols = []
     for c in df_clipped.columns:
         if c in skip_cols or c.startswith("y_churn_"):
             continue
         if pd.api.types.is_numeric_dtype(df_clipped[c]):
             num_cols.append(c)
-            
+
     for col in num_cols:
         vals = pd.to_numeric(df_clipped[col], errors='coerce')
         if vals.isna().all():
             continue
-            
+
         lower_bound = np.nanpercentile(vals, percentile_lower)
         upper_bound = np.nanpercentile(vals, percentile_upper)
-        
+
         if lower_bound == upper_bound:
             continue
-            
+
         v_max = vals.max()
         v_min = vals.min()
-        
+
         should_clip_high = False
         should_clip_low = False
-        
-        # Chỉ thực sự clip nếu giá trị max/min vượt quá xa ngưỡng 99.9% / 0.1% để tránh làm phẳng các cột thưa (sparse) hoặc nhị phân
+
+        # Chá»‰ thá»±c sá»± clip náº¿u giÃ¡ trá»‹ max/min vÆ°á»£t quÃ¡ xa ngÆ°á»¡ng 99.9% / 0.1% Ä‘á»ƒ trÃ¡nh lÃ m pháº³ng cÃ¡c cá»™t thÆ°a (sparse) hoáº·c nhá»‹ phÃ¢n
         if upper_bound > 0 and v_max > 5 * upper_bound:
             should_clip_high = True
-            
+
         if lower_bound < 0 and v_min < 5 * lower_bound:
             should_clip_low = True
-            
+
         clip_low = lower_bound if should_clip_low else v_min
         clip_high = upper_bound if should_clip_high else v_max
-        
+
         if clip_low == clip_high:
             continue
-            
+
         low_mask = vals < clip_low
         high_mask = vals > clip_high
-        
+
         low_count = low_mask.sum()
         high_count = high_mask.sum()
-        
+
         if low_count > 0 or high_count > 0:
             df_clipped[col] = vals.clip(clip_low, clip_high)
             outlier_summary.append({
@@ -80,14 +242,14 @@ def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 0.1, perce
                 "clip_low": clip_low,
                 "clip_high": clip_high
             })
-            
+
     if outlier_summary:
         logger.info(
-            "[OUTLIER DETECTION] Đã cắt ngoại lai cho %d cột có giá trị cực đại dị thường. Một số cột ví dụ: %s",
+            "[OUTLIER DETECTION] ÄÃ£ cáº¯t ngoáº¡i lai cho %d cá»™t cÃ³ giÃ¡ trá»‹ cá»±c Ä‘áº¡i dá»‹ thÆ°á»ng. Má»™t sá»‘ cá»™t vÃ­ dá»¥: %s",
             len(outlier_summary),
             ", ".join(f"{x['column']} (high_clip={x['clip_high']:.2f}, count={x['high_count']})" for x in outlier_summary[:5])
         )
-        
+
     return df_clipped
 
 def build_labeled_pair(
@@ -99,38 +261,88 @@ def build_labeled_pair(
 ) -> pd.DataFrame:
     kk, start, end = parse_feature_table_name(table_t)
     if kk != k:
-        raise ValueError("table_t không thuộc K")
+        raise ValueError("table_t khÃ´ng thuá»™c K")
 
-    t_plus_h = shift_yymm(end, horizon)
+    df_t = load_feature_table(engine, table_t, limit=limit)
 
-    # -------------------------------------------------------------------------
-    # SỬA LỖI LOGIC: Không dùng `k` để tìm bảng tương lai (table_tp), vì số lượng 
-    # cột lịch sử (item_1m_ago,...) sẽ thay đổi theo `k`, làm nhãn bị thay đổi.
-    # Giải pháp: Tìm bảng có end == t_plus_h và có K LỚN NHẤT để đảm bảo luôn 
-    # có đủ 3 tháng lịch sử tính nhãn (nhãn sẽ đồng nhất cho mọi vòng sweep K).
-    # -------------------------------------------------------------------------
-    from .feature_tables import list_feature_tables
-    all_tbls = list_feature_tables(engine)
-    future_cands = []
-    for t in all_tbls:
-        k_f, st_f, en_f = parse_feature_table_name(t)
-        if en_f == t_plus_h:
-            future_cands.append((k_f, t))
-            
-    if not future_cands:
-        return pd.DataFrame()  # censor window này (không có label tương lai)
-        
-    future_cands.sort(key=lambda x: x[0], reverse=True)
-    best_k_f, table_tp = future_cands[0]
+    label_tables = label_tables_for_horizon(engine, end, horizon)
+    if label_tables:
+        if "cms_code_enc" not in df_t.columns:
+            raise KeyError("Missing cms_code_enc to join label")
 
-    df_t  = load_feature_table(engine, table_t,  limit=limit)
-    df_tp = load_feature_table(engine, table_tp, limit=limit)
+        label_col = f"y_churn_t_plus_{horizon}"
+        d = df_t.copy()
+        d["cms_code_enc"] = d["cms_code_enc"].astype(str).str.strip()
+        labels = pd.concat(
+            [load_label_keys(engine, label_table) for label_table in label_tables],
+            ignore_index=True,
+        ).drop_duplicates()
+
+        cms_keys = set(labels["cms_code_enc"].dropna().astype(str))
+        crm_keys = set(labels["crm_code_enc"].dropna().astype(str))
+
+        matched = d["cms_code_enc"].isin(cms_keys)
+        if crm_keys:
+            if "crm_code_enc" in d.columns:
+                crm_series = d["crm_code_enc"].astype(str).str.strip()
+            else:
+                try:
+                    from sqlalchemy import text
+
+                    q = text("""
+                        SELECT cms_code_enc, crm_code_enc
+                        FROM public.cas_info
+                        WHERE crm_code_enc IS NOT NULL
+                    """)
+                    code_map = pd.read_sql(q, engine)
+                    code_map["cms_code_enc"] = code_map["cms_code_enc"].astype(str).str.strip()
+                    code_map["crm_code_enc"] = code_map["crm_code_enc"].astype(str).str.strip()
+                    code_map = code_map.drop_duplicates("cms_code_enc")
+                    crm_series = d[["cms_code_enc"]].merge(code_map, on="cms_code_enc", how="left")["crm_code_enc"].fillna("")
+                except Exception as exc:
+                    logger.warning("Could not load public.cas_info for crm_code_enc label matching: %s", exc)
+                    crm_series = pd.Series([""] * len(d), index=d.index)
+
+            matched = matched | crm_series.isin(crm_keys).to_numpy()
+
+        d[label_col] = matched.astype(int)
+        if "window_end" not in d.columns:
+            d["window_end"] = end
+        d["source_table_t"] = table_t
+        label_sources = ",".join(f"{LABEL_SCHEMA}.{label_table}" for label_table in label_tables)
+        d["source_table_t_plus_h"] = label_sources
+        d["label_source"] = "actual"
+        d["label_weight"] = 1.0
+
+        n_pos = int(d[label_col].sum())
+        logger.info(
+            "Generated %s from actual labels [%s] for window %s: Churn=%d (%.1f%%) | Active=%d | Total=%d",
+            label_col,
+            label_sources,
+            table_t,
+            n_pos,
+            100.0 * n_pos / max(len(d), 1),
+            len(d) - n_pos,
+            len(d),
+        )
+        return d
+
+    # Rule fallback uses raw order tables strictly after the prediction origin.
+    df_tp, table_tp = _load_post_origin_activity(
+        engine,
+        df_t,
+        origin_yymm=end,
+        horizon=horizon,
+    )
+
+    if df_tp.empty:
+        return pd.DataFrame()  # censor window nÃ y (khÃ´ng cÃ³ label tÆ°Æ¡ng lai)
 
     if "cms_code_enc" not in df_t.columns or "cms_code_enc" not in df_tp.columns:
-        raise KeyError("Thiếu cms_code_enc để join label")
+        raise KeyError("Thiáº¿u cms_code_enc Ä‘á»ƒ join label")
 
-    # ---------- Labeling đa tín hiệu (C0 OR C1 OR C2) ----------
-    # Tất cả tín hiệu tính từ df_tp (tháng t+h) — không leakage từ df_t
+    # ---------- Labeling Ä‘a tÃ­n hiá»‡u (C0 OR C1 OR C2) ----------
+    # Táº¥t cáº£ tÃ­n hiá»‡u tÃ­nh tá»« df_tp (thÃ¡ng t+h) â€” khÃ´ng leakage tá»« df_t
 
     from .gating import resolve_now_cols
     cols_tp = resolve_now_cols(df_tp)
@@ -140,10 +352,10 @@ def build_labeled_pair(
     item_tp = pd.to_numeric(df_tp[item_tp_col], errors="coerce").fillna(0)
     rev_tp  = pd.to_numeric(df_tp[rev_tp_col],  errors="coerce").fillna(0)
 
-    # C0: churn hoàn toàn (item=0 và revenue=0)
+    # C0: churn hoÃ n toÃ n (item=0 vÃ  revenue=0)
     c0 = (item_tp == 0) & (rev_tp == 0)
 
-    # Lấy các cột DE đã tính sẵn
+    # Láº¥y cÃ¡c cá»™t DE Ä‘Ã£ tÃ­nh sáºµn
     freq_tp = pd.to_numeric(df_tp.get("frequency", 0), errors="coerce").fillna(0)
     monetary_tp = pd.to_numeric(df_tp.get("monetary", 0), errors="coerce").fillna(0)
     rev_slope_tp = pd.to_numeric(df_tp.get("revenue_slope", 0), errors="coerce").fillna(0)
@@ -151,42 +363,34 @@ def build_labeled_pair(
     rev_1m = pd.to_numeric(df_tp.get("revenue_1m_ago", 0), errors="coerce").fillna(0)
     item_1m = pd.to_numeric(df_tp.get("item_1m_ago", 0), errors="coerce").fillna(0)
 
-    # FIX: freq_tp và monetary_tp là TỔNG của best_k_f tháng (window của bảng label).
-    # Phải chia cho best_k_f để ra mức BÌNH QUÂN 1 tháng trước khi so sánh với
-    # item_tp / rev_tp là giá trị của DUY NHẤT 1 tháng (tháng t+h).
-    # Nếu không normalize: khách hàng đều đặn bình thường cũng bị đánh nhầm là Churn.
-    k_months_label = max(int(best_k_f), 1)
-    avg_freq_per_month     = freq_tp     / k_months_label
-    avg_monetary_per_month = monetary_tp / k_months_label
-
-    # C1: Tần suất gửi hàng giảm mạnh (Giảm > 50% so với bình quân 1 tháng)
-    # HOẶC giảm > 50% so với tháng liền kề
-    c1_drop_avg = (avg_freq_per_month > 0) & (item_tp < 0.50 * avg_freq_per_month)
+    # C1: Táº§n suáº¥t gá»­i hÃ ng giáº£m máº¡nh (Giáº£m > 50% so vá»›i táº§n suáº¥t bÃ¬nh quÃ¢n frequency)
+    # HOáº¶C giáº£m > 50% so vá»›i thÃ¡ng liá»n ká»
+    c1_drop_avg = (freq_tp > 0) & (item_tp < 0.50 * freq_tp)
     c1_drop_1m  = (item_1m > 0) & (item_tp < 0.50 * item_1m)
     c1 = c1_drop_avg | c1_drop_1m
 
-    # C2: Doanh thu giảm mạnh (Giảm > 50% so với bình quân 1 tháng)
-    # HOẶC giảm > 50% so với tháng liền kề (revenue_1m_ago)
-    c2_drop_avg = (avg_monetary_per_month > 0) & (rev_tp < 0.50 * avg_monetary_per_month)
+    # C2: Doanh thu giáº£m máº¡nh (Giáº£m > 50% so vá»›i doanh thu bÃ¬nh quÃ¢n monetary)
+    # HOáº¶C giáº£m > 50% so vá»›i thÃ¡ng liá»n ká» (revenue_1m_ago)
+    c2_drop_avg = (monetary_tp > 0) & (rev_tp < 0.50 * monetary_tp)
     c2_drop_1m  = (rev_1m > 0) & (rev_tp < 0.50 * rev_1m)
     c2 = c2_drop_avg | c2_drop_1m
 
-    # C3: Xu hướng doanh thu cắm đầu (revenue_slope âm) kết hợp doanh thu tháng này thấp
-    # Dùng avg_monetary_per_month để so sánh cùng hệ quy chiếu 1 tháng
-    c3 = (rev_slope_tp < -1000) & (rev_tp < 0.80 * avg_monetary_per_month)
+    # C3: Xu hÆ°á»›ng doanh thu cáº¯m Ä‘áº§u (revenue_slope Ã¢m) káº¿t há»£p doanh thu thÃ¡ng nÃ y tháº¥p
+    # DÃ nh cho cÃ¡c khÃ¡ch hÃ ng rá»›t tá»« tá»« nhÆ°ng rÃµ rá»‡t
+    c3 = (rev_slope_tp < -1000) & (rev_tp < 0.80 * monetary_tp)
 
-    y = (c0 | c1 | c2 | c3).astype(int)
+    rule_y = (c0 | c1 | c2 | c3).astype(int)
 
     n_c0    = int(c0.sum())
     n_c1    = int(c1.sum())
     n_c2    = int(c2.sum())
     n_c3    = int(c3.sum())
-    n_total = len(y)
-    n_pos   = int(y.sum())
-    logger.info(
-        "Đã sinh nhãn y_churn_t_plus_%d từ %s (k_label=%d tháng): "
-        "Tổng Churn=%d (%.1f%%) | C0(hoàn toàn)=%d | C1(tần suất)=%d | C2(doanh thu)=%d | C3(slope)=%d | Active=%d | Total=%d",
-        horizon, table_tp, k_months_label,
+    n_total = len(rule_y)
+    n_pos   = int(rule_y.sum())
+    logger.debug(
+        "ÄÃ£ sinh nhÃ£n y_churn_t_plus_%d tá»« %s: "
+        "Tá»•ng Churn=%d (%.1f%%) | C0(hoÃ n toÃ n)=%d | C1(táº§n suáº¥t)=%d | C2(doanh thu)=%d | C3(slope)=%d | Active=%d | Total=%d",
+        horizon, table_tp,
         n_pos, 100.0 * n_pos / max(n_total, 1),
         n_c0, n_c1, n_c2, n_c3,
         n_total - n_pos, n_total,
@@ -195,17 +399,103 @@ def build_labeled_pair(
 
 
 
+    baseline_item = pd.concat([freq_tp, item_1m], axis=1).max(axis=1)
+    baseline_rev = pd.concat([monetary_tp, rev_1m], axis=1).max(axis=1)
+
+    item_drop = (1.0 - item_tp / baseline_item.replace(0, np.nan)).clip(lower=0, upper=1).fillna(0)
+    rev_drop = (1.0 - rev_tp / baseline_rev.replace(0, np.nan)).clip(lower=0, upper=1).fillna(0)
+    zero_activity = ((item_tp == 0) & (rev_tp == 0)).astype(float)
+
+    neg_slope = (-rev_slope_tp).clip(lower=0)
+    slope_score = pd.Series(0.0, index=df_tp.index)
+    if float(neg_slope.max()) > 0:
+        slope_score = (neg_slope.rank(pct=True) * (neg_slope > 0)).astype(float)
+
+    baseline_strength = (
+        baseline_item.rank(pct=True).fillna(0) * 0.5
+        + baseline_rev.rank(pct=True).fillna(0) * 0.5
+    )
+    eligible = (baseline_item > 0) | (baseline_rev > 0)
+
+    risk_score = (
+        0.35 * item_drop
+        + 0.35 * rev_drop
+        + 0.20 * zero_activity
+        + 0.10 * slope_score
+    ) * baseline_strength
+    risk_score = risk_score.where(eligible, np.nan)
+
+    target_rate_env = os.getenv("RULE_LABEL_TARGET_CHURN_RATE")
+    target_source = "observed_label_rate"
+    if target_rate_env:
+        target_rate = float(target_rate_env)
+        target_source = "env_RULE_LABEL_TARGET_CHURN_RATE"
+    else:
+        target_rate = estimate_observed_label_rate(
+            engine,
+            horizon=horizon,
+            feature_schema=FEATURE_SCHEMA,
+        )
+        if target_rate is None:
+            target_rate = float(os.getenv("RULE_LABEL_FALLBACK_TARGET_CHURN_RATE", "0.15"))
+            target_source = "fallback_RULE_LABEL_FALLBACK_TARGET_CHURN_RATE"
+
+    uncertain_band = float(os.getenv("RULE_LABEL_UNCERTAIN_BAND_RATE", "0.20"))
+    target_rate = max(0.001, min(float(target_rate), 0.50))
+    uncertain_band = max(0.0, min(float(uncertain_band), 0.80))
+
+    scored = risk_score.dropna()
+    uncertain_mask = pd.Series(False, index=df_tp.index)
+    if scored.empty:
+        y = pd.Series(np.nan, index=df_tp.index, dtype="float64")
+        pos_cutoff = np.nan
+        neg_cutoff = np.nan
+    else:
+        pos_cutoff = float(scored.quantile(1.0 - target_rate))
+        neg_quantile = max(0.0, 1.0 - target_rate - uncertain_band)
+        neg_cutoff = float(scored.quantile(neg_quantile))
+
+        y = pd.Series(np.nan, index=df_tp.index, dtype="float64")
+        y.loc[risk_score <= neg_cutoff] = 0.0
+        y.loc[risk_score >= pos_cutoff] = 1.0
+        # Resolve the mid-band with explicit business rules instead of dropping it.
+        uncertain_mask = y.isna() & risk_score.notna()
+        y.loc[uncertain_mask] = rule_y.loc[uncertain_mask].astype(float)
+
+    n_pos = int((y == 1).sum())
+    n_neg = int((y == 0).sum())
+    n_uncertain = int(y.isna().sum())
+    n_rule_resolved = int(uncertain_mask.sum())
+    logger.info(
+        "Override fallback labels y_churn_t_plus_%d from %s using adaptive risk-score rules: "
+        "Churn=%d (%.1f%% of labeled) | Active=%d | Rule-resolved(mid-band)=%d | Unlabeled(drop)=%d | eligible=%d | total=%d | "
+        "target_rate=%.4f (%s) | positive_cutoff=%.6f | negative_cutoff=%.6f | uncertain_band=%.2f",
+        horizon, table_tp,
+        n_pos, 100.0 * n_pos / max(n_pos + n_neg, 1),
+        n_neg, n_rule_resolved, n_uncertain, int(eligible.sum()), len(y),
+        target_rate, target_source, pos_cutoff, neg_cutoff, uncertain_band,
+    )
+
     lab = df_tp[["cms_code_enc"]].copy()
     lab[f"y_churn_t_plus_{horizon}"] = y.values
 
     out = df_t.merge(lab, on="cms_code_enc", how="left")
 
-    # Khách hàng có ở tháng t nhưng biến mất khỏi bảng tương lai (t+h)
-    # Vì bảng t+h chỉ chứa khách hàng CÓ GIAO DỊCH trong window K đó,
-    # nên vắng mặt ở đây CHẮC CHẮN nghĩa là họ không mua gì -> C0 (Churn hoàn toàn).
+    # KhÃ¡ch hÃ ng cÃ³ á»Ÿ thÃ¡ng t nhÆ°ng KHÃ”NG xuáº¥t hiá»‡n trong báº£ng tÆ°Æ¡ng lai (t+h):
+    # KhÃ´ng thá»ƒ xÃ¡c Ä‘á»‹nh Ä‘Æ°á»£c nhÃ£n chÃ­nh xÃ¡c â€” báº£ng t+h chá»‰ chá»©a nhá»¯ng ngÆ°á»i
+    # cÃ³ GIAO Dá»ŠCH trong window K cá»§a t+h. Váº¯ng máº·t cÃ³ thá»ƒ do:
+    #   (a) Thá»±c sá»± churn (khÃ´ng giao dá»‹ch), hoáº·c
+    #   (b) Dá»¯ liá»‡u chÆ°a Ä‘Æ°á»£c ingest Ä‘á»§ cho window t+h (data lag).
+    # Äá»ƒ trÃ¡nh nhiá»…u nhÃ£n vÃ  inflate churn_ratio á»Ÿ K lá»›n â†’ LOáº I Bá»Ž khá»i training.
     missing_mask = out[f"y_churn_t_plus_{horizon}"].isna()
     if missing_mask.any():
-        out.loc[missing_mask, f"y_churn_t_plus_{horizon}"] = 1
+        n_dropped = int(missing_mask.sum())
+        logger.info(
+            "Loáº¡i bá» %d/%d khÃ¡ch hÃ ng khÃ´ng cÃ³ nhÃ£n trong báº£ng tÆ°Æ¡ng lai %s "
+            "(khÃ´ng thá»ƒ xÃ¡c Ä‘á»‹nh churn/active â€” trÃ¡nh inflate churn_ratio).",
+            n_dropped, len(out), table_tp,
+        )
+        out = out[~missing_mask].copy()
 
     # enforce window_end exists
     if "window_end" not in out.columns:
@@ -213,6 +503,8 @@ def build_labeled_pair(
 
     out["source_table_t"] = table_t
     out["source_table_t_plus_h"] = table_tp
+    out["label_source"] = "rule_based"
+    out["label_weight"] = float(os.getenv("RULE_LABEL_SAMPLE_WEIGHT", "0.20"))
     return out
 
 def build_dataset_for_k(engine: Engine, k: int, horizon: int = 1, limit_rows_each: Optional[int] = None) -> pd.DataFrame:
@@ -224,6 +516,25 @@ def build_dataset_for_k(engine: Engine, k: int, horizon: int = 1, limit_rows_eac
             frames.append(df)
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if not out.empty:
+        label_col = f"y_churn_t_plus_{horizon}"
+        if label_col in out.columns and "source_table_t_plus_h" in out.columns:
+            group_cols = ["source_table_t_plus_h"]
+            if "label_source" in out.columns:
+                group_cols.append("label_source")
+            audit = (
+                out.groupby(group_cols, dropna=False)[label_col]
+                .agg(total_rows="size", churn_rows="sum")
+                .reset_index()
+            )
+            audit["churn_rate_pct"] = (
+                100.0 * audit["churn_rows"] / audit["total_rows"].clip(lower=1)
+            )
+            logger.info(
+                "[LABEL AUDIT K=%d H=%d]\n%s",
+                k,
+                horizon,
+                audit.to_string(index=False),
+            )
         out = apply_gate(out)
         out = clip_and_log_outliers(out)
     return out

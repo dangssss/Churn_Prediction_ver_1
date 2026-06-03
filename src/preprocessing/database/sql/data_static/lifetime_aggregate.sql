@@ -40,7 +40,8 @@ WITH customer_agg AS (
         SUM(COALESCE(ser_l,0))::bigint AS ser_l,
         SUM(COALESCE(ser_q,0))::bigint AS ser_q
     FROM public.cas_customer
-    WHERE report_month >= DATE '{START_DATE}' 
+    WHERE report_month >= DATE '{START_DATE}'
+      AND report_month <= DATE '{END_DATE}'
     GROUP BY cms_code_enc
 ),
 
@@ -70,10 +71,11 @@ bccp_agg AS (
         (MODE() WITHIN GROUP (ORDER BY region))::varchar AS most_common_region
     FROM {BCCP_SRC}
     WHERE sending_time >= DATE '{START_DATE}'
+      AND sending_time < DATE '{END_DATE}' + INTERVAL '1 day'
     GROUP BY cms_code_enc
 )
 
-INSERT INTO data_static.cus_lifetime (
+INSERT INTO {TARGET_TABLE} (
     cms_code_enc, is_corporate,
     contract_classify, contract_service, custype, contract_sig_first, tenure, contract_mgr_org, cus_poscode, cus_province,
     lifetime_total_items, lifetime_total_revenue, lifetime_total_weight, lifetime_total_complaint,
@@ -91,10 +93,8 @@ SELECT
     COALESCE(i.contract_service, 62),
     COALESCE(i.custype, 1),
     COALESCE(i.contract_sig_first, date_trunc('month', ca.first_month))::timestamp,
-    COALESCE(i.tenure,
-        (EXTRACT(year from age(now(), COALESCE(i.contract_sig_first, date_trunc('month', ca.first_month))))*12 + 
-         EXTRACT(month from age(now(), COALESCE(i.contract_sig_first, date_trunc('month', ca.first_month)))))::int
-    ),
+    (EXTRACT(year from age(DATE '{END_DATE}', COALESCE(i.contract_sig_first, date_trunc('month', ca.first_month))))*12 +
+     EXTRACT(month from age(DATE '{END_DATE}', COALESCE(i.contract_sig_first, date_trunc('month', ca.first_month)))))::int,
     i.contract_mgr_org,
     i.cus_poscode,
     i.cus_province,

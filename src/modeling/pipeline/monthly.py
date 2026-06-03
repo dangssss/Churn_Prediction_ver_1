@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import traceback
 import pandas as pd
@@ -10,7 +11,7 @@ from sqlalchemy.engine import Engine
 from infra.yymm import shift_yymm
 from infra.db import smoke_test
 from preprocess.feature_tables import max_window_end_for_k
-from preprocess.static_features import load_cus_lifetime
+from preprocess.static_features import load_cus_lifetime_snapshots
 from baseline.sweep import run_sweep_k
 from config_store.best_config import (
     ensure_best_config_table,
@@ -20,6 +21,7 @@ from config_store.best_config import (
 )
 from scripts.train_main import main as _train_main_cli  # fallback
 from main_model.runner import run_main_variant
+from baseline.runner import train_baseline_model_for_config
 from common.artifacts import save_bundle, load_bundle
 
 from export_risk_mode.runner import run_export_risk_mode
@@ -32,6 +34,95 @@ from monitoring.backtest import run_backtest_precision_in_list
 from logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+def _bundle_lifecycle(cfg: dict | None) -> str:
+    if not cfg:
+        return "PRODUCTION"
+    value = cfg.get("bundle_lifecycle")
+    if value is None or pd.isna(value):
+        return "PRODUCTION"
+    return str(value).upper()
+
+
+def retrain_due_reason(
+    engine: Engine,
+    *,
+    horizon: int,
+    interval_months: int = 3,
+    min_freshness_age_hours: float | None = None,
+) -> tuple[bool, str]:
+    """Return whether a retrain run may start and the audit reason."""
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        has_validation_table = conn.execute(
+            text("SELECT to_regclass('ingest.validation_status')")
+        ).scalar()
+        if has_validation_table is None:
+            return False, "blocked_missing_freshness_status"
+        freshness_row = conn.execute(
+            text(
+                """
+                SELECT status,
+                       EXTRACT(EPOCH FROM (now() - checked_at)) / 3600.0 AS age_hours
+                FROM ingest.validation_status
+                ORDER BY checked_at DESC, id DESC
+                LIMIT 1
+                """
+            )
+        ).fetchone()
+    if freshness_row is None:
+        return False, "blocked_missing_freshness_status"
+    freshness_status = freshness_row[0]
+    freshness_age_hours = float(freshness_row[1])
+    if freshness_status != "PASS":
+        return False, f"blocked_freshness_{str(freshness_status).lower()}"
+    if min_freshness_age_hours is None:
+        min_freshness_age_hours = float(os.getenv("RETRAIN_MIN_FRESHNESS_AGE_HOURS", "12"))
+    max_freshness_age_hours = float(os.getenv("RETRAIN_MAX_FRESHNESS_AGE_HOURS", "96"))
+    if freshness_age_hours < min_freshness_age_hours:
+        return False, f"blocked_freshness_not_stable_{freshness_age_hours:.1f}h"
+    if freshness_age_hours > max_freshness_age_hours:
+        return False, f"blocked_freshness_stale_{freshness_age_hours:.1f}h"
+
+    try:
+        cfg = load_latest_accepted_best_config(engine, horizon=int(horizon))
+    except Exception:
+        return True, "first_run_no_accepted_bundle"
+    if _bundle_lifecycle(cfg) == "PROVISIONAL":
+        return True, "provisional_bundle_requires_actual_validation"
+
+    accepted_at = cfg.get("accepted_at")
+    if accepted_at is None or pd.isna(accepted_at):
+        return True, "accepted_bundle_missing_timestamp"
+
+    accepted_ts = pd.Timestamp(accepted_at)
+    if accepted_ts.tzinfo is not None:
+        accepted_ts = accepted_ts.tz_convert(None)
+    now_ts = pd.Timestamp.utcnow().tz_localize(None)
+    if now_ts >= accepted_ts + pd.DateOffset(months=int(interval_months)):
+        return True, f"accepted_bundle_age_gte_{interval_months}_months"
+
+    ensure_monitoring_schema(engine)
+    with engine.connect() as conn:
+        has_alert = bool(
+            conn.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM ml_monitor.feature_drift
+                        WHERE horizon = :horizon
+                          AND severity = 'ALERT'
+                          AND created_at > :accepted_at
+                    )
+                    """
+                ),
+                {"horizon": int(horizon), "accepted_at": accepted_ts.to_pydatetime()},
+            ).scalar()
+        )
+    return (True, "feature_drift_alert") if has_alert else (False, "not_due")
 
 
 def is_mandatory_retrain_month(window_end: int, anchor_yymm: int = 2603, interval: int = 3) -> bool:
@@ -77,22 +168,24 @@ def _train_main_inline(engine: Engine, *, horizon: int, bundle_dir: Path) -> dic
     from config_store.best_config import load_latest_accepted_best_config as load_cfg
     cfg = load_cfg(engine, horizon=int(horizon))
     cfg = dict(cfg)
-    df_static = load_cus_lifetime(engine)
+    df_static = load_cus_lifetime_snapshots(engine)
     variants = [run_main_variant(engine, cfg, df_static, use_static_flag=False),
                 run_main_variant(engine, cfg, df_static, use_static_flag=True)]
     ok = [v for v in variants if not v.get("guardrail_warning")]
     if not ok:
         raise RuntimeError("All variants failed guardrail. Stop training.")
-    ok.sort(key=lambda r: (r["F1_val"], r["AP_val"]), reverse=True)
+    ok.sort(key=lambda r: (r["Lift_at_n"], r["AP_val"], r["F1_val"]), reverse=True)
     best = ok[0]
     if len(ok) == 2:
-        f1_gap = ok[0]["F1_val"] - ok[1]["F1_val"]
-        if abs(f1_gap) <= 0.002:
+        lift_gap = ok[0]["Lift_at_n"] - ok[1]["Lift_at_n"]
+        if abs(lift_gap) <= 0.05:
             best = next((v for v in ok if v["use_static"] is False), best)
 
     cfg["use_static"] = bool(best["use_static"])
     meta = {
         "cfg": cfg,
+        "bundle_lifecycle": _bundle_lifecycle(cfg),
+        "validation_label_source": cfg.get("validation_label_source"),
         "main_report": best["report"],
         "feat_cols": best.get("feat_cols"),
         "cat_cols": best.get("cat_cols"),
@@ -102,6 +195,29 @@ def _train_main_inline(engine: Engine, *, horizon: int, bundle_dir: Path) -> dic
     }
     save_bundle(bundle_dir, best["model"], metadata=meta)
     return {"cfg": cfg, "main_report": best["report"]}
+
+
+def _train_baseline_fallback_inline(engine: Engine, *, cfg: dict, bundle_dir: Path) -> dict:
+    """Save a ready LogisticRegression baseline bundle when bootstrap XGBoost is guarded out."""
+    cfg = dict(cfg)
+    df_static = load_cus_lifetime_snapshots(engine)
+    best = train_baseline_model_for_config(engine, cfg, df_static=df_static)
+    report = dict(best["report"])
+    report["model_type"] = "baseline_logistic_bootstrap_fallback"
+    meta = {
+        "cfg": cfg,
+        "bundle_lifecycle": _bundle_lifecycle(cfg),
+        "validation_label_source": cfg.get("validation_label_source"),
+        "model_type": "baseline_logistic_bootstrap_fallback",
+        "main_report": report,
+        "feat_cols": best.get("feat_cols"),
+        "cat_cols": best.get("cat_cols"),
+        "date_cols": best.get("date_cols", []),
+        "feature_name_map": best.get("feature_name_map"),
+        "feature_profile": best.get("feature_profile"),
+    }
+    save_bundle(bundle_dir, best["model"], metadata=meta)
+    return {"cfg": cfg, "main_report": report}
 
 
 from config.paths import CHURN_MODEL_DIR
@@ -114,14 +230,16 @@ def run_monthly_pipeline(
     bundle_dir: str | Path = CHURN_MODEL_DIR / "bundles/latest",
     limit_rows_each: int | None = None,
     k_min: int = 3,
-    f1_improve_eps: float = 1e-6,
+    lift_improve_eps: float = 1e-6,
     do_backtest: bool = True,
     do_feature_drift: bool = True,
+    do_scoring: bool = True,
+    force_cycle_retrain: bool = False,
 ) -> dict:
     """
     FULL monthly pipeline (run once):
       1) Sweep K (candidate)
-      2) Compare candidate F1 vs previous accepted F1
+      2) Compare candidate Lift@N vs previous accepted Lift@N
          - accept if improved
          - else keep previous accepted config/model
       3) If accepted -> retrain main model + overwrite bundle
@@ -138,12 +256,20 @@ def run_monthly_pipeline(
     # previous accepted config (can be None)
     prev_cfg = None
     prev_f1 = None
+    prev_lift_at_n = None
     prev_k = None
     prev_f1_db = 0.0
     prev_f1_bundle = 0.0
+    prev_lift_db = None
+    prev_lift_bundle = None
+    previous_lift_records = []
+    prev_bundle_lifecycle = None
     try:
         prev_cfg = load_latest_accepted_best_config(engine, horizon=int(horizon))
         prev_f1_db = float(prev_cfg.get("metric_f1_val") or 0)
+        if prev_cfg.get("metric_lift_at_n") is not None and not pd.isna(prev_cfg["metric_lift_at_n"]):
+            prev_lift_db = float(prev_cfg["metric_lift_at_n"])
+            previous_lift_records.append((int(prev_cfg.get("ranking_top_n") or 5000), prev_lift_db))
         prev_k = int(prev_cfg.get("best_k")) if prev_cfg.get("best_k") is not None else None
     except Exception:
         prev_cfg = None
@@ -151,16 +277,34 @@ def run_monthly_pipeline(
     # Cross-check với bundle metadata để tránh DB bị overwrite thủ công
     try:
         _, bundle_meta = load_bundle(bundle_dir)
+        bundle_cfg = (bundle_meta or {}).get("cfg", {})
         prev_f1_bundle = float(
-            (bundle_meta or {}).get("cfg", {}).get("metric_f1_val") or 0
+            bundle_cfg.get("metric_f1_val") or 0
         )
+        if bundle_cfg.get("metric_lift_at_n") is not None and not pd.isna(bundle_cfg["metric_lift_at_n"]):
+            prev_lift_bundle = float(bundle_cfg["metric_lift_at_n"])
+            previous_lift_records.append((int(bundle_cfg.get("ranking_top_n") or 5000), prev_lift_bundle))
+        prev_bundle_lifecycle = str(
+            (bundle_meta or {}).get("bundle_lifecycle")
+            or bundle_cfg.get("bundle_lifecycle")
+            or "PRODUCTION"
+        ).upper()
     except Exception:
         prev_f1_bundle = 0.0
+        prev_bundle_lifecycle = None
 
     prev_f1 = max(prev_f1_db, prev_f1_bundle) if (prev_f1_db > 0 or prev_f1_bundle > 0) else None
+    previous_lifts = [value for value in [prev_lift_db, prev_lift_bundle] if value is not None]
+    prev_lift_at_n = max(previous_lifts) if previous_lifts else None
     logger.info("[PREV_F1] DB=%.4f | bundle=%.4f | using=%s",
                 prev_f1_db, prev_f1_bundle,
                 f"{prev_f1:.4f}" if prev_f1 is not None else "None")
+    logger.info(
+        "[PREV_LIFT_AT_N] DB=%s | bundle=%s | using=%s",
+        f"{prev_lift_db:.4f}" if prev_lift_db is not None else "None",
+        f"{prev_lift_bundle:.4f}" if prev_lift_bundle is not None else "None",
+        f"{prev_lift_at_n:.4f}" if prev_lift_at_n is not None else "None",
+    )
 
     start_run(
         engine,
@@ -169,6 +313,7 @@ def run_monthly_pipeline(
         risk_threshold_pct=int(risk_threshold_pct),
         prev_best_k=prev_k,
         prev_best_f1=prev_f1,
+        prev_best_lift_at_n=prev_lift_at_n,
         notes=f"smoke_test={smoke_test(engine)}",
     )
 
@@ -187,31 +332,67 @@ def run_monthly_pipeline(
             k_min=int(k_min),
         )
         cand_f1 = float(cand_cfg["metric_f1_val"])
+        cand_lift_at_n = float(cand_cfg["metric_lift_at_n"])
+        ranking_top_n = int(cand_cfg["ranking_top_n"])
+        compatible_previous_lifts = [
+            lift for top_n, lift in previous_lift_records if top_n == ranking_top_n
+        ]
+        if prev_lift_at_n is not None and not compatible_previous_lifts:
+            logger.warning(
+                "[RANKING BASELINE RESET] No previous Lift@%d is available. "
+                "Accept the next eligible candidate to establish a comparable baseline.",
+                ranking_top_n,
+            )
+        prev_lift_at_n = max(compatible_previous_lifts) if compatible_previous_lifts else None
         cand_k = int(cand_cfg["best_k"])
         t_current = int(cand_cfg["as_of_month"])
 
-        # Prevalence guard: nếu churn_ratio quá cao → labels chưa sẵn sàng
+        # Phát hiện lần chạy đầu tiên (chưa có bất kỳ accepted config nào trong DB)
+        is_first_run = (prev_cfg is None)
+
+        # Prevalence guard: churn_ratio quá cao → labels chưa sẵn sàng
+        # Chỉ áp dụng khi đã có model cũ để fallback; lần đầu tiên thì LUÔN chạy mới.
         VAL_PREVALENCE_MAX = 0.45
         prevalence_blocked = False
-        if not df_ab.empty and "churn_ratio_train" in df_ab.columns:
-            max_prev = float(df_ab["churn_ratio_train"].max())
-            if max_prev > VAL_PREVALENCE_MAX:
+        if not is_first_run and not df_ab.empty and "churn_ratio_train" in df_ab.columns:
+            # Dùng churn_ratio của best K đã chọn (không phải max toàn ablation)
+            # để tránh bị block bởi K lớn có ratio cao một cách tự nhiên
+            best_row = df_ab[df_ab["K"] == cand_k].iloc[0] if cand_k in df_ab["K"].values else df_ab.iloc[0]
+            cand_prev = float(best_row["churn_ratio_train"])
+            if cand_prev > VAL_PREVALENCE_MAX:
                 prevalence_blocked = True
                 logger.warning(
-                    "[GUARD] val_month=%d có churn_ratio=%.2f > %.2f. "
+                    "[GUARD] val_month=%d có churn_ratio=%.2f > %.2f (tại best K=%d). "
                     "Labels cho tháng này chưa sẵn sàng. HỦY RETRAIN.",
-                    t_current, max_prev, VAL_PREVALENCE_MAX
+                    t_current, cand_prev, VAL_PREVALENCE_MAX, cand_k,
                 )
 
         # 2) Decide accept
-        is_mandatory = is_mandatory_retrain_month(t_current)
+        is_mandatory = force_cycle_retrain or is_mandatory_retrain_month(t_current)
         pass_guardrail = True
         active_ratio = 1.0
         active_cnt_cur = 0
         active_cnt_prev = 0
         t_prev = None
 
-        if not is_mandatory:
+        if is_first_run:
+            # Lần đầu tiên → chạy mới hoàn toàn, không áp dụng bất kỳ guard nào
+            accepted = True
+            rule = "accepted_first_run"
+            logger.info(
+                "[FIRST RUN] Chưa có model nào trong DB. Chấp nhận ngay config mới "
+                "(K=%d, Lift@%d=%.2fx, F1=%.4f) và train fresh. Bỏ qua mọi guard.",
+                cand_k, ranking_top_n, cand_lift_at_n, cand_f1,
+            )
+        elif prevalence_blocked:
+            accepted = False
+            rule = f"rejected_high_prevalence_{cand_prev:.2f}"
+        elif is_mandatory:
+            accepted = True
+            rule = "accepted_mandatory_cycle"
+            logger.info("[CYCLE] Tháng %d thuộc chu kỳ 3 tháng cố định. BẮT BUỘC RETRAIN (bỏ qua check guardrail).", t_current)
+        else:
+            # Kiểm tra guardrail dữ liệu (chỉ khi không mandatory và không first_run)
             from infra.yymm import shift_yymm
             try:
                 t_prev = int(shift_yymm(str(t_current), -1))
@@ -228,33 +409,55 @@ def run_monthly_pipeline(
                 logger.warning("[GUARD-RAIL] Gặp lỗi khi tính toán guardrail active customers: %s. Chặn retrain để an toàn.", e)
                 pass_guardrail = False
 
-        if prevalence_blocked:
-            accepted = False
-            rule = f"rejected_high_prevalence_{max_prev:.2f}"
-        elif is_mandatory:
-            accepted = True
-            rule = "accepted_mandatory_cycle"
-            logger.info("[CYCLE] Tháng %d thuộc chu kỳ 3 tháng cố định. BẮT BUỘC RETRAIN (bỏ qua check guardrail).", t_current)
-        elif not pass_guardrail:
-            accepted = False
-            rule = "rejected_by_guardrail_incomplete_data"
-            logger.warning(
-                "[GUARD] Tháng %d chưa hoàn thành dữ liệu (Active: %d vs tháng trước %s: %d, Tỷ lệ: %.2f < 0.80). "
-                "HỦY RETRAIN, giữ nguyên model cũ và chỉ chạy scoring.", 
-                t_current, active_cnt_cur, t_prev, active_cnt_prev, active_ratio
-            )
-        else:
-            if prev_f1 is None:
+            if not pass_guardrail:
+                accepted = False
+                rule = "rejected_by_guardrail_incomplete_data"
+                logger.warning(
+                    "[GUARD] Tháng %d chưa hoàn thành dữ liệu (Active: %d vs tháng trước %s: %d, Tỷ lệ: %.2f < 0.80). "
+                    "HỦY RETRAIN, giữ nguyên model cũ và chỉ chạy scoring.",
+                    t_current, active_cnt_cur, t_prev, active_cnt_prev, active_ratio
+                )
+            elif prev_lift_at_n is None:
                 accepted = True
-                rule = "accepted_no_prev"
+                rule = "accepted_missing_prev_lift_at_n"
             else:
-                accepted = bool(cand_f1 > (prev_f1 + f1_improve_eps))
-                rule = "accepted_f1_improved" if accepted else "rejected_f1_not_improved"
+                accepted = bool(cand_lift_at_n > (prev_lift_at_n + lift_improve_eps))
+                rule = "accepted_lift_at_n_improved" if accepted else "rejected_lift_at_n_not_improved"
+
+        candidate_lifecycle = _bundle_lifecycle(cand_cfg)
+        previous_lifecycles = [
+            lifecycle
+            for lifecycle in [
+                _bundle_lifecycle(prev_cfg) if prev_cfg is not None else None,
+                prev_bundle_lifecycle,
+            ]
+            if lifecycle
+        ]
+        previous_lifecycle = (
+            "PRODUCTION"
+            if "PRODUCTION" in previous_lifecycles
+            else (previous_lifecycles[0] if previous_lifecycles else None)
+        )
+        if candidate_lifecycle == "PROVISIONAL" and previous_lifecycle == "PRODUCTION":
+            accepted = False
+            rule = "rejected_provisional_validation_no_actual"
+            logger.warning(
+                "[PROMOTION BLOCKED] Candidate validation uses rule-based labels only. "
+                "Keep the existing PRODUCTION bundle until actual validation labels are available."
+            )
+        elif candidate_lifecycle == "PROVISIONAL" and is_first_run:
+            accepted = True
+            rule = "accepted_provisional_bootstrap"
+            logger.warning(
+                "[PROVISIONAL BOOTSTRAP] No production bundle exists. "
+                "Allow a provisional bundle for scoring, but do not treat it as production."
+            )
 
         cand_cfg["is_accepted"] = bool(accepted)
         cand_cfg["prev_accepted_f1"] = prev_f1
+        cand_cfg["prev_accepted_lift_at_n"] = prev_lift_at_n
         cand_cfg["accept_rule"] = rule
-        cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime()
+        cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime() if accepted else None
 
         # Store candidate config (accepted or rejected)
         upsert_best_config(engine, cand_cfg)
@@ -268,91 +471,144 @@ def run_monthly_pipeline(
         bundle_dir.mkdir(parents=True, exist_ok=True)
 
         if accepted:
-            _train_main_inline(engine, horizon=int(horizon), bundle_dir=bundle_dir)
-            did_retrain = True
-
-        # 4) Monthly scoring (always)
-        res = run_export_risk_mode(
-            engine,
-            horizon=int(horizon),
-            bundle_dir=bundle_dir,
-            risk_threshold=float(risk_threshold_pct),
-            t_current=int(t_current),
-            limit_rows=None,
-            make_dossier=True,
-        )
-        did_score = True
-
-        # 5) Monitoring
-        # Score drift
-        score_stats = res.get("score_stats") or {}
-        active_cnt = int(res.get("active_cnt") or 0)
-        churned_now_cnt = int(res.get("churned_now_cnt") or 0)
-        risk_cnt = int(res.get("risk_cnt") or 0)
-        # We don't have raw scores array here; but we can approximate by reading from score_stats.
-        # For anomaly detection, only need risk_ratio.
-        # Use empty scores to keep p50/p90/p99 as in res.
-        # We'll store res stats directly.
-        # To compute quantiles properly, we would need df_pred; that’s intentionally not returned.
-        # So we store what export runner computed.
-        # We'll pass dummy scores array and overwrite stats fields after upsert.
-        import numpy as np
-        payload = upsert_score_drift(
-            engine,
-            window_end=int(t_current),
-            horizon=int(horizon),
-            best_k=int(load_latest_accepted_best_config(engine, horizon=int(horizon)).get("best_k", cand_k)),
-            active_cnt=active_cnt,
-            churned_now_cnt=churned_now_cnt,
-            scores=np.array([], dtype=float),
-            risk_threshold_pct=int(risk_threshold_pct),
-            risk_cnt=risk_cnt,
-        )
-        # overwrite stored quantiles with export runner's (more accurate)
-        if score_stats:
-            from sqlalchemy import text
-            q = text(f"""
-                UPDATE ml_monitor.score_drift
-                SET mean_score=:m, p50=:p50, p90=:p90, p99=:p99
-                WHERE window_end=:w AND horizon=:h
-            """)
-            with engine.begin() as conn:
-                conn.execute(q, {
-                    "m": score_stats.get("mean"),
-                    "p50": score_stats.get("p50"),
-                    "p90": score_stats.get("p90"),
-                    "p99": score_stats.get("p99"),
-                    "w": int(t_current),
-                    "h": int(horizon),
-                })
-
-        # Feature drift (PSI) if baseline profile exists in bundle
-        if do_feature_drift:
             try:
-                _, meta = load_bundle(bundle_dir)
-                prof = (meta or {}).get("feature_profile")
-                if prof:
-                    # Use scoring data (active) already engineered: take from risk snapshot? Too small.
-                    # Instead, load feature table for best_k and t_current as proxy for current distribution.
-                    best_k_used = int(load_latest_accepted_best_config(engine, horizon=int(horizon)).get("best_k", cand_k))
-                    from preprocess.dataset import load_scoring_table_for_k
-                    df_cur, _, _ = load_scoring_table_for_k(engine, k=best_k_used, window_end=int(t_current))
-                    drift_df = compute_feature_drift(df_cur, prof)
-                    upsert_feature_drift(engine, window_end=int(t_current), horizon=int(horizon), best_k=best_k_used, drift_df=drift_df)
-            except Exception:
-                # do not fail whole pipeline
-                pass
+                _train_main_inline(engine, horizon=int(horizon), bundle_dir=bundle_dir)
+                did_retrain = True
+            except RuntimeError as e:
+                if "All variants failed guardrail" not in str(e):
+                    raise
 
-        # Backtest (precision-in-list) when label month exists (t_current acts as label month)
-        bt = None
-        if do_backtest:
-            bt = run_backtest_precision_in_list(
-                engine,
-                label_window_end=int(t_current),
-                horizon=int(horizon),
-                risk_threshold_pct=int(risk_threshold_pct),
-                best_k_for_population=int(k_min),
+                if is_first_run and prev_cfg is None:
+                    rule = "accepted_baseline_bootstrap_fallback"
+                    cand_cfg["is_accepted"] = True
+                    cand_cfg["accept_rule"] = rule
+                    cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime()
+                    cand_cfg["notes"] = (
+                        f"{cand_cfg.get('notes') or ''}; "
+                        f"main_train_guardrail={str(e)}; "
+                        "served_model=baseline_logistic_bootstrap_fallback"
+                    ).strip("; ")
+                    upsert_best_config(engine, cand_cfg)
+                    _train_baseline_fallback_inline(engine, cfg=cand_cfg, bundle_dir=bundle_dir)
+                    did_retrain = True
+                    logger.warning(
+                        "[BOOTSTRAP FALLBACK] XGBoost variants failed guardrail for K=%d, month=%d. "
+                        "Saved a LogisticRegression baseline bundle so scoring can start. Reason: %s",
+                        cand_k,
+                        t_current,
+                        e,
+                    )
+                else:
+                    accepted = False
+                    rule = "rejected_main_guardrail_all_variants_failed"
+                    cand_cfg["is_accepted"] = False
+                    cand_cfg["accept_rule"] = rule
+                    cand_cfg["accepted_at"] = None
+                    cand_cfg["notes"] = (
+                        f"{cand_cfg.get('notes') or ''}; main_train_guardrail={str(e)}"
+                    ).strip("; ")
+                    upsert_best_config(engine, cand_cfg)
+                    logger.warning(
+                        "[GUARD] Main model retrain failed guardrail for K=%d, month=%d. "
+                        "Reject candidate and keep previous accepted model/config if available. Reason: %s",
+                        cand_k,
+                        t_current,
+                        e,
+                    )
+
+        # 4) Monthly scoring — chỉ chạy nếu có accepted config trong DB
+        # (trường hợp bị block ngay lần đầu tiên: chưa có model nào được accepted)
+        has_accepted_in_db = prev_cfg is not None or accepted
+        if not do_scoring:
+            logger.info("[SKIP SCORING] Retrain DAG is isolated from business scoring.")
+            res = {"status": "skipped_retrain_only", "active_cnt": 0, "risk_cnt": 0, "churned_now_cnt": 0}
+            bt = None
+        elif not has_accepted_in_db:
+            logger.warning(
+                "[SKIP SCORING] Không có accepted best_config nào trong DB và tháng này bị block "
+                "(prevalence_blocked=%s, accepted=%s). "
+                "Bỏ qua bước scoring. Pipeline kết thúc sớm.",
+                prevalence_blocked, accepted,
             )
+            res = {"status": "skipped_no_accepted_config", "active_cnt": 0, "risk_cnt": 0, "churned_now_cnt": 0}
+            bt = None
+        else:
+            res = run_export_risk_mode(
+                engine,
+                horizon=int(horizon),
+                bundle_dir=bundle_dir,
+                risk_threshold=float(risk_threshold_pct),
+                t_current=int(t_current),
+                limit_rows=None,
+                make_dossier=True,
+            )
+            did_score = True
+
+        # 5) Monitoring — chỉ chạy khi scoring thực sự được thực hiện
+        import numpy as np
+        if did_score:
+            # Score drift
+            score_stats = res.get("score_stats") or {}
+            active_cnt = int(res.get("active_cnt") or 0)
+            churned_now_cnt = int(res.get("churned_now_cnt") or 0)
+            risk_cnt = int(res.get("risk_cnt") or 0)
+            payload = upsert_score_drift(
+                engine,
+                window_end=int(t_current),
+                horizon=int(horizon),
+                best_k=int(load_latest_accepted_best_config(engine, horizon=int(horizon)).get("best_k", cand_k)),
+                active_cnt=active_cnt,
+                churned_now_cnt=churned_now_cnt,
+                scores=np.array([], dtype=float),
+                risk_threshold_pct=int(risk_threshold_pct),
+                risk_cnt=risk_cnt,
+            )
+            # overwrite stored quantiles with export runner's (more accurate)
+            if score_stats:
+                from sqlalchemy import text
+                q = text(f"""
+                    UPDATE ml_monitor.score_drift
+                    SET mean_score=:m, p50=:p50, p90=:p90, p99=:p99
+                    WHERE window_end=:w AND horizon=:h
+                """)
+                with engine.begin() as conn:
+                    conn.execute(q, {
+                        "m": score_stats.get("mean"),
+                        "p50": score_stats.get("p50"),
+                        "p90": score_stats.get("p90"),
+                        "p99": score_stats.get("p99"),
+                        "w": int(t_current),
+                        "h": int(horizon),
+                    })
+
+            # Feature drift (PSI) if baseline profile exists in bundle
+            if do_feature_drift:
+                try:
+                    _, meta = load_bundle(bundle_dir)
+                    prof = (meta or {}).get("feature_profile")
+                    if prof:
+                        best_k_used = int(load_latest_accepted_best_config(engine, horizon=int(horizon)).get("best_k", cand_k))
+                        from preprocess.dataset import load_scoring_table_for_k
+                        df_cur, _, _ = load_scoring_table_for_k(engine, k=best_k_used, window_end=int(t_current))
+                        drift_df = compute_feature_drift(df_cur, prof)
+                        upsert_feature_drift(engine, window_end=int(t_current), horizon=int(horizon), best_k=best_k_used, drift_df=drift_df)
+                except Exception:
+                    # do not fail whole pipeline
+                    pass
+
+            # Backtest (precision-in-list) when label month exists (t_current acts as label month)
+            bt = None
+            if do_backtest:
+                bt = run_backtest_precision_in_list(
+                    engine,
+                    label_window_end=int(t_current),
+                    horizon=int(horizon),
+                    risk_threshold_pct=int(risk_threshold_pct),
+                    best_k_for_population=int(k_min),
+                )
+        else:
+            # Scoring bị skip → không có monitoring data
+            bt = None
 
         guardrail_meta = {
             "is_mandatory_cycle": bool(is_mandatory),
@@ -368,11 +624,13 @@ def run_monthly_pipeline(
             window_end=int(t_current),
             cand_best_k=int(cand_k),
             cand_best_f1=float(cand_f1),
+            cand_best_lift_at_n=float(cand_lift_at_n),
             cand_is_accepted=bool(accepted),
             did_retrain=bool(did_retrain),
             did_score=bool(did_score),
             notes=(
                 f"accept_rule={rule}; "
+                f"Lift@{ranking_top_n}={cand_lift_at_n:.4f}x; "
                 f"mandatory={is_mandatory}; "
                 f"guardrail={'pass' if pass_guardrail else 'blocked'}; "
                 f"active_ratio={active_ratio:.2f}; "
@@ -399,6 +657,7 @@ def run_monthly_pipeline(
             window_end=int(t_current) if t_current is not None else None,
             cand_best_k=int(cand_cfg["best_k"]) if cand_cfg else None,
             cand_best_f1=float(cand_cfg["metric_f1_val"]) if cand_cfg else None,
+            cand_best_lift_at_n=float(cand_cfg["metric_lift_at_n"]) if cand_cfg else None,
             cand_is_accepted=bool(accepted) if accepted is not None else None,
             did_retrain=bool(did_retrain),
             did_score=bool(did_score),

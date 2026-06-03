@@ -81,6 +81,28 @@ x-airflow-common:
     PG_DB: ${PG_DB}
     PG_USER: ${PG_USER}
     PG_PW: ${PG_PW}
+    LABEL_INCOMING_DIR: ${LABEL_INCOMING_DIR:-/churn_data/label_de}
+    LABEL_SCHEMA: ${LABEL_SCHEMA:-Label}
+    LABEL_EXPECTED_HORIZON_MONTHS: ${LABEL_EXPECTED_HORIZON_MONTHS:-2}
+    FRESHNESS_BCCP_MAX_LAG_MONTHS: ${FRESHNESS_BCCP_MAX_LAG_MONTHS:-1}
+    FRESHNESS_SNAPSHOT_MAX_AGE_DAYS: ${FRESHNESS_SNAPSHOT_MAX_AGE_DAYS:-14}
+    FRESHNESS_MIN_ROW_RATIO: ${FRESHNESS_MIN_ROW_RATIO:-0.80}
+    RULE_LABEL_TARGET_CHURN_RATE: ${RULE_LABEL_TARGET_CHURN_RATE:-}
+    RULE_LABEL_FALLBACK_TARGET_CHURN_RATE: ${RULE_LABEL_FALLBACK_TARGET_CHURN_RATE:-0.15}
+    RULE_LABEL_UNCERTAIN_BAND_RATE: ${RULE_LABEL_UNCERTAIN_BAND_RATE:-0.20}
+    RULE_LABEL_SAMPLE_WEIGHT: ${RULE_LABEL_SAMPLE_WEIGHT:-0.20}
+    BASELINE_MAX_POSITIVE_CLASS_WEIGHT: ${BASELINE_MAX_POSITIVE_CLASS_WEIGHT:-100}
+    BASELINE_MIN_PURGED_TRAIN_ORIGINS: ${BASELINE_MIN_PURGED_TRAIN_ORIGINS:-2}
+    MODEL_RANKING_TOP_N: ${MODEL_RANKING_TOP_N:-5000}
+    BACKTEST_MIN_ACTUAL_CHURN_ROWS: ${BACKTEST_MIN_ACTUAL_CHURN_ROWS:-30}
+    BACKTEST_WARN_MIN_PRECISION: ${BACKTEST_WARN_MIN_PRECISION:-0.05}
+    BACKTEST_FAIL_MIN_PRECISION: ${BACKTEST_FAIL_MIN_PRECISION:-0.02}
+    BACKTEST_WARN_MIN_RECALL: ${BACKTEST_WARN_MIN_RECALL:-0.20}
+    BACKTEST_FAIL_MIN_RECALL: ${BACKTEST_FAIL_MIN_RECALL:-0.10}
+    BACKTEST_WARN_MIN_LIFT: ${BACKTEST_WARN_MIN_LIFT:-1.50}
+    BACKTEST_FAIL_MIN_LIFT: ${BACKTEST_FAIL_MIN_LIFT:-1.00}
+    RETRAIN_MIN_FRESHNESS_AGE_HOURS: ${RETRAIN_MIN_FRESHNESS_AGE_HOURS:-12}
+    RETRAIN_MAX_FRESHNESS_AGE_HOURS: ${RETRAIN_MAX_FRESHNESS_AGE_HOURS:-96}
 
   volumes:
     # --------------------------------------------------------------------------------------
@@ -114,6 +136,8 @@ x-airflow-common:
     - /data/churn_prediction/churn_processing:/churn_process
     # Nap du lieu dau vao (File Zip tu DE) va noi luu File ket qua (churn_de, output_prediction)
     - /data/churn_prediction/ftp_churn/churn_de:/churn_data
+    # Nap file ZIP label chuan tu DE (host: /data/churn_prediction/ftp_churn/churn_de/label_de)
+    - /data/churn_prediction/ftp_churn/churn_de/label_de:/churn_data/label_de
     # Noi luu giu toan bo File text logs trong qua trinh tien xu ly
     - /data/churn_prediction/churn_logs:/logs
     # --------------------------------------------------------------------------------------

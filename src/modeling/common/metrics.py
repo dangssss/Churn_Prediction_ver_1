@@ -2,6 +2,75 @@ from __future__ import annotations
 
 import numpy as np
 
+
+def ranking_metrics_at_n(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    n: int = 5000,
+    sample_weight: np.ndarray | None = None,
+) -> dict:
+    """Compute business ranking metrics for the highest-risk N customers."""
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob, dtype=float)
+    if len(y_true) != len(y_prob):
+        raise ValueError("y_true and y_prob must have the same length")
+    if sample_weight is None:
+        weight = np.ones(len(y_true), dtype=float)
+        weighted = False
+    else:
+        weight = np.asarray(sample_weight, dtype=float)
+        if len(weight) != len(y_true):
+            raise ValueError("sample_weight and y_true must have the same length")
+        weight = np.nan_to_num(weight, nan=1.0, posinf=1.0, neginf=1.0)
+        weight = np.maximum(weight, 0.0)
+        weighted = True
+
+    requested_n = max(int(n), 1)
+    effective_n = min(requested_n, len(y_true))
+    positive_weight = weight * (y_true == 1)
+    total_positives = float(positive_weight.sum())
+    total_weight = float(weight.sum())
+    prevalence = total_positives / max(total_weight, 1e-9)
+    if effective_n == 0:
+        return {
+            "ranking_top_n": requested_n,
+            "ranking_effective_n": 0,
+            "hits_at_n": 0,
+            "precision_at_n": 0.0,
+            "recall_at_n": 0.0,
+            "lift_at_n": 0.0,
+            "val_prevalence": float(prevalence),
+        }
+
+    order = np.argsort(-y_prob, kind="stable")[:effective_n]
+    selected_weight = float(weight[order].sum())
+    hits = float(positive_weight[order].sum())
+    precision = hits / max(selected_weight, 1e-9)
+    recall = hits / max(total_positives, 1e-9)
+    lift = precision / prevalence if prevalence > 0 else 0.0
+    return {
+        "ranking_top_n": requested_n,
+        "ranking_effective_n": effective_n,
+        "hits_at_n": float(hits) if weighted else int(hits),
+        "precision_at_n": float(precision),
+        "recall_at_n": float(recall),
+        "lift_at_n": float(lift),
+        "val_prevalence": float(prevalence),
+    }
+
+
+def prefixed_ranking_metrics_at_n(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    *,
+    n: int,
+    prefix: str,
+    sample_weight: np.ndarray | None = None,
+) -> dict:
+    metrics = ranking_metrics_at_n(y_true, y_prob, n=n, sample_weight=sample_weight)
+    return {f"{prefix}_{key}": value for key, value in metrics.items()}
+
+
 def prf1_at_threshold(y_true: np.ndarray, y_prob: np.ndarray, thr: float):
     y_true = y_true.astype(int)
     y_pred = (y_prob >= thr).astype(int)

@@ -25,17 +25,18 @@ with DAG(
     tags=["ds_churn", "model", "scoring"],
 ) as dag:
 
-    from airflow.operators.bash import BashOperator
+    from airflow.providers.standard.operators.bash import BashOperator
 
     # Chỉ chạy lệnh export-risk: nạp model bundle cũ và xuất danh sách rủi ro Churn
     # Không bao giờ kích hoạt bước sweep-k hay train-main
     run_scoring_only = BashOperator(
         task_id="run_export_risk_only",
         bash_command=(
-            "cd /churn_source && "
+            "python /churn_source/modeling/ops_lock.py --wait-seconds 0 -- "
+            "bash -lc 'cd /churn_source && "
             "python modeling/main.py export-risk "
             "--horizon 2 "
-            "--risk-threshold-pct 95"
+            "--risk-threshold-pct 95'"
         ),
         env={
             "TZ": "Asia/Ho_Chi_Minh",
