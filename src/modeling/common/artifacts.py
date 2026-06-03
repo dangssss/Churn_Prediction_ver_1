@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, Dict, Optional
 import numpy as np
@@ -21,6 +22,8 @@ def _make_json_serializable(obj: Any) -> Any:
         return float(obj)
     elif isinstance(obj, np.ndarray):
         return obj.tolist()
+    elif isinstance(obj, (datetime, date, time)):
+        return obj.isoformat()
     elif isinstance(obj, (pd.Timestamp, pd.Timedelta)):
         return str(obj)
     elif isinstance(obj, np.bool_):
