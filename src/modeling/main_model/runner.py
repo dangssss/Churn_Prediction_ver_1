@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -32,6 +33,71 @@ from .xgb_utils import (
     is_date_like_col,
     date_col_to_ordinal,
 )
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid float env %s=%r. Using default %.4f.", name, raw, default)
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid int env %s=%r. Using default %d.", name, raw, default)
+        return int(default)
+
+
+def _score_stats(prob: np.ndarray) -> dict:
+    if len(prob) == 0:
+        return {}
+    q01, q10, q50, q90, q99 = np.quantile(prob, [0.01, 0.10, 0.50, 0.90, 0.99])
+    return {
+        "score_min": float(np.min(prob)),
+        "score_p01": float(q01),
+        "score_p10": float(q10),
+        "score_p50": float(q50),
+        "score_p90": float(q90),
+        "score_p99": float(q99),
+        "score_max": float(np.max(prob)),
+        "score_range": float(np.max(prob) - np.min(prob)),
+        "score_unique_rounded_6": int(len(np.unique(np.round(prob, 6)))),
+    }
+
+
+def _xgb_scale_pos_weight(
+    y: np.ndarray,
+    sample_weight: np.ndarray,
+    baseline_spw: float,
+) -> tuple[float, float, float]:
+    """Keep source weights, then add only a capped class-balance multiplier for XGB."""
+    pos_w = float(sample_weight[y == 1].sum())
+    neg_w = float(sample_weight[y == 0].sum())
+    weighted_ratio = neg_w / max(pos_w, 1e-9)
+    max_spw = max(_env_float("MAIN_XGB_MAX_SCALE_POS_WEIGHT", 20.0), 1.0)
+    mode = (os.getenv("MAIN_XGB_SCALE_POS_WEIGHT_MODE") or "sqrt_weighted").strip().lower()
+
+    if mode in {"none", "off", "1", "false"}:
+        effective = 1.0
+    elif mode in {"baseline", "best_spw"}:
+        effective = baseline_spw
+    elif mode in {"weighted", "raw_weighted"}:
+        effective = weighted_ratio
+    else:
+        effective = float(np.sqrt(max(weighted_ratio, 1.0)))
+
+    effective = min(max(float(effective), 1.0), max_spw)
+    return effective, weighted_ratio, max_spw
+
 
 def select_feature_cols_for_model(df: pd.DataFrame, label_col: str):
     drop_cols = {
@@ -128,9 +194,11 @@ def train_main_xgb_option_B(
         else np.ones(len(df_tr), dtype=float)
     )
 
-    # scale_pos_weight đã được baseline sweep tính + guardrail sẵn → dùng thẳng
-    spw = float(cfg["best_spw"])
-    thr_baseline = float(cfg["best_threshold"])  # tham chiếu
+    # Baseline SPW is tuned for LR. XGB also receives row-level label_weight, so
+    # use a capped XGB-specific multiplier to avoid double-counting positives.
+    baseline_spw = float(cfg["best_spw"])
+    spw, weighted_spw_raw, spw_cap = _xgb_scale_pos_weight(y_tr, sample_weight, baseline_spw)
+    thr_baseline = float(cfg["best_threshold"])
     es_rounds = int(cfg.get("main_es_rounds", 200))
 
     n_churn_train = int(y_tr.sum())
@@ -140,6 +208,16 @@ def train_main_xgb_option_B(
     n_churn_val = int(y_va.sum())
     n_active_val = len(y_va) - n_churn_val
     churn_ratio_val = n_churn_val / max(len(y_va), 1)
+
+    logger.info(
+        "[MAIN MODEL][XGB BALANCE] baseline_spw=%.2f | weighted_spw_raw=%.2f | "
+        "xgb_spw=%.2f | spw_cap=%.2f | mode=%s",
+        baseline_spw,
+        weighted_spw_raw,
+        spw,
+        spw_cap,
+        (os.getenv("MAIN_XGB_SCALE_POS_WEIGHT_MODE") or "sqrt_weighted"),
+    )
 
     logger.info(
         "[MAIN MODEL] Train: Churn=%d | Active=%d | Total=%d | Tỷ lệ Churn=%.2f%% | spw=%.2f",
@@ -172,17 +250,17 @@ def train_main_xgb_option_B(
             X_va[c] = pd.to_numeric(X_va[c], errors="coerce")
 
     params = dict(
-        n_estimators=5000,
-        learning_rate=0.01,
-        max_depth=6,
-        max_leaves=63,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        colsample_bylevel=0.7,
-        reg_lambda=2.0,
-        reg_alpha=1.0, 
-        min_child_weight=5,
-        gamma=0.2,
+        n_estimators=_env_int("MAIN_XGB_N_ESTIMATORS", 5000),
+        learning_rate=_env_float("MAIN_XGB_LEARNING_RATE", 0.03),
+        max_depth=_env_int("MAIN_XGB_MAX_DEPTH", 6),
+        max_leaves=_env_int("MAIN_XGB_MAX_LEAVES", 63),
+        subsample=_env_float("MAIN_XGB_SUBSAMPLE", 0.8),
+        colsample_bytree=_env_float("MAIN_XGB_COLSAMPLE_BYTREE", 0.8),
+        colsample_bylevel=_env_float("MAIN_XGB_COLSAMPLE_BYLEVEL", 0.7),
+        reg_lambda=_env_float("MAIN_XGB_REG_LAMBDA", 1.0),
+        reg_alpha=_env_float("MAIN_XGB_REG_ALPHA", 0.1),
+        min_child_weight=_env_float("MAIN_XGB_MIN_CHILD_WEIGHT", 2.0),
+        gamma=_env_float("MAIN_XGB_GAMMA", 0.0),
         tree_method="hist",
         random_state=42,
         scale_pos_weight=spw,
@@ -233,6 +311,21 @@ def train_main_xgb_option_B(
         va_prob = predict_proba_best_iteration(model, X_va_oh)[:, 1]
 
     # baseline threshold (tham chiếu)
+    score_stats = _score_stats(va_prob)
+    logger.info(
+        "[MAIN MODEL] Score spread: min=%.6f p01=%.6f p10=%.6f p50=%.6f "
+        "p90=%.6f p99=%.6f max=%.6f range=%.6f unique_rounded_6=%d",
+        score_stats["score_min"],
+        score_stats["score_p01"],
+        score_stats["score_p10"],
+        score_stats["score_p50"],
+        score_stats["score_p90"],
+        score_stats["score_p99"],
+        score_stats["score_max"],
+        score_stats["score_range"],
+        score_stats["score_unique_rounded_6"],
+    )
+
     p_b, r_b, f1_b = prf1_at_threshold(y_va, va_prob, thr_baseline)
 
     # optimize threshold on MAIN val
@@ -337,12 +430,13 @@ def train_main_xgb_option_B(
         )
 
     # Score compression guard: model không phân biệt được customers
-    score_range = float(np.max(va_prob)) - float(np.min(va_prob))
-    if score_range < 0.05:
+    min_score_range = _env_float("MAIN_XGB_MIN_SCORE_RANGE", 0.05)
+    score_range = score_stats["score_range"]
+    if score_range < min_score_range:
         raise ValueError(
             f"XGBoost score range quá hẹp: {score_range:.4f}. "
             f"Scores trong [{va_prob.min():.3f}, {va_prob.max():.3f}]. "
-            f"Model không phân biệt được customers."
+            f"Model không phân biệt được customers. min_required={min_score_range:.4f}."
         )
 
     # --- early stop meta
@@ -373,9 +467,13 @@ def train_main_xgb_option_B(
         "val_rows": int(len(df_va)),
 
         "spw_used": float(spw),
+        "spw_baseline": float(baseline_spw),
+        "spw_weighted_raw": float(weighted_spw_raw),
+        "spw_cap": float(spw_cap),
         "used_mode": used_mode,
 
         "AP_val": float(ap),
+        **score_stats,
         **ranking,
         **source_ranking,
 
