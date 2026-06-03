@@ -244,7 +244,14 @@ def run_export_risk(
             'cms_code_enc', 'window_end', 'predict_period', 
             'item_last', 'revenue_last', 'complaint_last', 'delay_last', 
             'nodone_last', 'order_score_last', 'satisfaction_last', 
-            'churn_rate', 'reason_1', 'reason_2', 'reason_3', 'updated_at'
+            'churn_rate', 'reason_1', 'reason_2', 'reason_3',
+            'reason_1_code', 'reason_1_metric', 'reason_1_baseline',
+            'reason_1_delta', 'reason_1_delta_pct', 'reason_1_severity',
+            'reason_2_code', 'reason_2_metric', 'reason_2_baseline',
+            'reason_2_delta', 'reason_2_delta_pct', 'reason_2_severity',
+            'reason_3_code', 'reason_3_metric', 'reason_3_baseline',
+            'reason_3_delta', 'reason_3_delta_pct', 'reason_3_severity',
+            'updated_at'
         ]
         
         for col in required_csv_cols:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, Dict, Optional
 import numpy as np
@@ -21,6 +22,8 @@ def _make_json_serializable(obj: Any) -> Any:
         return float(obj)
     elif isinstance(obj, np.ndarray):
         return obj.tolist()
+    elif isinstance(obj, (datetime, date, time)):
+        return obj.isoformat()
     elif isinstance(obj, (pd.Timestamp, pd.Timedelta)):
         return str(obj)
     elif isinstance(obj, np.bool_):
@@ -58,5 +61,6 @@ def load_bundle(
 ) -> tuple[Any, Dict[str, Any]]:
     in_dir = Path(in_dir)
     model = joblib.load(in_dir / model_filename)
-    meta = json.loads((in_dir / metadata_filename).read_text(encoding="utf-8"))
+    meta_path = in_dir / metadata_filename
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
     return model, meta
