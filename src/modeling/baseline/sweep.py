@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import os
 import pandas as pd
 from sqlalchemy.engine import Engine
 
@@ -12,6 +13,56 @@ from baseline.runner import SparseChurnLabelsError, eval_one_k_train_val
 from logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid int env %s=%r. Using default %d.", name, raw, default)
+        return int(default)
+
+
+def _config_from_ablation_row(engine: Engine, row: pd.Series, horizon: int) -> dict:
+    best_k = int(row["K"])
+    as_of_month = int(max_window_end_for_k(engine, best_k))
+    target_month = int(shift_yymm(str(as_of_month), int(horizon)))
+    return {
+        "as_of_month": as_of_month,
+        "target_month": target_month,
+        "horizon": int(horizon),
+        "best_k": best_k,
+        "use_static": bool(row["use_static"]),
+        "best_threshold": float(row["best_threshold"]),
+        "best_spw": float(row["spw_used"]),
+        "metric_f1_val": float(row["f1"]),
+        "metric_pr_auc_val": float(row["PR_AUC_val"]),
+        "ranking_top_n": int(row["ranking_top_n"]),
+        "metric_hits_at_n": int(row["hits_at_n"]),
+        "metric_precision_at_n": float(row["precision_at_n"]),
+        "metric_recall_at_n": float(row["recall_at_n"]),
+        "metric_lift_at_n": float(row["lift_at_n"]),
+        "metric_val_prevalence": float(row["val_prevalence"]),
+        "metric_actual_hits_at_n": int(row.get("actual_hits_at_n", row["hits_at_n"])),
+        "metric_actual_precision_at_n": float(row.get("actual_precision_at_n", row["precision_at_n"])),
+        "metric_actual_recall_at_n": float(row.get("actual_recall_at_n", row["recall_at_n"])),
+        "metric_actual_lift_at_n": float(row.get("actual_lift_at_n", row["lift_at_n"])),
+        "metric_rule_hits_at_n": None if pd.isna(row.get("rule_hits_at_n")) else int(row.get("rule_hits_at_n")),
+        "metric_rule_precision_at_n": None if pd.isna(row.get("rule_precision_at_n")) else float(row.get("rule_precision_at_n")),
+        "metric_rule_recall_at_n": None if pd.isna(row.get("rule_recall_at_n")) else float(row.get("rule_recall_at_n")),
+        "metric_rule_lift_at_n": None if pd.isna(row.get("rule_lift_at_n")) else float(row.get("rule_lift_at_n")),
+        "metric_combined_weighted_hits_at_n": float(row.get("combined_weighted_hits_at_n", row["hits_at_n"])),
+        "metric_combined_weighted_precision_at_n": float(row.get("combined_weighted_precision_at_n", row["precision_at_n"])),
+        "metric_combined_weighted_recall_at_n": float(row.get("combined_weighted_recall_at_n", row["recall_at_n"])),
+        "metric_combined_weighted_lift_at_n": float(row.get("combined_weighted_lift_at_n", row["lift_at_n"])),
+        "val_month": int(row["val_month"]),
+        "validation_label_source": str(row["validation_label_source"]),
+        "bundle_lifecycle": str(row["bundle_lifecycle"]),
+        "notes": "LR shortlisted by Lift@N, Precision@N, Recall@N, PR_AUC, F1; XGBoost selects final K",
+    }
 
 def run_sweep_k(
     engine: Engine,
@@ -96,46 +147,29 @@ def run_sweep_k(
         .reset_index(drop=True)
     )
 
-    best_k = int(df_ab.iloc[0]["K"])
-    use_static_best = bool(df_ab.iloc[0]["use_static"])
-    best_f1_final = float(df_ab.iloc[0]["f1"])
-    best_thr_final = float(df_ab.iloc[0]["best_threshold"])
-    best_spw_final = float(df_ab.iloc[0]["spw_used"])
+    best_config = _config_from_ablation_row(engine, df_ab.iloc[0], int(horizon))
 
-    as_of_month = int(max_window_end_for_k(engine, best_k))
-    target_month = int(shift_yymm(str(as_of_month), int(horizon)))
+    shortlist_size = max(_env_int("MODEL_XGB_K_CANDIDATES", 3), 1)
+    candidate_configs = []
+    seen_k = set()
+    for _, row in df_ab.iterrows():
+        k = int(row["K"])
+        if k in seen_k:
+            continue
+        seen_k.add(k)
+        candidate_configs.append(_config_from_ablation_row(engine, row, int(horizon)))
+        if len(candidate_configs) >= shortlist_size:
+            break
 
-    best_config = {
-        "as_of_month": as_of_month,
-        "target_month": target_month,
-        "horizon": int(horizon),
-        "best_k": best_k,
-        "use_static": use_static_best,
-        "best_threshold": best_thr_final,
-        "best_spw": best_spw_final,
-        "metric_f1_val": best_f1_final,
-        "metric_pr_auc_val": float(df_ab.iloc[0]["PR_AUC_val"]),
-        "ranking_top_n": int(df_ab.iloc[0]["ranking_top_n"]),
-        "metric_hits_at_n": int(df_ab.iloc[0]["hits_at_n"]),
-        "metric_precision_at_n": float(df_ab.iloc[0]["precision_at_n"]),
-        "metric_recall_at_n": float(df_ab.iloc[0]["recall_at_n"]),
-        "metric_lift_at_n": float(df_ab.iloc[0]["lift_at_n"]),
-        "metric_val_prevalence": float(df_ab.iloc[0]["val_prevalence"]),
-        "metric_actual_hits_at_n": int(df_ab.iloc[0].get("actual_hits_at_n", df_ab.iloc[0]["hits_at_n"])),
-        "metric_actual_precision_at_n": float(df_ab.iloc[0].get("actual_precision_at_n", df_ab.iloc[0]["precision_at_n"])),
-        "metric_actual_recall_at_n": float(df_ab.iloc[0].get("actual_recall_at_n", df_ab.iloc[0]["recall_at_n"])),
-        "metric_actual_lift_at_n": float(df_ab.iloc[0].get("actual_lift_at_n", df_ab.iloc[0]["lift_at_n"])),
-        "metric_rule_hits_at_n": None if pd.isna(df_ab.iloc[0].get("rule_hits_at_n")) else int(df_ab.iloc[0].get("rule_hits_at_n")),
-        "metric_rule_precision_at_n": None if pd.isna(df_ab.iloc[0].get("rule_precision_at_n")) else float(df_ab.iloc[0].get("rule_precision_at_n")),
-        "metric_rule_recall_at_n": None if pd.isna(df_ab.iloc[0].get("rule_recall_at_n")) else float(df_ab.iloc[0].get("rule_recall_at_n")),
-        "metric_rule_lift_at_n": None if pd.isna(df_ab.iloc[0].get("rule_lift_at_n")) else float(df_ab.iloc[0].get("rule_lift_at_n")),
-        "metric_combined_weighted_hits_at_n": float(df_ab.iloc[0].get("combined_weighted_hits_at_n", df_ab.iloc[0]["hits_at_n"])),
-        "metric_combined_weighted_precision_at_n": float(df_ab.iloc[0].get("combined_weighted_precision_at_n", df_ab.iloc[0]["precision_at_n"])),
-        "metric_combined_weighted_recall_at_n": float(df_ab.iloc[0].get("combined_weighted_recall_at_n", df_ab.iloc[0]["recall_at_n"])),
-        "metric_combined_weighted_lift_at_n": float(df_ab.iloc[0].get("combined_weighted_lift_at_n", df_ab.iloc[0]["lift_at_n"])),
-        "val_month": int(df_ab.iloc[0]["val_month"]),
-        "validation_label_source": str(df_ab.iloc[0]["validation_label_source"]),
-        "bundle_lifecycle": str(df_ab.iloc[0]["bundle_lifecycle"]),
-        "notes": "picked by Lift@N then Precision@N, Recall@N, PR_AUC, F1; sweep K window_only then static ablation",
-    }
+    best_config["xgb_candidate_configs"] = candidate_configs
+    best_config["xgb_candidate_ks"] = [int(c["best_k"]) for c in candidate_configs]
+    best_config["notes"] = (
+        f"{best_config.get('notes')}; "
+        f"LR shortlist for XGBoost K={best_config['xgb_candidate_ks']}"
+    )
+    logger.info(
+        "[LR SHORTLIST] top_%d distinct K for XGBoost: %s",
+        shortlist_size,
+        best_config["xgb_candidate_ks"],
+    )
     return best_config, df_ab

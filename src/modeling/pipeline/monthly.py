@@ -160,17 +160,40 @@ def get_active_count_for_month(engine: Engine, k: int, window_end: int) -> int:
 
 
 
-def _train_main_inline(engine: Engine, *, horizon: int, bundle_dir: Path) -> dict:
+def _train_main_inline(
+    engine: Engine,
+    *,
+    horizon: int,
+    bundle_dir: Path,
+    cfg_override: dict | None = None,
+    candidate_configs: list[dict] | None = None,
+) -> dict:
     """
     Inline training (no subprocess). Trains both use_static variants (if allowed by cfg) and saves bundle.
     Returns chosen report dict (same as scripts/train_main).
     """
     from config_store.best_config import load_latest_accepted_best_config as load_cfg
-    cfg = load_cfg(engine, horizon=int(horizon))
-    cfg = dict(cfg)
+    cfg = dict(cfg_override) if cfg_override is not None else dict(load_cfg(engine, horizon=int(horizon)))
+    candidates = [dict(c) for c in (candidate_configs or cfg.get("xgb_candidate_configs") or [cfg])]
     df_static = load_cus_lifetime_snapshots(engine)
-    variants = [run_main_variant(engine, cfg, df_static, use_static_flag=False),
-                run_main_variant(engine, cfg, df_static, use_static_flag=True)]
+    variants = []
+    seen = set()
+    for cand in candidates:
+        cand = dict(cand)
+        for use_static_flag in [False, True]:
+            key = (int(cand["best_k"]), bool(use_static_flag))
+            if key in seen:
+                continue
+            seen.add(key)
+            logger.info(
+                "[XGB CANDIDATE] Training K=%d use_static=%s from LR shortlist",
+                int(cand["best_k"]),
+                bool(use_static_flag),
+            )
+            variant = run_main_variant(engine, cand, df_static, use_static_flag=use_static_flag)
+            variant["candidate_cfg"] = cand
+            variants.append(variant)
+
     ok = [v for v in variants if not v.get("guardrail_warning")]
     if not ok:
         raise RuntimeError("All variants failed guardrail. Stop training.")
@@ -181,7 +204,47 @@ def _train_main_inline(engine: Engine, *, horizon: int, bundle_dir: Path) -> dic
         if abs(lift_gap) <= 0.05:
             best = next((v for v in ok if v["use_static"] is False), best)
 
+    cfg = dict(best.get("candidate_cfg") or cfg)
     cfg["use_static"] = bool(best["use_static"])
+    cfg["best_k"] = int(best["report"]["K"])
+    cfg["as_of_month"] = int(max_window_end_for_k(engine, int(cfg["best_k"])))
+    cfg["target_month"] = int(shift_yymm(str(cfg["as_of_month"]), int(horizon)))
+    cfg["metric_f1_val"] = float(best["report"]["f1@main_thr"])
+    cfg["metric_pr_auc_val"] = float(best["report"]["AP_val"])
+    cfg["ranking_top_n"] = int(best["report"]["ranking_top_n"])
+    cfg["metric_hits_at_n"] = int(best["report"]["hits_at_n"])
+    cfg["metric_precision_at_n"] = float(best["report"]["precision_at_n"])
+    cfg["metric_recall_at_n"] = float(best["report"]["recall_at_n"])
+    cfg["metric_lift_at_n"] = float(best["report"]["lift_at_n"])
+    cfg["metric_val_prevalence"] = float(best["report"]["val_prevalence"])
+    cfg["metric_actual_hits_at_n"] = int(best["report"].get("actual_hits_at_n", best["report"]["hits_at_n"]))
+    cfg["metric_actual_precision_at_n"] = float(best["report"].get("actual_precision_at_n", best["report"]["precision_at_n"]))
+    cfg["metric_actual_recall_at_n"] = float(best["report"].get("actual_recall_at_n", best["report"]["recall_at_n"]))
+    cfg["metric_actual_lift_at_n"] = float(best["report"].get("actual_lift_at_n", best["report"]["lift_at_n"]))
+    cfg["metric_rule_hits_at_n"] = best["report"].get("rule_hits_at_n")
+    cfg["metric_rule_precision_at_n"] = best["report"].get("rule_precision_at_n")
+    cfg["metric_rule_recall_at_n"] = best["report"].get("rule_recall_at_n")
+    cfg["metric_rule_lift_at_n"] = best["report"].get("rule_lift_at_n")
+    cfg["metric_combined_weighted_hits_at_n"] = float(best["report"].get("combined_weighted_hits_at_n", best["report"]["hits_at_n"]))
+    cfg["metric_combined_weighted_precision_at_n"] = float(best["report"].get("combined_weighted_precision_at_n", best["report"]["precision_at_n"]))
+    cfg["metric_combined_weighted_recall_at_n"] = float(best["report"].get("combined_weighted_recall_at_n", best["report"]["recall_at_n"]))
+    cfg["metric_combined_weighted_lift_at_n"] = float(best["report"].get("combined_weighted_lift_at_n", best["report"]["lift_at_n"]))
+    cfg["notes"] = (
+        f"{cfg.get('notes') or ''}; "
+        f"XGBoost selected final K={cfg['best_k']} use_static={cfg['use_static']} "
+        f"from LR shortlist"
+    ).strip("; ")
+    cfg.pop("xgb_candidate_configs", None)
+    cfg.pop("xgb_candidate_ks", None)
+    logger.info(
+        "[XGB SELECTED] K=%d use_static=%s Lift@%d=%.2fx AP=%.4f F1=%.4f",
+        int(cfg["best_k"]),
+        bool(cfg["use_static"]),
+        int(best["report"]["ranking_top_n"]),
+        float(best["report"]["lift_at_n"]),
+        float(best["report"]["AP_val"]),
+        float(best["report"]["f1@main_thr"]),
+    )
     meta = {
         "cfg": cfg,
         "bundle_lifecycle": _bundle_lifecycle(cfg),
@@ -459,10 +522,12 @@ def run_monthly_pipeline(
         cand_cfg["accept_rule"] = rule
         cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime() if accepted else None
 
-        # Store candidate config (accepted or rejected)
-        upsert_best_config(engine, cand_cfg)
+        # Store rejected candidates immediately. Accepted candidates are stored after
+        # XGBoost selects the final K/use_static from the LR shortlist.
+        if not accepted:
+            upsert_best_config(engine, cand_cfg)
 
-        # Choose K/month for serving (if rejected -> keep previous accepted K)
+        # Choose K/month for serving (updated again after accepted XGBoost training)
         best_k_for_scoring = int(cand_k) if accepted or prev_k is None else int(prev_k)
         t_current = int(max_window_end_for_k(engine, best_k_for_scoring))
 
@@ -472,7 +537,22 @@ def run_monthly_pipeline(
 
         if accepted:
             try:
-                _train_main_inline(engine, horizon=int(horizon), bundle_dir=bundle_dir)
+                train_out = _train_main_inline(
+                    engine,
+                    horizon=int(horizon),
+                    bundle_dir=bundle_dir,
+                    cfg_override=cand_cfg,
+                    candidate_configs=cand_cfg.get("xgb_candidate_configs"),
+                )
+                cand_cfg = dict(train_out["cfg"])
+                cand_cfg["is_accepted"] = True
+                cand_cfg["prev_accepted_f1"] = prev_f1
+                cand_cfg["prev_accepted_lift_at_n"] = prev_lift_at_n
+                cand_cfg["accept_rule"] = rule
+                cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime()
+                upsert_best_config(engine, cand_cfg)
+                cand_k = int(cand_cfg["best_k"])
+                t_current = int(cand_cfg["as_of_month"])
                 did_retrain = True
             except RuntimeError as e:
                 if "All variants failed guardrail" not in str(e):
