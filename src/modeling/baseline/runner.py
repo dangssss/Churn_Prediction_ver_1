@@ -322,3 +322,125 @@ def eval_one_k_train_val(
         "f1": f1_val,
         "degenerate": is_degenerate,
     }
+
+
+def train_baseline_model_for_config(
+    engine: Engine,
+    cfg: dict,
+    df_static: Optional[pd.DataFrame] = None,
+    limit_rows_each: Optional[int] = None,
+) -> Dict:
+    """Train the sweep LogisticRegression baseline as a deployable fallback bundle."""
+    k = int(cfg["best_k"])
+    horizon = int(cfg["horizon"])
+    use_static = bool(cfg.get("use_static", False))
+    label_col = f"y_churn_t_plus_{horizon}"
+
+    df_k = build_dataset_for_k(
+        engine,
+        k,
+        horizon=horizon,
+        limit_rows_each=limit_rows_each,
+    )
+    if df_k.empty or label_col not in df_k.columns:
+        raise ValueError(f"Dataset empty for baseline fallback K={k}, H={horizon}")
+
+    df_k = df_k[df_k["is_active_now"] == 1].dropna(subset=[label_col]).copy()
+    if df_k.empty or df_k[label_col].nunique() < 2:
+        raise ValueError(f"Not enough labeled data for baseline fallback K={k}, H={horizon}")
+
+    if use_static:
+        if df_static is None:
+            raise ValueError("use_static=True but df_static=None")
+        df_k = attach_static(df_k, df_static)
+
+    df_tr, df_va, val_month = time_split_train_val_last_month(
+        df_k,
+        time_col="window_end",
+        horizon=horizon,
+    )
+    if df_tr is None or df_tr.empty or df_va.empty:
+        raise ValueError(f"Not enough train/val data for baseline fallback K={k}, H={horizon}")
+
+    num_cols, cat_cols = select_feature_cols_mixed(df_k, label_col=label_col)
+    X_tr = df_tr[num_cols + cat_cols]
+    y_tr = df_tr[label_col].astype(int)
+    X_va = df_va[num_cols + cat_cols]
+    y_va = df_va[label_col].astype(int)
+    sample_weight = (
+        pd.to_numeric(df_tr["label_weight"], errors="coerce").fillna(1.0)
+        if "label_weight" in df_tr.columns
+        else pd.Series(1.0, index=df_tr.index)
+    )
+
+    class_weight_used = {0: 1.0, 1: float(cfg.get("best_spw") or 1.0)}
+    pre = make_preprocess(num_cols, cat_cols)
+    clf = LogisticRegression(
+        max_iter=5000,
+        solver="saga",
+        tol=1e-3,
+        class_weight=class_weight_used,
+        l1_ratio=0.5,
+        C=0.1,
+    )
+    pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
+    pipe.fit(X_tr, y_tr, clf__sample_weight=sample_weight.to_numpy())
+
+    va_prob = pipe.predict_proba(X_va)[:, 1]
+    ranking_top_n = int(cfg.get("ranking_top_n") or os.getenv("MODEL_RANKING_TOP_N", "5000"))
+    ranking = ranking_metrics_at_n(y_va.to_numpy(), va_prob, n=ranking_top_n)
+    pr_auc = average_precision_score(y_va, va_prob)
+    roc_auc = roc_auc_score(y_va, va_prob)
+    thr = best_threshold_by_f1(y_va.to_numpy(), va_prob)
+    yhat = (va_prob >= thr).astype(int)
+
+    try:
+        from monitoring.drift import compute_feature_profile
+
+        feature_profile = compute_feature_profile(
+            df_tr,
+            feat_cols=num_cols + cat_cols,
+            cat_cols=cat_cols,
+        )
+    except Exception:
+        feature_profile = None
+
+    report = {
+        "model_type": "baseline_logistic",
+        "K": k,
+        "H": horizon,
+        "use_static": use_static,
+        "val_month": int(val_month),
+        "train_rows": int(len(df_tr)),
+        "val_rows": int(len(df_va)),
+        "AP_val": float(pr_auc),
+        "ROC_AUC_val": float(roc_auc),
+        **ranking,
+        "thr_main_opt": float(thr),
+        "precision@main_thr": float(precision_score(y_va, yhat, zero_division=0)),
+        "recall@main_thr": float(recall_score(y_va, yhat, zero_division=0)),
+        "f1@main_thr": float(f1_score(y_va, yhat, zero_division=0)),
+        "guardrail_warning": None,
+    }
+    logger.warning(
+        "[BASELINE FALLBACK BUNDLE] K=%d use_static=%s Lift@%d=%.2fx "
+        "Precision@%d=%.4f%% Recall@%d=%.2f%% hits=%d",
+        k,
+        use_static,
+        ranking["ranking_top_n"],
+        ranking["lift_at_n"],
+        ranking["ranking_top_n"],
+        100.0 * ranking["precision_at_n"],
+        ranking["ranking_top_n"],
+        100.0 * ranking["recall_at_n"],
+        ranking["hits_at_n"],
+    )
+    return {
+        "model": pipe,
+        "report": report,
+        "feat_cols": num_cols + cat_cols,
+        "cat_cols": cat_cols,
+        "date_cols": [],
+        "feature_name_map": None,
+        "feature_profile": feature_profile,
+    }
