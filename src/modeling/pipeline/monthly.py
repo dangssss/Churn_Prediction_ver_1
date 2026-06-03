@@ -21,6 +21,7 @@ from config_store.best_config import (
 )
 from scripts.train_main import main as _train_main_cli  # fallback
 from main_model.runner import run_main_variant
+from baseline.runner import train_baseline_model_for_config
 from common.artifacts import save_bundle, load_bundle
 
 from export_risk_mode.runner import run_export_risk_mode
@@ -194,6 +195,29 @@ def _train_main_inline(engine: Engine, *, horizon: int, bundle_dir: Path) -> dic
     }
     save_bundle(bundle_dir, best["model"], metadata=meta)
     return {"cfg": cfg, "main_report": best["report"]}
+
+
+def _train_baseline_fallback_inline(engine: Engine, *, cfg: dict, bundle_dir: Path) -> dict:
+    """Save a ready LogisticRegression baseline bundle when bootstrap XGBoost is guarded out."""
+    cfg = dict(cfg)
+    df_static = load_cus_lifetime_snapshots(engine)
+    best = train_baseline_model_for_config(engine, cfg, df_static=df_static)
+    report = dict(best["report"])
+    report["model_type"] = "baseline_logistic_bootstrap_fallback"
+    meta = {
+        "cfg": cfg,
+        "bundle_lifecycle": _bundle_lifecycle(cfg),
+        "validation_label_source": cfg.get("validation_label_source"),
+        "model_type": "baseline_logistic_bootstrap_fallback",
+        "main_report": report,
+        "feat_cols": best.get("feat_cols"),
+        "cat_cols": best.get("cat_cols"),
+        "date_cols": best.get("date_cols", []),
+        "feature_name_map": best.get("feature_name_map"),
+        "feature_profile": best.get("feature_profile"),
+    }
+    save_bundle(bundle_dir, best["model"], metadata=meta)
+    return {"cfg": cfg, "main_report": report}
 
 
 from config.paths import CHURN_MODEL_DIR
@@ -454,22 +478,43 @@ def run_monthly_pipeline(
                 if "All variants failed guardrail" not in str(e):
                     raise
 
-                accepted = False
-                rule = "rejected_main_guardrail_all_variants_failed"
-                cand_cfg["is_accepted"] = False
-                cand_cfg["accept_rule"] = rule
-                cand_cfg["accepted_at"] = None
-                cand_cfg["notes"] = (
-                    f"{cand_cfg.get('notes') or ''}; main_train_guardrail={str(e)}"
-                ).strip("; ")
-                upsert_best_config(engine, cand_cfg)
-                logger.warning(
-                    "[GUARD] Main model retrain failed guardrail for K=%d, month=%d. "
-                    "Reject candidate and keep previous accepted model/config if available. Reason: %s",
-                    cand_k,
-                    t_current,
-                    e,
-                )
+                if is_first_run and prev_cfg is None:
+                    rule = "accepted_baseline_bootstrap_fallback"
+                    cand_cfg["is_accepted"] = True
+                    cand_cfg["accept_rule"] = rule
+                    cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime()
+                    cand_cfg["notes"] = (
+                        f"{cand_cfg.get('notes') or ''}; "
+                        f"main_train_guardrail={str(e)}; "
+                        "served_model=baseline_logistic_bootstrap_fallback"
+                    ).strip("; ")
+                    upsert_best_config(engine, cand_cfg)
+                    _train_baseline_fallback_inline(engine, cfg=cand_cfg, bundle_dir=bundle_dir)
+                    did_retrain = True
+                    logger.warning(
+                        "[BOOTSTRAP FALLBACK] XGBoost variants failed guardrail for K=%d, month=%d. "
+                        "Saved a LogisticRegression baseline bundle so scoring can start. Reason: %s",
+                        cand_k,
+                        t_current,
+                        e,
+                    )
+                else:
+                    accepted = False
+                    rule = "rejected_main_guardrail_all_variants_failed"
+                    cand_cfg["is_accepted"] = False
+                    cand_cfg["accept_rule"] = rule
+                    cand_cfg["accepted_at"] = None
+                    cand_cfg["notes"] = (
+                        f"{cand_cfg.get('notes') or ''}; main_train_guardrail={str(e)}"
+                    ).strip("; ")
+                    upsert_best_config(engine, cand_cfg)
+                    logger.warning(
+                        "[GUARD] Main model retrain failed guardrail for K=%d, month=%d. "
+                        "Reject candidate and keep previous accepted model/config if available. Reason: %s",
+                        cand_k,
+                        t_current,
+                        e,
+                    )
 
         # 4) Monthly scoring — chỉ chạy nếu có accepted config trong DB
         # (trường hợp bị block ngay lần đầu tiên: chưa có model nào được accepted)
