@@ -61,5 +61,6 @@ def load_bundle(
 ) -> tuple[Any, Dict[str, Any]]:
     in_dir = Path(in_dir)
     model = joblib.load(in_dir / model_filename)
-    meta = json.loads((in_dir / metadata_filename).read_text(encoding="utf-8"))
+    meta_path = in_dir / metadata_filename
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
     return model, meta

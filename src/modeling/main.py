@@ -29,7 +29,7 @@ logger = get_logger(__name__)
 
 def _bundle_is_ready(bundle_dir: str | Path) -> bool:
     bundle_path = Path(bundle_dir)
-    return (bundle_path / "model.joblib").is_file() and (bundle_path / "metadata.json").is_file()
+    return (bundle_path / "model.joblib").is_file()
 
 
 def _latest_freshness_status(engine) -> str | None:
