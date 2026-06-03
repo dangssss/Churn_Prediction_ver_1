@@ -184,7 +184,7 @@ def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 0.1, perce
     df_clipped = df.copy()
     outlier_summary = []
 
-    # Bá» qua cÃ¡c cá»™t metadata vÃ  nhÃ£n
+    # Skip metadata and label columns.
     skip_cols = {"cms_code_enc", "window_size", "window_start", "window_end",
                  "source_table_t", "source_table_t_plus_h",
                  "is_active_now", "is_churned_now", "gate_group",
@@ -214,7 +214,7 @@ def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 0.1, perce
         should_clip_high = False
         should_clip_low = False
 
-        # Chá»‰ thá»±c sá»± clip náº¿u giÃ¡ trá»‹ max/min vÆ°á»£t quÃ¡ xa ngÆ°á»¡ng 99.9% / 0.1% Ä‘á»ƒ trÃ¡nh lÃ m pháº³ng cÃ¡c cá»™t thÆ°a (sparse) hoáº·c nhá»‹ phÃ¢n
+        # Clip only extreme outliers to avoid flattening sparse or binary columns.
         if upper_bound > 0 and v_max > 5 * upper_bound:
             should_clip_high = True
 
@@ -245,7 +245,7 @@ def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 0.1, perce
 
     if outlier_summary:
         logger.info(
-            "[OUTLIER DETECTION] ÄÃ£ cáº¯t ngoáº¡i lai cho %d cá»™t cÃ³ giÃ¡ trá»‹ cá»±c Ä‘áº¡i dá»‹ thÆ°á»ng. Má»™t sá»‘ cá»™t vÃ­ dá»¥: %s",
+            "[OUTLIER DETECTION] Clipped extreme outliers for %d columns. Examples: %s",
             len(outlier_summary),
             ", ".join(f"{x['column']} (high_clip={x['clip_high']:.2f}, count={x['high_count']})" for x in outlier_summary[:5])
         )
@@ -261,7 +261,7 @@ def build_labeled_pair(
 ) -> pd.DataFrame:
     kk, start, end = parse_feature_table_name(table_t)
     if kk != k:
-        raise ValueError("table_t khÃ´ng thuá»™c K")
+        raise ValueError("table_t does not belong to K")
 
     df_t = load_feature_table(engine, table_t, limit=limit)
 
@@ -336,13 +336,13 @@ def build_labeled_pair(
     )
 
     if df_tp.empty:
-        return pd.DataFrame()  # censor window nÃ y (khÃ´ng cÃ³ label tÆ°Æ¡ng lai)
+        return pd.DataFrame()  # censor this window: no future labels/signals
 
     if "cms_code_enc" not in df_t.columns or "cms_code_enc" not in df_tp.columns:
-        raise KeyError("Thiáº¿u cms_code_enc Ä‘á»ƒ join label")
+        raise KeyError("Missing cms_code_enc to join label")
 
-    # ---------- Labeling Ä‘a tÃ­n hiá»‡u (C0 OR C1 OR C2) ----------
-    # Táº¥t cáº£ tÃ­n hiá»‡u tÃ­nh tá»« df_tp (thÃ¡ng t+h) â€” khÃ´ng leakage tá»« df_t
+    # ---------- Multi-signal rule labels (C0 OR C1 OR C2 OR C3) ----------
+    # All signals are computed from post-origin activity only; no leakage from df_t.
 
     from .gating import resolve_now_cols
     cols_tp = resolve_now_cols(df_tp)
@@ -352,10 +352,10 @@ def build_labeled_pair(
     item_tp = pd.to_numeric(df_tp[item_tp_col], errors="coerce").fillna(0)
     rev_tp  = pd.to_numeric(df_tp[rev_tp_col],  errors="coerce").fillna(0)
 
-    # C0: churn hoÃ n toÃ n (item=0 vÃ  revenue=0)
+    # C0: no future activity.
     c0 = (item_tp == 0) & (rev_tp == 0)
 
-    # Láº¥y cÃ¡c cá»™t DE Ä‘Ã£ tÃ­nh sáºµn
+    # Precomputed feature-engineering columns.
     freq_tp = pd.to_numeric(df_tp.get("frequency", 0), errors="coerce").fillna(0)
     monetary_tp = pd.to_numeric(df_tp.get("monetary", 0), errors="coerce").fillna(0)
     rev_slope_tp = pd.to_numeric(df_tp.get("revenue_slope", 0), errors="coerce").fillna(0)
@@ -363,20 +363,17 @@ def build_labeled_pair(
     rev_1m = pd.to_numeric(df_tp.get("revenue_1m_ago", 0), errors="coerce").fillna(0)
     item_1m = pd.to_numeric(df_tp.get("item_1m_ago", 0), errors="coerce").fillna(0)
 
-    # C1: Táº§n suáº¥t gá»­i hÃ ng giáº£m máº¡nh (Giáº£m > 50% so vá»›i táº§n suáº¥t bÃ¬nh quÃ¢n frequency)
-    # HOáº¶C giáº£m > 50% so vá»›i thÃ¡ng liá»n ká»
+    # C1: item frequency drops by more than 50% versus baseline or previous month.
     c1_drop_avg = (freq_tp > 0) & (item_tp < 0.50 * freq_tp)
     c1_drop_1m  = (item_1m > 0) & (item_tp < 0.50 * item_1m)
     c1 = c1_drop_avg | c1_drop_1m
 
-    # C2: Doanh thu giáº£m máº¡nh (Giáº£m > 50% so vá»›i doanh thu bÃ¬nh quÃ¢n monetary)
-    # HOáº¶C giáº£m > 50% so vá»›i thÃ¡ng liá»n ká» (revenue_1m_ago)
+    # C2: revenue drops by more than 50% versus baseline or previous month.
     c2_drop_avg = (monetary_tp > 0) & (rev_tp < 0.50 * monetary_tp)
     c2_drop_1m  = (rev_1m > 0) & (rev_tp < 0.50 * rev_1m)
     c2 = c2_drop_avg | c2_drop_1m
 
-    # C3: Xu hÆ°á»›ng doanh thu cáº¯m Ä‘áº§u (revenue_slope Ã¢m) káº¿t há»£p doanh thu thÃ¡ng nÃ y tháº¥p
-    # DÃ nh cho cÃ¡c khÃ¡ch hÃ ng rá»›t tá»« tá»« nhÆ°ng rÃµ rá»‡t
+    # C3: negative revenue trend plus low current revenue.
     c3 = (rev_slope_tp < -1000) & (rev_tp < 0.80 * monetary_tp)
 
     rule_y = (c0 | c1 | c2 | c3).astype(int)
@@ -388,8 +385,8 @@ def build_labeled_pair(
     n_total = len(rule_y)
     n_pos   = int(rule_y.sum())
     logger.debug(
-        "ÄÃ£ sinh nhÃ£n y_churn_t_plus_%d tá»« %s: "
-        "Tá»•ng Churn=%d (%.1f%%) | C0(hoÃ n toÃ n)=%d | C1(táº§n suáº¥t)=%d | C2(doanh thu)=%d | C3(slope)=%d | Active=%d | Total=%d",
+        "Generated raw rule signals y_churn_t_plus_%d from %s: "
+        "Churn=%d (%.1f%%) | C0(no activity)=%d | C1(item drop)=%d | C2(revenue drop)=%d | C3(slope)=%d | Active=%d | Total=%d",
         horizon, table_tp,
         n_pos, 100.0 * n_pos / max(n_total, 1),
         n_c0, n_c1, n_c2, n_c3,
@@ -481,18 +478,14 @@ def build_labeled_pair(
 
     out = df_t.merge(lab, on="cms_code_enc", how="left")
 
-    # KhÃ¡ch hÃ ng cÃ³ á»Ÿ thÃ¡ng t nhÆ°ng KHÃ”NG xuáº¥t hiá»‡n trong báº£ng tÆ°Æ¡ng lai (t+h):
-    # KhÃ´ng thá»ƒ xÃ¡c Ä‘á»‹nh Ä‘Æ°á»£c nhÃ£n chÃ­nh xÃ¡c â€” báº£ng t+h chá»‰ chá»©a nhá»¯ng ngÆ°á»i
-    # cÃ³ GIAO Dá»ŠCH trong window K cá»§a t+h. Váº¯ng máº·t cÃ³ thá»ƒ do:
-    #   (a) Thá»±c sá»± churn (khÃ´ng giao dá»‹ch), hoáº·c
-    #   (b) Dá»¯ liá»‡u chÆ°a Ä‘Æ°á»£c ingest Ä‘á»§ cho window t+h (data lag).
-    # Äá»ƒ trÃ¡nh nhiá»…u nhÃ£n vÃ  inflate churn_ratio á»Ÿ K lá»›n â†’ LOáº I Bá»Ž khá»i training.
+    # Customers that cannot be matched to post-origin activity are unlabeled.
+    # Drop them to avoid noisy fallback labels and inflated churn ratios.
     missing_mask = out[f"y_churn_t_plus_{horizon}"].isna()
     if missing_mask.any():
         n_dropped = int(missing_mask.sum())
         logger.info(
-            "Loáº¡i bá» %d/%d khÃ¡ch hÃ ng khÃ´ng cÃ³ nhÃ£n trong báº£ng tÆ°Æ¡ng lai %s "
-            "(khÃ´ng thá»ƒ xÃ¡c Ä‘á»‹nh churn/active â€” trÃ¡nh inflate churn_ratio).",
+            "Dropped %d/%d customers without post-origin labels from %s "
+            "(cannot determine churn/active without inflating churn_ratio).",
             n_dropped, len(out), table_tp,
         )
         out = out[~missing_mask].copy()
