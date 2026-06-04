@@ -298,6 +298,7 @@ def run_monthly_pipeline(
     do_feature_drift: bool = True,
     do_scoring: bool = True,
     force_cycle_retrain: bool = False,
+    strict_main_guardrail: bool = False,
 ) -> dict:
     """
     FULL monthly pipeline (run once):
@@ -556,6 +557,8 @@ def run_monthly_pipeline(
                 did_retrain = True
             except RuntimeError as e:
                 if "All variants failed guardrail" not in str(e):
+                    raise
+                if strict_main_guardrail:
                     raise
 
                 if is_first_run and prev_cfg is None:

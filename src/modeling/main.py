@@ -153,6 +153,7 @@ def cmd_prepare_scoring(args) -> None:
                     k_min=int(args.k_min),
                     do_scoring=False,
                     force_cycle_retrain=True,
+                    strict_main_guardrail=True,
                 )
             else:
                 try:
