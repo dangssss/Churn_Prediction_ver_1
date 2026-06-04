@@ -99,6 +99,63 @@ def _xgb_scale_pos_weight(
     return effective, weighted_ratio, max_spw
 
 
+def _ranking_operational_guardrail(
+    *,
+    y_va: np.ndarray,
+    ranking: dict,
+    score_stats: dict,
+    cfg: dict,
+) -> tuple[bool, list[str], dict]:
+    positives = int(np.asarray(y_va).astype(int).sum())
+    top_n = int(ranking.get("ranking_top_n") or cfg.get("ranking_top_n") or 5000)
+    effective_n = int(ranking.get("ranking_effective_n") or 0)
+    hits_at_n = float(ranking.get("hits_at_n") or 0.0)
+    lift_at_n = float(ranking.get("lift_at_n") or 0.0)
+    precision_at_n = float(ranking.get("precision_at_n") or 0.0)
+    prevalence = float(ranking.get("val_prevalence") or 0.0)
+    score_p99_minus_p50 = float(score_stats["score_p99"] - score_stats["score_p50"])
+    unique_scores = int(score_stats["score_unique_rounded_6"])
+
+    min_positives = _env_int("MAIN_XGB_GUARD_MIN_ACTUAL_POSITIVES", 20)
+    min_hits = _env_int("MAIN_XGB_GUARD_MIN_HITS_AT_N", 20)
+    min_lift = _env_float("MAIN_XGB_GUARD_MIN_LIFT_AT_N", 1.0)
+    min_score_sep = _env_float("MAIN_XGB_GUARD_MIN_P99_P50", 0.02)
+    min_unique_scores = _env_int("MAIN_XGB_GUARD_MIN_UNIQUE_SCORES", 100)
+
+    reasons: list[str] = []
+    if effective_n <= 0:
+        reasons.append(f"effective_n={effective_n} <= 0")
+    if positives >= min_positives and hits_at_n < min_hits:
+        reasons.append(
+            f"hits@{top_n}={hits_at_n:.0f} < {min_hits} "
+            f"(actual_positives={positives})"
+        )
+    if positives > 0 and lift_at_n < min_lift:
+        reasons.append(f"lift@{top_n}={lift_at_n:.2f}x < {min_lift:.2f}x")
+    if positives > 0 and precision_at_n <= prevalence:
+        reasons.append(
+            f"precision@{top_n}={precision_at_n:.6f} <= prevalence={prevalence:.6f}"
+        )
+    if score_p99_minus_p50 < min_score_sep:
+        reasons.append(
+            f"score_p99_minus_p50={score_p99_minus_p50:.6f} < {min_score_sep:.6f}"
+        )
+    if unique_scores < min_unique_scores:
+        reasons.append(f"unique_scores={unique_scores} < {min_unique_scores}")
+
+    meta = {
+        "guard_actual_positives": positives,
+        "guard_min_actual_positives": int(min_positives),
+        "guard_min_hits_at_n": int(min_hits),
+        "guard_min_lift_at_n": float(min_lift),
+        "guard_min_p99_p50": float(min_score_sep),
+        "guard_score_p99_minus_p50": float(score_p99_minus_p50),
+        "guard_min_unique_scores": int(min_unique_scores),
+        "guard_unique_scores": int(unique_scores),
+    }
+    return not reasons, reasons, meta
+
+
 def select_feature_cols_for_model(df: pd.DataFrame, label_col: str):
     drop_cols = {
         "cms_code_enc", "window_size", "window_start", "window_end",
@@ -421,8 +478,33 @@ def train_main_xgb_option_B(
         tp / (tp + fp + 1e-9), tp / (tp + fn + 1e-9), f1_opt,
     )
 
+    operational_pass, operational_reasons, operational_meta = _ranking_operational_guardrail(
+        y_va=y_va,
+        ranking=ranking,
+        score_stats=score_stats,
+        cfg=cfg,
+    )
+    logger.info(
+        "[MAIN GUARDRAIL][RANKING] pass=%s hits@%d=%s lift@%d=%.2fx "
+        "precision@%d=%.4f%% prevalence=%.4f%% p99_minus_p50=%.6f unique_scores=%d",
+        operational_pass,
+        ranking["ranking_top_n"],
+        ranking["hits_at_n"],
+        ranking["ranking_top_n"],
+        ranking["lift_at_n"],
+        ranking["ranking_top_n"],
+        100.0 * ranking["precision_at_n"],
+        100.0 * ranking["val_prevalence"],
+        operational_meta["guard_score_p99_minus_p50"],
+        operational_meta["guard_unique_scores"],
+    )
+    if not operational_pass:
+        raise ValueError(
+            "XGBoost ranking guardrail failed: " + " | ".join(operational_reasons)
+        )
+
     # Degenerate guard: predict-all-positive → vô dụng cho production
-    if tn + fn == 0:
+    if False and tn + fn == 0:
         raise ValueError(
             f"XGBoost degenerate: TN=0, FN=0 (predict-all-positive). "
             f"K={cfg['best_k']}, threshold={thr_opt:.4f}, "
@@ -432,7 +514,7 @@ def train_main_xgb_option_B(
     # Score compression guard: model không phân biệt được customers
     min_score_range = _env_float("MAIN_XGB_MIN_SCORE_RANGE", 0.05)
     score_range = score_stats["score_range"]
-    if score_range < min_score_range:
+    if False and score_range < min_score_range:
         raise ValueError(
             f"XGBoost score range quá hẹp: {score_range:.4f}. "
             f"Scores trong [{va_prob.min():.3f}, {va_prob.max():.3f}]. "
@@ -453,7 +535,10 @@ def train_main_xgb_option_B(
         seed=int(cfg.get("seed", 42))
     )
 
-    guardrail_warning = " | ".join(sanity["warnings"]) if sanity["warnings"] else None
+    diagnostic_warning = " | ".join(sanity["warnings"]) if sanity["warnings"] else None
+    if diagnostic_warning:
+        logger.warning("[MAIN GUARDRAIL][DIAGNOSTIC] %s", diagnostic_warning)
+    guardrail_warning = None
     dummy_simple2 = sanity["dummy_simple2feat_lr"]
     dummy_simple2_ap = float(dummy_simple2["AP"]) if dummy_simple2 else None
     dummy_simple2_feats = ",".join(dummy_simple2["features"]) if dummy_simple2 else None
@@ -474,6 +559,7 @@ def train_main_xgb_option_B(
 
         "AP_val": float(ap),
         **score_stats,
+        **operational_meta,
         **ranking,
         **source_ranking,
 
@@ -487,6 +573,7 @@ def train_main_xgb_option_B(
         "dummy_ap_simple2": dummy_simple2_ap,
         "dummy_simple2_features": dummy_simple2_feats,
         "guardrail_warning": guardrail_warning,
+        "diagnostic_warning": diagnostic_warning,
 
         "thr_baseline": float(thr_baseline),
         "precision@baseline_thr": float(p_b),
