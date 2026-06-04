@@ -122,15 +122,28 @@ def cmd_prepare_scoring(args) -> None:
         if not _bundle_is_ready(bundle_dir):
             raise RuntimeError("Bootstrap completed without producing a ready model bundle")
     else:
-        due, reason = retrain_due_reason(
-            engine,
-            horizon=int(args.horizon),
-            interval_months=int(args.interval_months),
-            min_freshness_age_hours=0.0,
-        )
+        if bool(args.force_retrain):
+            if freshness_status not in {"PASS", "DEGRADED"}:
+                raise RuntimeError(
+                    "Cannot force retrain with unsafe freshness status: "
+                    f"freshness_status={freshness_status!r}"
+                )
+            due = True
+            reason = f"manual_force_retrain_freshness_{str(freshness_status).lower()}"
+            logger.warning(
+                "[POST FEATURE] Force retrain requested. Bypass due/freshness gate: %s",
+                reason,
+            )
+        else:
+            due, reason = retrain_due_reason(
+                engine,
+                horizon=int(args.horizon),
+                interval_months=int(args.interval_months),
+                min_freshness_age_hours=0.0,
+            )
         if due:
             logger.info("[POST FEATURE] Retrain before scoring: %s", reason)
-            try:
+            if bool(args.force_retrain):
                 run_monthly_pipeline(
                     engine,
                     horizon=int(args.horizon),
@@ -139,11 +152,23 @@ def cmd_prepare_scoring(args) -> None:
                     limit_rows_each=args.limit_rows_each,
                     k_min=int(args.k_min),
                     do_scoring=False,
-                    force_cycle_retrain=reason.startswith("accepted_bundle_age_gte_"),
+                    force_cycle_retrain=True,
                 )
-            except Exception:
-                logger.exception(
-                    "[POST FEATURE] Retrain failed. Continue scoring with the last ready bundle."
+            else:
+                try:
+                    run_monthly_pipeline(
+                        engine,
+                        horizon=int(args.horizon),
+                        risk_threshold_pct=int(args.risk_threshold_pct),
+                        bundle_dir=bundle_dir,
+                        limit_rows_each=args.limit_rows_each,
+                        k_min=int(args.k_min),
+                        do_scoring=False,
+                        force_cycle_retrain=reason.startswith("accepted_bundle_age_gte_"),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[POST FEATURE] Retrain failed. Continue scoring with the last ready bundle."
                 )
         else:
             logger.info("[POST FEATURE] Retrain skipped: %s", reason)
@@ -298,6 +323,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bundle-dir", type=str, default=str(CHURN_MODEL_DIR / "bundles/latest"))
     p.add_argument("--limit-rows-each", type=int, default=None)
     p.add_argument("--k-min", type=int, default=3)
+    p.add_argument(
+        "--force-retrain",
+        action="store_true",
+        help="Manual override: retrain before scoring even when due/freshness gate would skip. Allows PASS/DEGRADED only.",
+    )
     p.set_defaults(func=cmd_prepare_scoring)
 
     p = sub.add_parser("sweep-k", help="Sweep K (debug). Saves best_config (accepted=True).")

@@ -20,7 +20,8 @@ with DAG(
         bash_command=(
             "python /churn_source/modeling/ops_lock.py --wait-seconds 0 -- "
             "bash -lc 'cd /churn_source && python modeling/main.py prepare-scoring "
-            "--horizon 2 --risk-threshold-pct 95'"
+            "--horizon 2 --risk-threshold-pct 95"
+            "{% if dag_run and dag_run.conf.get(\"force_retrain\") %} --force-retrain{% endif %}'"
         ),
         env={
             "TZ": "Asia/Ho_Chi_Minh",
