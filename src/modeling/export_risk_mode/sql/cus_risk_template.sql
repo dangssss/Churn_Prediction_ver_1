@@ -20,8 +20,11 @@ CREATE TABLE IF NOT EXISTS data_static.{TABLE_NAME} (
     order_score_last          DOUBLE PRECISION,
     satisfaction_last         DOUBLE PRECISION,
 
-    -- Risk scores (churn_rate in 0-100)
+    -- Risk scores:
+    -- churn_rate is a CRM-facing display risk score percentile in 0-100.
+    -- model_probability_pct is the raw model probability percent for audit.
     churn_rate                DOUBLE PRECISION NOT NULL,
+    model_probability_pct     DOUBLE PRECISION,
 
     -- Simple reasons (top 3, prioritized)
     reason_1                  TEXT,
@@ -35,3 +38,6 @@ CREATE TABLE IF NOT EXISTS data_static.{TABLE_NAME} (
 
 -- Index for ordering (newest period first, then high risk first)
 CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_predict_risk ON data_static.{TABLE_NAME} (predict_period DESC, churn_rate DESC);
+
+ALTER TABLE data_static.{TABLE_NAME}
+ADD COLUMN IF NOT EXISTS model_probability_pct DOUBLE PRECISION;

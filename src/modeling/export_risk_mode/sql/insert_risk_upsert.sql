@@ -11,6 +11,7 @@ ON CONFLICT (cms_code_enc, predict_period) DO UPDATE SET
     order_score_last = EXCLUDED.order_score_last,
     satisfaction_last = EXCLUDED.satisfaction_last,
     churn_rate = EXCLUDED.churn_rate,
+    model_probability_pct = EXCLUDED.model_probability_pct,
     reason_1 = EXCLUDED.reason_1,
     reason_2 = EXCLUDED.reason_2,
     reason_3 = EXCLUDED.reason_3,

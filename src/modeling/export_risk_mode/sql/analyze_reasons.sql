@@ -29,6 +29,7 @@ ORDER BY frequency DESC;
 SELECT 
     cms_code_enc,
     churn_rate,
+    model_probability_pct,
     item_last,
     reason_1,
     reason_2,
