@@ -36,12 +36,9 @@ def main():
     print("\nTOP-10 sweep results:")
     cols = [
         c for c in [
-            "K", "use_static", "val_month", "ranking_top_n",
-            "hits_at_n", "precision_at_n", "recall_at_n", "lift_at_n",
-            "rule_hits_at_n", "rule_precision_at_n", "rule_recall_at_n", "rule_lift_at_n",
-            "combined_weighted_hits_at_n", "combined_weighted_precision_at_n",
-            "combined_weighted_recall_at_n", "combined_weighted_lift_at_n",
-            "f1", "PR_AUC_val", "best_threshold", "spw_used",
+            "K", "use_static", "val_month",
+            "f1", "precision", "recall", "PR_AUC_val", "ROC_AUC_val",
+            "val_prevalence", "best_threshold", "spw_used",
         ] if c in df_ab.columns
     ]
     print(df_ab[cols].head(10).to_string(index=False))

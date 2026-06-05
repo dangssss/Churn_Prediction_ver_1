@@ -40,28 +40,29 @@ def _config_from_ablation_row(engine: Engine, row: pd.Series, horizon: int) -> d
         "best_spw": float(row["spw_used"]),
         "metric_f1_val": float(row["f1"]),
         "metric_pr_auc_val": float(row["PR_AUC_val"]),
-        "ranking_top_n": int(row["ranking_top_n"]),
-        "metric_hits_at_n": int(row["hits_at_n"]),
-        "metric_precision_at_n": float(row["precision_at_n"]),
-        "metric_recall_at_n": float(row["recall_at_n"]),
-        "metric_lift_at_n": float(row["lift_at_n"]),
+        "metric_roc_auc_val": float(row.get("ROC_AUC_val", 0.0)),
+        "ranking_top_n": None,
+        "metric_hits_at_n": None,
+        "metric_precision_at_n": None,
+        "metric_recall_at_n": None,
+        "metric_lift_at_n": None,
         "metric_val_prevalence": float(row["val_prevalence"]),
-        "metric_actual_hits_at_n": int(row.get("actual_hits_at_n", row["hits_at_n"])),
-        "metric_actual_precision_at_n": float(row.get("actual_precision_at_n", row["precision_at_n"])),
-        "metric_actual_recall_at_n": float(row.get("actual_recall_at_n", row["recall_at_n"])),
-        "metric_actual_lift_at_n": float(row.get("actual_lift_at_n", row["lift_at_n"])),
-        "metric_rule_hits_at_n": None if pd.isna(row.get("rule_hits_at_n")) else int(row.get("rule_hits_at_n")),
-        "metric_rule_precision_at_n": None if pd.isna(row.get("rule_precision_at_n")) else float(row.get("rule_precision_at_n")),
-        "metric_rule_recall_at_n": None if pd.isna(row.get("rule_recall_at_n")) else float(row.get("rule_recall_at_n")),
-        "metric_rule_lift_at_n": None if pd.isna(row.get("rule_lift_at_n")) else float(row.get("rule_lift_at_n")),
-        "metric_combined_weighted_hits_at_n": float(row.get("combined_weighted_hits_at_n", row["hits_at_n"])),
-        "metric_combined_weighted_precision_at_n": float(row.get("combined_weighted_precision_at_n", row["precision_at_n"])),
-        "metric_combined_weighted_recall_at_n": float(row.get("combined_weighted_recall_at_n", row["recall_at_n"])),
-        "metric_combined_weighted_lift_at_n": float(row.get("combined_weighted_lift_at_n", row["lift_at_n"])),
+        "metric_actual_hits_at_n": None,
+        "metric_actual_precision_at_n": None,
+        "metric_actual_recall_at_n": None,
+        "metric_actual_lift_at_n": None,
+        "metric_rule_hits_at_n": None,
+        "metric_rule_precision_at_n": None,
+        "metric_rule_recall_at_n": None,
+        "metric_rule_lift_at_n": None,
+        "metric_combined_weighted_hits_at_n": None,
+        "metric_combined_weighted_precision_at_n": None,
+        "metric_combined_weighted_recall_at_n": None,
+        "metric_combined_weighted_lift_at_n": None,
         "val_month": int(row["val_month"]),
         "validation_label_source": str(row["validation_label_source"]),
         "bundle_lifecycle": str(row["bundle_lifecycle"]),
-        "notes": "LR shortlisted by F1, PR_AUC, Lift@N, Precision@N, Recall@N; XGBoost selects final K",
+        "notes": "LR shortlisted by F1, PR_AUC, ROC_AUC; XGBoost selects final K",
     }
 
 def run_sweep_k(
@@ -120,19 +121,14 @@ def run_sweep_k(
                 continue
             ablation.append(out)
             logger.info(
-                "K=%d | use_static=%s | val=%s | Lift@%d=%.2fx | "
-                "Precision@%d=%.4f%% | Recall@%d=%.2f%% | hits=%d | "
-                "RuleLift@%d=%s | WeightedCombinedLift@%d=%.2fx | F1=%.4f | PR_AUC=%.4f",
-                k, use_static, out.get("val_month"),
-                out["ranking_top_n"], out["lift_at_n"],
-                out["ranking_top_n"], 100.0 * out["precision_at_n"],
-                out["ranking_top_n"], 100.0 * out["recall_at_n"],
-                out["hits_at_n"],
-                out["ranking_top_n"],
-                f"{out['rule_lift_at_n']:.2f}x" if "rule_lift_at_n" in out else "n/a",
-                out["ranking_top_n"],
-                out.get("combined_weighted_lift_at_n", 0.0),
-                out["f1"], out["PR_AUC_val"],
+                "K=%d | use_static=%s | val=%s | F1=%.4f | PR_AUC=%.4f | ROC_AUC=%.4f | threshold=%.4f",
+                k,
+                use_static,
+                out.get("val_month"),
+                out["f1"],
+                out["PR_AUC_val"],
+                out.get("ROC_AUC_val", 0.0),
+                out["best_threshold"],
             )
 
     if not ablation:
@@ -141,7 +137,7 @@ def run_sweep_k(
     df_ab = (
         pd.DataFrame(ablation)
         .sort_values(
-            ["f1", "PR_AUC_val", "lift_at_n", "precision_at_n", "recall_at_n"],
+            ["f1", "PR_AUC_val", "ROC_AUC_val"],
             ascending=False,
         )
         .reset_index(drop=True)

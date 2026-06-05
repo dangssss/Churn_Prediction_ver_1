@@ -38,7 +38,10 @@ with DAG(
             "upstream_post_feature_run_id": "{{ run_id }}",
             "logical_date": "{{ ds }}",
         },
-        wait_for_completion=False,
+        wait_for_completion=True,
+        poke_interval=60,
+        allowed_states=["success"],
+        failed_states=["failed", "upstream_failed"],
         reset_dag_run=True,
     )
 
