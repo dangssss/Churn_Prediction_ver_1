@@ -1,7 +1,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import traceback
 import pandas as pd
@@ -52,7 +51,11 @@ def retrain_due_reason(
     interval_months: int = 3,
     min_freshness_age_hours: float | None = None,
 ) -> tuple[bool, str]:
-    """Return whether a retrain run may start and the audit reason."""
+    """Return whether a retrain run is due.
+
+    Freshness status is audit context only. The training policy now accepts mixed
+    actual/rule-based labels, so DEGRADED freshness must not block retraining.
+    """
     from sqlalchemy import text
 
     with engine.connect() as conn:
@@ -60,49 +63,44 @@ def retrain_due_reason(
             text("SELECT to_regclass('ingest.validation_status')")
         ).scalar()
         if has_validation_table is None:
-            return False, "blocked_missing_freshness_status"
-        freshness_row = conn.execute(
-            text(
-                """
-                SELECT status,
-                       EXTRACT(EPOCH FROM (now() - checked_at)) / 3600.0 AS age_hours
-                FROM ingest.validation_status
-                ORDER BY checked_at DESC, id DESC
-                LIMIT 1
-                """
-            )
-        ).fetchone()
-    if freshness_row is None:
-        return False, "blocked_missing_freshness_status"
-    freshness_status = freshness_row[0]
-    freshness_age_hours = float(freshness_row[1])
-    if freshness_status != "PASS":
-        return False, f"blocked_freshness_{str(freshness_status).lower()}"
-    if min_freshness_age_hours is None:
-        min_freshness_age_hours = float(os.getenv("RETRAIN_MIN_FRESHNESS_AGE_HOURS", "12"))
-    max_freshness_age_hours = float(os.getenv("RETRAIN_MAX_FRESHNESS_AGE_HOURS", "96"))
-    if freshness_age_hours < min_freshness_age_hours:
-        return False, f"blocked_freshness_not_stable_{freshness_age_hours:.1f}h"
-    if freshness_age_hours > max_freshness_age_hours:
-        return False, f"blocked_freshness_stale_{freshness_age_hours:.1f}h"
+            freshness_row = None
+        else:
+            freshness_row = conn.execute(
+                text(
+                    """
+                    SELECT status,
+                           EXTRACT(EPOCH FROM (now() - checked_at)) / 3600.0 AS age_hours
+                    FROM ingest.validation_status
+                    ORDER BY checked_at DESC, id DESC
+                    LIMIT 1
+                    """
+                )
+            ).fetchone()
+    freshness_status = str(freshness_row[0]).lower() if freshness_row is not None else "missing"
+    freshness_age_hours = float(freshness_row[1]) if freshness_row is not None else None
+    freshness_note = (
+        f"freshness_{freshness_status}_{freshness_age_hours:.1f}h"
+        if freshness_age_hours is not None
+        else f"freshness_{freshness_status}"
+    )
 
     try:
         cfg = load_latest_accepted_best_config(engine, horizon=int(horizon))
     except Exception:
-        return True, "first_run_no_accepted_bundle"
+        return True, f"first_run_no_accepted_bundle_{freshness_note}"
     if _bundle_lifecycle(cfg) == "PROVISIONAL":
-        return True, "provisional_bundle_requires_actual_validation"
+        return True, f"provisional_bundle_requires_retrain_{freshness_note}"
 
     accepted_at = cfg.get("accepted_at")
     if accepted_at is None or pd.isna(accepted_at):
-        return True, "accepted_bundle_missing_timestamp"
+        return True, f"accepted_bundle_missing_timestamp_{freshness_note}"
 
     accepted_ts = pd.Timestamp(accepted_at)
     if accepted_ts.tzinfo is not None:
         accepted_ts = accepted_ts.tz_convert(None)
     now_ts = pd.Timestamp.utcnow().tz_localize(None)
     if now_ts >= accepted_ts + pd.DateOffset(months=int(interval_months)):
-        return True, f"accepted_bundle_age_gte_{interval_months}_months"
+        return True, f"accepted_bundle_age_gte_{interval_months}_months_{freshness_note}"
 
     ensure_monitoring_schema(engine)
     with engine.connect() as conn:
@@ -122,7 +120,7 @@ def retrain_due_reason(
                 {"horizon": int(horizon), "accepted_at": accepted_ts.to_pydatetime()},
             ).scalar()
         )
-    return (True, "feature_drift_alert") if has_alert else (False, "not_due")
+    return (True, f"feature_drift_alert_{freshness_note}") if has_alert else (False, f"not_due_{freshness_note}")
 
 
 def is_mandatory_retrain_month(window_end: int, anchor_yymm: int = 2603, interval: int = 3) -> bool:

@@ -99,14 +99,9 @@ def cmd_prepare_scoring(args) -> None:
     freshness_status = _latest_freshness_status(engine)
 
     if not bundle_ready:
-        if freshness_status not in {"PASS", "DEGRADED"}:
-            raise RuntimeError(
-                "Cannot bootstrap model without a ready bundle: "
-                f"freshness_status={freshness_status!r}"
-            )
         logger.warning(
             "[BOOTSTRAP] No model bundle found. Starting first sweep/train with freshness=%s. "
-            "DEGRADED bootstrap may use mixed actual/rule-based labels.",
+            "Mixed actual/rule-based labels are allowed by training policy.",
             freshness_status,
         )
         run_monthly_pipeline(
@@ -123,11 +118,6 @@ def cmd_prepare_scoring(args) -> None:
             raise RuntimeError("Bootstrap completed without producing a ready model bundle")
     else:
         if bool(args.force_retrain):
-            if freshness_status not in {"PASS", "DEGRADED"}:
-                raise RuntimeError(
-                    "Cannot force retrain with unsafe freshness status: "
-                    f"freshness_status={freshness_status!r}"
-                )
             due = True
             reason = f"manual_force_retrain_freshness_{str(freshness_status).lower()}"
             logger.warning(
@@ -306,7 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--k-min", type=int, default=3)
     p.set_defaults(func=cmd_run_monthly)
 
-    p = sub.add_parser("retrain-if-due", help="Retrain-only gate: freshness PASS and interval/drift trigger")
+    p = sub.add_parser("retrain-if-due", help="Retrain-only gate: interval/drift trigger; freshness is audit-only")
     p.add_argument("--horizon", type=int, required=True)
     p.add_argument("--interval-months", type=int, default=3)
     p.add_argument("--bundle-dir", type=str, default=str(CHURN_MODEL_DIR / "bundles/latest"))
@@ -324,7 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--force-retrain",
         action="store_true",
-        help="Manual override: retrain before scoring even when due/freshness gate would skip. Allows PASS/DEGRADED only.",
+        help="Manual override: retrain before scoring even when the due gate would skip.",
     )
     p.set_defaults(func=cmd_prepare_scoring)
 
