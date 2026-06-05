@@ -197,11 +197,11 @@ def _train_main_inline(
     ok = [v for v in variants if not v.get("guardrail_warning")]
     if not ok:
         raise RuntimeError("All variants failed guardrail. Stop training.")
-    ok.sort(key=lambda r: (r["Lift_at_n"], r["AP_val"], r["F1_val"]), reverse=True)
+    ok.sort(key=lambda r: (r["F1_val"], r["AP_val"], r["Lift_at_n"]), reverse=True)
     best = ok[0]
     if len(ok) == 2:
-        lift_gap = ok[0]["Lift_at_n"] - ok[1]["Lift_at_n"]
-        if abs(lift_gap) <= 0.05:
+        f1_gap = ok[0]["F1_val"] - ok[1]["F1_val"]
+        if abs(f1_gap) <= 0.005:
             best = next((v for v in ok if v["use_static"] is False), best)
 
     cfg = dict(best.get("candidate_cfg") or cfg)
@@ -237,13 +237,13 @@ def _train_main_inline(
     cfg.pop("xgb_candidate_configs", None)
     cfg.pop("xgb_candidate_ks", None)
     logger.info(
-        "[XGB SELECTED] K=%d use_static=%s Lift@%d=%.2fx AP=%.4f F1=%.4f",
+        "[XGB SELECTED] K=%d use_static=%s F1=%.4f AP=%.4f Lift@%d=%.2fx",
         int(cfg["best_k"]),
         bool(cfg["use_static"]),
+        float(best["report"]["f1@main_thr"]),
+        float(best["report"]["AP_val"]),
         int(best["report"]["ranking_top_n"]),
         float(best["report"]["lift_at_n"]),
-        float(best["report"]["AP_val"]),
-        float(best["report"]["f1@main_thr"]),
     )
     meta = {
         "cfg": cfg,

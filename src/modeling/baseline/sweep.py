@@ -61,7 +61,7 @@ def _config_from_ablation_row(engine: Engine, row: pd.Series, horizon: int) -> d
         "val_month": int(row["val_month"]),
         "validation_label_source": str(row["validation_label_source"]),
         "bundle_lifecycle": str(row["bundle_lifecycle"]),
-        "notes": "LR shortlisted by Lift@N, Precision@N, Recall@N, PR_AUC, F1; XGBoost selects final K",
+        "notes": "LR shortlisted by F1, PR_AUC, Lift@N, Precision@N, Recall@N; XGBoost selects final K",
     }
 
 def run_sweep_k(
@@ -72,7 +72,7 @@ def run_sweep_k(
     k_min: int = 3,
 ) -> tuple[dict, pd.DataFrame]:
     """
-    Always sweep K to find the best K for current data (picked by Lift@N).
+    Always sweep K to find the best K for current data (picked by F1 first).
     Returns:
       (best_config_candidate, df_ablation_sorted)
     """
@@ -141,7 +141,7 @@ def run_sweep_k(
     df_ab = (
         pd.DataFrame(ablation)
         .sort_values(
-            ["lift_at_n", "precision_at_n", "recall_at_n", "PR_AUC_val", "f1"],
+            ["f1", "PR_AUC_val", "lift_at_n", "precision_at_n", "recall_at_n"],
             ascending=False,
         )
         .reset_index(drop=True)
