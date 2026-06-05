@@ -92,7 +92,13 @@ def run_export_risk(
 
     # [5/6] Make predictions
     print("\n[5/6] Make predictions...")
-    df_pred = make_predictions(model, df_engineered, cfg, metadata)
+    df_pred = make_predictions(
+        model,
+        df_engineered,
+        cfg,
+        metadata,
+        risk_threshold=float(risk_threshold),
+    )
     print("? Predictions completed")
 
     # Compute reasons — dùng SHAP làm cốt lõi, fallback sang rule-based
@@ -244,7 +250,7 @@ def run_export_risk(
             'cms_code_enc', 'window_end', 'predict_period', 
             'item_last', 'revenue_last', 'complaint_last', 'delay_last', 
             'nodone_last', 'order_score_last', 'satisfaction_last', 
-            'churn_rate', 'reason_1', 'reason_2', 'reason_3',
+            'churn_rate', 'model_probability_pct', 'reason_1', 'reason_2', 'reason_3',
             'reason_1_code', 'reason_1_metric', 'reason_1_baseline',
             'reason_1_delta', 'reason_1_delta_pct', 'reason_1_severity',
             'reason_2_code', 'reason_2_metric', 'reason_2_baseline',

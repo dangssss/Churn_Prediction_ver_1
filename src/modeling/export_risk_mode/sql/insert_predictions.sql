@@ -3,6 +3,7 @@
 SELECT 
     cms_code_enc,
     ROUND(churn_rate::numeric, 2) as churn_rate,
+    ROUND(model_probability_pct::numeric, 6) as model_probability_pct,
     item_last,
     ROUND(revenue_last::numeric/1000000, 2) as revenue_m,
     complaint_last,

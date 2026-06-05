@@ -19,6 +19,7 @@ def make_predictions(
     df_data: pd.DataFrame,
     cfg: dict,
     metadata: dict,
+    risk_threshold: float | None = None,
 ) -> pd.DataFrame:
     """Make predictions using trained XGBoost model."""
     h = int(cfg["horizon"])
@@ -99,15 +100,22 @@ def make_predictions(
         print("   Fallback to standard predict_proba")
         prob = model.predict_proba(X)[:, 1]
     
-    # Combine results
+    # Combine results. `churn_rate` is intentionally a CRM-facing display risk
+    # score in the familiar 0-100 format, not a calibrated probability. It is a
+    # percentile rank where 95 means "higher risk than 95% of active customers".
+    # Keep the raw model probability separately for technical audit.
     df_out = df_data.copy()
     df_out["churn_probability"] = prob
-    df_out["churn_rate"] = (prob * 100).round(2)
+    risk_percentile = pd.Series(prob, index=df_out.index).rank(method="first", pct=True) * 100.0
+    df_out["model_probability_pct"] = (prob * 100).round(6)
+    df_out["churn_rate"] = risk_percentile.round(2)
 
-    # Threshold from config
-    thr = cfg.get("main_threshold", cfg.get("best_threshold", 0.5))
-    df_out["risk_score"] = prob
-    df_out["risk_flag"] = (prob >= float(thr)).astype(int)
+    # Operational threshold is a percentile threshold from export-risk
+    # (e.g. 95 means export the top 5% highest-risk active customers).
+    thr = float(risk_threshold) if risk_threshold is not None else cfg.get("main_threshold", cfg.get("best_threshold", 0.5))
+    df_out["risk_score"] = df_out["churn_rate"]
+    thr_pct = float(thr) * 100.0 if float(thr) <= 1.0 else float(thr)
+    df_out["risk_flag"] = (df_out["risk_score"] >= thr_pct).astype(int)
 
     return df_out
 
@@ -749,14 +757,14 @@ def insert_predictions_to_risk_table(
     risk_threshold: float = 90.0,
     horizon: int = 1,
 ) -> int:
-    """Insert predictions v\u00e0o risk table (ch\u1ec9 nh\u1eefng kh\u00e1ch h\u00e0ng c\u00f3 churn_rate >= threshold)."""
+    """Insert customers whose CRM display risk score (`churn_rate`) meets the percentile threshold."""
     risk_pct = int(risk_threshold)
     table_name = f"cus_risk_{risk_pct}"
     
     if "churn_rate" not in df_predictions.columns:
         raise KeyError("Missing 'churn_rate' column in predictions")
     
-    # Filter theo threshold
+    # Filter by display risk score percentile (e.g. 95 keeps the top 5%).
     df_risk = df_predictions[df_predictions["churn_rate"] >= float(risk_threshold)].copy()
     
     if df_risk.empty:
@@ -780,6 +788,7 @@ def insert_predictions_to_risk_table(
         "order_score_last",
         "satisfaction_last",
         "churn_rate",
+        "model_probability_pct",
         "reason_1",
         "reason_2",
         "reason_3",
