@@ -18,9 +18,7 @@ from common.metrics import (
     average_precision_np,
     best_threshold_by_f1_np,
     prf1_at_threshold,
-    ranking_metrics_at_n,
 )
-from baseline.runner import auxiliary_rule_holdout, label_source_ranking_metrics
 
 from monitoring.drift import compute_feature_profile
 
@@ -99,63 +97,6 @@ def _xgb_scale_pos_weight(
     return effective, weighted_ratio, max_spw
 
 
-def _ranking_operational_guardrail(
-    *,
-    y_va: np.ndarray,
-    ranking: dict,
-    score_stats: dict,
-    cfg: dict,
-) -> tuple[bool, list[str], dict]:
-    positives = int(np.asarray(y_va).astype(int).sum())
-    top_n = int(ranking.get("ranking_top_n") or cfg.get("ranking_top_n") or 5000)
-    effective_n = int(ranking.get("ranking_effective_n") or 0)
-    hits_at_n = float(ranking.get("hits_at_n") or 0.0)
-    lift_at_n = float(ranking.get("lift_at_n") or 0.0)
-    precision_at_n = float(ranking.get("precision_at_n") or 0.0)
-    prevalence = float(ranking.get("val_prevalence") or 0.0)
-    score_p99_minus_p50 = float(score_stats["score_p99"] - score_stats["score_p50"])
-    unique_scores = int(score_stats["score_unique_rounded_6"])
-
-    min_positives = _env_int("MAIN_XGB_GUARD_MIN_ACTUAL_POSITIVES", 20)
-    min_hits = _env_int("MAIN_XGB_GUARD_MIN_HITS_AT_N", 20)
-    min_lift = _env_float("MAIN_XGB_GUARD_MIN_LIFT_AT_N", 1.0)
-    min_score_sep = _env_float("MAIN_XGB_GUARD_MIN_P99_P50", 0.02)
-    min_unique_scores = _env_int("MAIN_XGB_GUARD_MIN_UNIQUE_SCORES", 100)
-
-    reasons: list[str] = []
-    if effective_n <= 0:
-        reasons.append(f"effective_n={effective_n} <= 0")
-    if positives >= min_positives and hits_at_n < min_hits:
-        reasons.append(
-            f"hits@{top_n}={hits_at_n:.0f} < {min_hits} "
-            f"(actual_positives={positives})"
-        )
-    if positives > 0 and lift_at_n < min_lift:
-        reasons.append(f"lift@{top_n}={lift_at_n:.2f}x < {min_lift:.2f}x")
-    if positives > 0 and precision_at_n <= prevalence:
-        reasons.append(
-            f"precision@{top_n}={precision_at_n:.6f} <= prevalence={prevalence:.6f}"
-        )
-    if score_p99_minus_p50 < min_score_sep:
-        reasons.append(
-            f"score_p99_minus_p50={score_p99_minus_p50:.6f} < {min_score_sep:.6f}"
-        )
-    if unique_scores < min_unique_scores:
-        reasons.append(f"unique_scores={unique_scores} < {min_unique_scores}")
-
-    meta = {
-        "guard_actual_positives": positives,
-        "guard_min_actual_positives": int(min_positives),
-        "guard_min_hits_at_n": int(min_hits),
-        "guard_min_lift_at_n": float(min_lift),
-        "guard_min_p99_p50": float(min_score_sep),
-        "guard_score_p99_minus_p50": float(score_p99_minus_p50),
-        "guard_min_unique_scores": int(min_unique_scores),
-        "guard_unique_scores": int(unique_scores),
-    }
-    return not reasons, reasons, meta
-
-
 def select_feature_cols_for_model(df: pd.DataFrame, label_col: str):
     drop_cols = {
         "cms_code_enc", "window_size", "window_start", "window_end",
@@ -231,7 +172,6 @@ def train_main_xgb_option_B(
     df_tr: pd.DataFrame,
     df_va: pd.DataFrame,
     cfg: dict,
-    df_rule_aux: pd.DataFrame | None = None,
 ):
     h = int(cfg["horizon"])
     label_col = f"y_churn_t_plus_{h}"
@@ -388,82 +328,29 @@ def train_main_xgb_option_B(
     # optimize threshold on MAIN val
     thr_opt, p_opt, r_opt, f1_opt = best_threshold_by_f1_np(y_va, va_prob, n_grid=600)
     ap = average_precision_np(y_va, va_prob)
-    ranking_top_n = int(cfg.get("ranking_top_n") or 5000)
-    ranking = ranking_metrics_at_n(y_va, va_prob, n=ranking_top_n)
-    aux_prob = np.array([], dtype=float)
-    if df_rule_aux is not None and not df_rule_aux.empty:
-        X_aux = df_rule_aux[feat_cols].copy()
-        for c in date_cols:
-            X_aux[c] = date_col_to_ordinal(X_aux[c])
-        for c in cat_cols:
-            X_aux[c] = safe_to_category(X_aux[c])
-        for c in feat_cols:
-            if c not in cat_cols and c not in date_cols:
-                X_aux[c] = pd.to_numeric(X_aux[c], errors="coerce")
-
-        if used_mode == "native_categorical":
-            X_aux_s = X_aux.rename(columns=feature_name_map)
-            aux_prob = predict_proba_best_iteration(model, X_aux_s)[:, 1]
-        else:
-            _, X_aux_oh, _ = onehot_align_train_val(X_tr, X_aux, cat_cols=cat_cols)
-            aux_prob = predict_proba_best_iteration(model, X_aux_oh)[:, 1]
-        logger.info(
-            "[MAIN AUX RULE HOLDOUT] rows=%d origins=%s",
-            len(df_rule_aux),
-            sorted(df_rule_aux["window_end"].astype(int).unique()),
-        )
-    eval_df = (
-        pd.concat([df_va, df_rule_aux], axis=0, ignore_index=True)
-        if df_rule_aux is not None and not df_rule_aux.empty
-        else df_va.reset_index(drop=True)
-    )
-    eval_prob = np.concatenate([va_prob, aux_prob]) if len(aux_prob) else va_prob
-    source_ranking = label_source_ranking_metrics(
-        eval_df,
-        eval_prob,
-        label_col=label_col,
-        ranking_top_n=ranking_top_n,
-    )
+    roc_auc = float(roc_auc_score(y_va, va_prob)) if len(np.unique(y_va)) == 2 else None
     primary_sources = (
         sorted(df_va["label_source"].dropna().astype(str).unique())
         if "label_source" in df_va.columns
         else []
     )
-    primary_label_source = "actual" if primary_sources == ["actual"] else "rule_based"
-    logger.info(
-        "[MAIN RANKING METRICS][PRIMARY %s] top_n=%d effective_n=%d hits=%d "
-        "precision=%.4f%% recall=%.2f%% lift=%.2fx prevalence=%.4f%%",
-        primary_label_source.upper(),
-        ranking["ranking_top_n"],
-        ranking["ranking_effective_n"],
-        ranking["hits_at_n"],
-        100.0 * ranking["precision_at_n"],
-        100.0 * ranking["recall_at_n"],
-        ranking["lift_at_n"],
-        100.0 * ranking["val_prevalence"],
+    primary_label_source = (
+        "unknown"
+        if not primary_sources
+        else primary_sources[0]
+        if len(primary_sources) == 1
+        else "mixed"
     )
-    if "rule_lift_at_n" in source_ranking:
-        logger.info(
-            "[MAIN RANKING METRICS][AUX RULE] top_n=%d effective_n=%d hits=%d "
-            "precision=%.4f%% recall=%.2f%% lift=%.2fx prevalence=%.4f%%",
-            source_ranking["rule_ranking_top_n"],
-            source_ranking["rule_ranking_effective_n"],
-            source_ranking["rule_hits_at_n"],
-            100.0 * source_ranking["rule_precision_at_n"],
-            100.0 * source_ranking["rule_recall_at_n"],
-            source_ranking["rule_lift_at_n"],
-            100.0 * source_ranking["rule_val_prevalence"],
-        )
     logger.info(
-        "[MAIN RANKING METRICS][WEIGHTED COMBINED] top_n=%d effective_n=%d "
-        "weighted_hits=%.2f precision=%.4f%% recall=%.2f%% lift=%.2fx prevalence=%.4f%%",
-        source_ranking["combined_weighted_ranking_top_n"],
-        source_ranking["combined_weighted_ranking_effective_n"],
-        source_ranking["combined_weighted_hits_at_n"],
-        100.0 * source_ranking["combined_weighted_precision_at_n"],
-        100.0 * source_ranking["combined_weighted_recall_at_n"],
-        source_ranking["combined_weighted_lift_at_n"],
-        100.0 * source_ranking["combined_weighted_val_prevalence"],
+        "[MAIN CLASSIFICATION METRICS][%s] F1=%.4f precision=%.4f recall=%.4f "
+        "AP=%.4f ROC_AUC=%s prevalence=%.4f%%",
+        primary_label_source.upper(),
+        f1_opt,
+        p_opt,
+        r_opt,
+        ap,
+        f"{roc_auc:.4f}" if roc_auc is not None else "n/a",
+        100.0 * float(y_va.mean()),
     )
     
     # Calculate confusion matrix at optimal threshold
@@ -477,32 +364,6 @@ def train_main_xgb_option_B(
         thr_opt, tn, fp, fn, tp,
         tp / (tp + fp + 1e-9), tp / (tp + fn + 1e-9), f1_opt,
     )
-
-    operational_pass, operational_reasons, operational_meta = _ranking_operational_guardrail(
-        y_va=y_va,
-        ranking=ranking,
-        score_stats=score_stats,
-        cfg=cfg,
-    )
-    logger.info(
-        "[MAIN GUARDRAIL][RANKING DIAGNOSTIC] pass=%s hits@%d=%s lift@%d=%.2fx "
-        "precision@%d=%.4f%% prevalence=%.4f%% p99_minus_p50=%.6f unique_scores=%d",
-        operational_pass,
-        ranking["ranking_top_n"],
-        ranking["hits_at_n"],
-        ranking["ranking_top_n"],
-        ranking["lift_at_n"],
-        ranking["ranking_top_n"],
-        100.0 * ranking["precision_at_n"],
-        100.0 * ranking["val_prevalence"],
-        operational_meta["guard_score_p99_minus_p50"],
-        operational_meta["guard_unique_scores"],
-    )
-    if not operational_pass:
-        logger.warning(
-            "[MAIN GUARDRAIL][RANKING DIAGNOSTIC] %s",
-            " | ".join(operational_reasons),
-        )
 
     # Degenerate guard: predict-all-positive → vô dụng cho production
     if tn + fn == 0:
@@ -559,10 +420,8 @@ def train_main_xgb_option_B(
         "used_mode": used_mode,
 
         "AP_val": float(ap),
+        "ROC_AUC_val": roc_auc,
         **score_stats,
-        **operational_meta,
-        **ranking,
-        **source_ranking,
 
         "xgb_es_rounds": int(es_rounds),
         "xgb_best_iteration": int(best_it) if best_it is not None else None,
@@ -591,25 +450,23 @@ def train_main_xgb_option_B(
 
 def run_main_variant(engine, cfg: dict, df_static: pd.DataFrame, use_static_flag: bool):
     from preprocess.trainval import build_train_val_for_main
-    df_all, df_tr, df_va, val_month_main = build_train_val_for_main(
+    _df_all, df_tr, df_va, val_month_main = build_train_val_for_main(
         engine, cfg, df_static, use_static_override=use_static_flag
     )
     cfg_tmp = dict(cfg)
     cfg_tmp["use_static"] = bool(use_static_flag)
-    df_rule_aux = auxiliary_rule_holdout(df_all, int(val_month_main), time_col="window_end")
 
     try:
         model, report, feat_cols, cat_cols, fmap, date_cols = train_main_xgb_option_B(
             df_tr,
             df_va,
             cfg_tmp,
-            df_rule_aux=df_rule_aux,
         )
     except ValueError as e:
         logger.warning("Variant K=%d use_static=%s rejected: %s",
                        cfg['best_k'], use_static_flag, e)
         return {"use_static": bool(use_static_flag), "guardrail_warning": str(e),
-                "F1_val": 0.0, "AP_val": 0.0, "Lift_at_n": 0.0}
+                "F1_val": 0.0, "AP_val": 0.0, "ROC_AUC_val": 0.0}
 
     # baseline profile for monitoring drift (built on train split)
     feature_profile = compute_feature_profile(df_tr, feat_cols=feat_cols, cat_cols=cat_cols)
@@ -621,7 +478,7 @@ def run_main_variant(engine, cfg: dict, df_static: pd.DataFrame, use_static_flag
         "val_rows": int(len(df_va)),
         "AP_val": float(report["AP_val"]),
         "F1_val": float(report["f1@main_thr"]),
-        "Lift_at_n": float(report["lift_at_n"]),
+        "ROC_AUC_val": float(report["ROC_AUC_val"] or 0.0),
         "guardrail_warning": report.get("guardrail_warning"),
         "report": report,
         "model": model,

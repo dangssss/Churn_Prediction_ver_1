@@ -21,7 +21,6 @@ from sklearn.metrics import (
 from preprocess.dataset import build_dataset_for_k, preflight_purged_train_val_for_k
 from preprocess.static_features import attach_static
 from infra.yymm import shift_yymm
-from common.metrics import ranking_metrics_at_n, prefixed_ranking_metrics_at_n
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -126,66 +125,6 @@ def time_split_train_val_last_month(
     )
     return df_tr, df_va, val_month
 
-
-def auxiliary_rule_holdout(
-    df: pd.DataFrame,
-    val_month: int,
-    *,
-    time_col: str = "window_end",
-) -> pd.DataFrame:
-    if "label_source" not in df.columns:
-        return pd.DataFrame(columns=df.columns)
-    time_values = df[time_col].astype(int)
-    mask = (df["label_source"] == "rule_based") & (time_values > int(val_month))
-    return df[mask].copy()
-
-
-def label_source_ranking_metrics(
-    df_eval: pd.DataFrame,
-    y_prob: np.ndarray,
-    *,
-    label_col: str,
-    ranking_top_n: int,
-) -> dict:
-    """Compute source-separated ranking metrics for validation reporting."""
-    out: dict = {}
-    if df_eval.empty:
-        return out
-    y_prob = np.asarray(y_prob, dtype=float)
-    if len(df_eval) != len(y_prob):
-        raise ValueError("df_eval and y_prob must have the same length")
-
-    if "label_source" in df_eval.columns:
-        source = df_eval["label_source"].astype(str)
-        source_specs = [("actual", "actual"), ("rule_based", "rule")]
-        for source_value, prefix in source_specs:
-            mask = source == source_value
-            if not bool(mask.any()):
-                continue
-            out.update(
-                prefixed_ranking_metrics_at_n(
-                    df_eval.loc[mask, label_col].astype(int).to_numpy(),
-                    y_prob[mask.to_numpy()],
-                    n=ranking_top_n,
-                    prefix=prefix,
-                )
-            )
-
-    weights = (
-        pd.to_numeric(df_eval["label_weight"], errors="coerce").fillna(1.0).to_numpy()
-        if "label_weight" in df_eval.columns
-        else None
-    )
-    out.update(
-        prefixed_ranking_metrics_at_n(
-            df_eval[label_col].astype(int).to_numpy(),
-            y_prob,
-            n=ranking_top_n,
-            prefix="combined_weighted",
-            sample_weight=weights,
-        )
-    )
-    return out
 
 def eval_one_k_train_val(
     engine: Engine,
@@ -316,7 +255,7 @@ def eval_one_k_train_val(
     clf = LogisticRegression(
         max_iter=5000,
         solver="saga",   # saga: solver duy nhất hỗ trợ ElasticNet (l1_ratio ∈ (0,1))
-        tol=1e-3,        # relaxed tolerance: converge nhanh hơn mà không ảnh hưởng chất lượng ranking
+        tol=1e-3,
         class_weight=class_weight_used,
         l1_ratio=0.5,    # ElasticNet: 0=L2, 1=L1, 0.5=50/50 mix — penalty string deprecated từ sklearn 1.8
         C=0.1,           # regularization strength (ngược với lambda); 0.1 = mạnh hơn default (1.0)
@@ -326,77 +265,15 @@ def eval_one_k_train_val(
     pipe.fit(X_tr, y_tr, clf__sample_weight=sample_weight.to_numpy())
 
     va_prob = pipe.predict_proba(X_va)[:, 1]
-    df_rule_aux = auxiliary_rule_holdout(df_k, int(val_month), time_col="window_end")
-    aux_prob = np.array([], dtype=float)
-    if not df_rule_aux.empty:
-        X_aux = df_rule_aux[num_cols + cat_cols]
-        aux_prob = pipe.predict_proba(X_aux)[:, 1]
-        logger.info(
-            "[AUX RULE HOLDOUT] K=%d use_static=%s rows=%d origins=%s",
-            k,
-            use_static,
-            len(df_rule_aux),
-            sorted(df_rule_aux["window_end"].astype(int).unique()),
-        )
-
     pr_auc  = average_precision_score(y_va, va_prob)
     roc_auc = roc_auc_score(y_va, va_prob)
-    ranking_top_n = int(os.getenv("MODEL_RANKING_TOP_N", "5000"))
-    ranking = ranking_metrics_at_n(y_va.to_numpy(), va_prob, n=ranking_top_n)
-    eval_df = pd.concat([df_va, df_rule_aux], axis=0, ignore_index=True)
-    eval_prob = np.concatenate([va_prob, aux_prob]) if len(aux_prob) else va_prob
-    source_ranking = label_source_ranking_metrics(
-        eval_df,
-        eval_prob,
-        label_col=label_col,
-        ranking_top_n=ranking_top_n,
-    )
-    logger.info(
-        "[RANKING METRICS][PRIMARY %s] K=%d use_static=%s top_n=%d effective_n=%d "
-        "hits=%d precision=%.4f%% recall=%.2f%% lift=%.2fx prevalence=%.4f%%",
-        validation_label_source.upper(),
-        k,
-        use_static,
-        ranking["ranking_top_n"],
-        ranking["ranking_effective_n"],
-        ranking["hits_at_n"],
-        100.0 * ranking["precision_at_n"],
-        100.0 * ranking["recall_at_n"],
-        ranking["lift_at_n"],
-        100.0 * ranking["val_prevalence"],
-    )
-    if "rule_lift_at_n" in source_ranking:
-        logger.info(
-            "[RANKING METRICS][AUX RULE] K=%d use_static=%s top_n=%d effective_n=%d "
-            "hits=%d precision=%.4f%% recall=%.2f%% lift=%.2fx prevalence=%.4f%%",
-            k,
-            use_static,
-            source_ranking["rule_ranking_top_n"],
-            source_ranking["rule_ranking_effective_n"],
-            source_ranking["rule_hits_at_n"],
-            100.0 * source_ranking["rule_precision_at_n"],
-            100.0 * source_ranking["rule_recall_at_n"],
-            source_ranking["rule_lift_at_n"],
-            100.0 * source_ranking["rule_val_prevalence"],
-        )
-    logger.info(
-        "[RANKING METRICS][WEIGHTED COMBINED] K=%d use_static=%s top_n=%d effective_n=%d "
-        "weighted_hits=%.2f precision=%.4f%% recall=%.2f%% lift=%.2fx prevalence=%.4f%%",
-        k,
-        use_static,
-        source_ranking["combined_weighted_ranking_top_n"],
-        source_ranking["combined_weighted_ranking_effective_n"],
-        source_ranking["combined_weighted_hits_at_n"],
-        100.0 * source_ranking["combined_weighted_precision_at_n"],
-        100.0 * source_ranking["combined_weighted_recall_at_n"],
-        source_ranking["combined_weighted_lift_at_n"],
-        100.0 * source_ranking["combined_weighted_val_prevalence"],
-    )
 
     thr = best_threshold_by_f1(y_va.to_numpy(), va_prob)
     yhat = (va_prob >= thr).astype(int)
 
     f1_val = float(f1_score(y_va, yhat, zero_division=0))
+    precision_val = float(precision_score(y_va, yhat, zero_division=0))
+    recall_val = float(recall_score(y_va, yhat, zero_division=0))
 
     # Bug #2: đánh dấu degenerate nếu F1 gần bằng predict-all-positive
     prevalence = float(y_va.mean())
@@ -404,6 +281,21 @@ def eval_one_k_train_val(
     is_degenerate = abs(f1_val - dummy_f1) < 0.005
     if is_degenerate:
         logger.warning("K=%d use_static=%s: model degenerate (F1=%.4f ≈ dummy=%.4f, predict-all-positive)", k, use_static, f1_val, dummy_f1)
+
+    logger.info(
+        "[CLASSIFICATION METRICS] K=%d use_static=%s val=%s source=%s "
+        "F1=%.4f precision=%.4f recall=%.4f PR_AUC=%.4f ROC_AUC=%.4f prevalence=%.4f%%",
+        k,
+        use_static,
+        val_month,
+        validation_label_source,
+        f1_val,
+        precision_val,
+        recall_val,
+        float(pr_auc),
+        float(roc_auc),
+        100.0 * prevalence,
+    )
 
     return {
         "K": int(k),
@@ -421,11 +313,10 @@ def eval_one_k_train_val(
         "n_cat": int(len(cat_cols)),
         "PR_AUC_val": float(pr_auc),
         "ROC_AUC_val": float(roc_auc),
-        **ranking,
-        **source_ranking,
+        "val_prevalence": float(prevalence),
         "best_threshold": float(thr),
-        "precision": float(precision_score(y_va, yhat, zero_division=0)),
-        "recall": float(recall_score(y_va, yhat, zero_division=0)),
+        "precision": precision_val,
+        "recall": recall_val,
         "f1": f1_val,
         "degenerate": is_degenerate,
     }
@@ -494,18 +385,11 @@ def train_baseline_model_for_config(
     pipe.fit(X_tr, y_tr, clf__sample_weight=sample_weight.to_numpy())
 
     va_prob = pipe.predict_proba(X_va)[:, 1]
-    ranking_top_n = int(cfg.get("ranking_top_n") or os.getenv("MODEL_RANKING_TOP_N", "5000"))
-    ranking = ranking_metrics_at_n(y_va.to_numpy(), va_prob, n=ranking_top_n)
-    source_ranking = label_source_ranking_metrics(
-        df_va.reset_index(drop=True),
-        va_prob,
-        label_col=label_col,
-        ranking_top_n=ranking_top_n,
-    )
     pr_auc = average_precision_score(y_va, va_prob)
     roc_auc = roc_auc_score(y_va, va_prob)
     thr = best_threshold_by_f1(y_va.to_numpy(), va_prob)
     yhat = (va_prob >= thr).astype(int)
+    val_prevalence = float(y_va.mean())
 
     try:
         from monitoring.drift import compute_feature_profile
@@ -528,8 +412,7 @@ def train_baseline_model_for_config(
         "val_rows": int(len(df_va)),
         "AP_val": float(pr_auc),
         "ROC_AUC_val": float(roc_auc),
-        **ranking,
-        **source_ranking,
+        "val_prevalence": val_prevalence,
         "thr_main_opt": float(thr),
         "precision@main_thr": float(precision_score(y_va, yhat, zero_division=0)),
         "recall@main_thr": float(recall_score(y_va, yhat, zero_division=0)),
@@ -537,17 +420,12 @@ def train_baseline_model_for_config(
         "guardrail_warning": None,
     }
     logger.warning(
-        "[BASELINE FALLBACK BUNDLE] K=%d use_static=%s Lift@%d=%.2fx "
-        "Precision@%d=%.4f%% Recall@%d=%.2f%% hits=%d",
+        "[BASELINE FALLBACK BUNDLE] K=%d use_static=%s F1=%.4f AP=%.4f ROC_AUC=%.4f",
         k,
         use_static,
-        ranking["ranking_top_n"],
-        ranking["lift_at_n"],
-        ranking["ranking_top_n"],
-        100.0 * ranking["precision_at_n"],
-        ranking["ranking_top_n"],
-        100.0 * ranking["recall_at_n"],
-        ranking["hits_at_n"],
+        report["f1@main_thr"],
+        report["AP_val"],
+        report["ROC_AUC_val"],
     )
     return {
         "model": pipe,

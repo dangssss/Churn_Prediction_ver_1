@@ -106,7 +106,7 @@ def cmd_prepare_scoring(args) -> None:
             )
         logger.warning(
             "[BOOTSTRAP] No model bundle found. Starting first sweep/train with freshness=%s. "
-            "DEGRADED bootstrap may use weighted rule-based labels.",
+            "DEGRADED bootstrap may use mixed actual/rule-based labels.",
             freshness_status,
         )
         run_monthly_pipeline(
@@ -193,12 +193,9 @@ def cmd_sweep_k(args) -> None:
     logger.info("Sweep result (NOT saved to DB): %s", best_cfg)
     cols = [
         c for c in [
-            "K", "use_static", "val_month", "ranking_top_n",
-            "hits_at_n", "precision_at_n", "recall_at_n", "lift_at_n",
-            "rule_hits_at_n", "rule_precision_at_n", "rule_recall_at_n", "rule_lift_at_n",
-            "combined_weighted_hits_at_n", "combined_weighted_precision_at_n",
-            "combined_weighted_recall_at_n", "combined_weighted_lift_at_n",
-            "f1", "PR_AUC_val", "best_threshold", "spw_used",
+            "K", "use_static", "val_month",
+            "f1", "precision", "recall", "PR_AUC_val", "ROC_AUC_val",
+            "val_prevalence", "best_threshold", "spw_used",
         ] if c in df_ab.columns
     ]
     logger.info("TOP-10:\n%s", df_ab[cols].head(10).to_string(index=False))
@@ -217,7 +214,7 @@ def cmd_train_main(args) -> None:
     ok = [v for v in variants if not v.get("guardrail_warning")]
     if not ok:
         raise RuntimeError("All variants failed guardrail. Stop training.")
-    ok.sort(key=lambda r: (r["F1_val"], r["AP_val"], r["Lift_at_n"]), reverse=True)
+    ok.sort(key=lambda r: (r["F1_val"], r["AP_val"], r["ROC_AUC_val"]), reverse=True)
     best = ok[0]
 
     cfg = dict(cfg)
