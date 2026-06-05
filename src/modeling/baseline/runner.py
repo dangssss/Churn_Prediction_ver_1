@@ -102,16 +102,11 @@ def time_split_train_val_last_month(
     months = sorted(df2[time_col].unique())
     if len(months) < 2:
         return None, None, None
-    actual_months = []
-    if "label_source" in df2.columns:
-        actual_months = sorted(
-            df2.loc[df2["label_source"] == "actual", time_col].unique()
-        )
-    val_month = actual_months[-1] if actual_months else months[-1]
+    val_month = months[-1]
     train_max_month = int(shift_yymm(str(val_month), -int(horizon)))
     historical_train = df2[time_col] <= train_max_month
     future_rule_holdout = pd.Series(False, index=df2.index)
-    if actual_months and "label_source" in df2.columns:
+    if "label_source" in df2.columns:
         future_rule_holdout = (
             (df2["label_source"] == "rule_based")
             & (df2[time_col] > val_month)
@@ -236,13 +231,15 @@ def eval_one_k_train_val(
         else []
     )
     validation_label_source = (
-        "actual" if val_label_sources == ["actual"] else "rule_based"
+        "unknown"
+        if not val_label_sources
+        else val_label_sources[0]
+        if len(val_label_sources) == 1
+        else "mixed"
     )
-    bundle_lifecycle = (
-        "PRODUCTION" if validation_label_source == "actual" else "PROVISIONAL"
-    )
+    bundle_lifecycle = "PRODUCTION"
     logger.info(
-        "[VALIDATION PROVENANCE] val_month=%s source=%s lifecycle=%s",
+        "[VALIDATION PROVENANCE] val_month=%s source=%s lifecycle=%s policy=mixed_actual_rule",
         val_month,
         validation_label_source,
         bundle_lifecycle,

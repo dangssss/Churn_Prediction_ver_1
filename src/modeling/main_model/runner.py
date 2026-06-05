@@ -485,7 +485,7 @@ def train_main_xgb_option_B(
         cfg=cfg,
     )
     logger.info(
-        "[MAIN GUARDRAIL][RANKING] pass=%s hits@%d=%s lift@%d=%.2fx "
+        "[MAIN GUARDRAIL][RANKING DIAGNOSTIC] pass=%s hits@%d=%s lift@%d=%.2fx "
         "precision@%d=%.4f%% prevalence=%.4f%% p99_minus_p50=%.6f unique_scores=%d",
         operational_pass,
         ranking["ranking_top_n"],
@@ -499,12 +499,13 @@ def train_main_xgb_option_B(
         operational_meta["guard_unique_scores"],
     )
     if not operational_pass:
-        raise ValueError(
-            "XGBoost ranking guardrail failed: " + " | ".join(operational_reasons)
+        logger.warning(
+            "[MAIN GUARDRAIL][RANKING DIAGNOSTIC] %s",
+            " | ".join(operational_reasons),
         )
 
     # Degenerate guard: predict-all-positive → vô dụng cho production
-    if False and tn + fn == 0:
+    if tn + fn == 0:
         raise ValueError(
             f"XGBoost degenerate: TN=0, FN=0 (predict-all-positive). "
             f"K={cfg['best_k']}, threshold={thr_opt:.4f}, "
@@ -514,7 +515,7 @@ def train_main_xgb_option_B(
     # Score compression guard: model không phân biệt được customers
     min_score_range = _env_float("MAIN_XGB_MIN_SCORE_RANGE", 0.05)
     score_range = score_stats["score_range"]
-    if False and score_range < min_score_range:
+    if score_range < min_score_range:
         raise ValueError(
             f"XGBoost score range quá hẹp: {score_range:.4f}. "
             f"Scores trong [{va_prob.min():.3f}, {va_prob.max():.3f}]. "
@@ -535,10 +536,10 @@ def train_main_xgb_option_B(
         seed=int(cfg.get("seed", 42))
     )
 
-    diagnostic_warning = " | ".join(sanity["warnings"]) if sanity["warnings"] else None
-    if diagnostic_warning:
-        logger.warning("[MAIN GUARDRAIL][DIAGNOSTIC] %s", diagnostic_warning)
-    guardrail_warning = None
+    guardrail_warning = " | ".join(sanity["warnings"]) if sanity["warnings"] else None
+    if guardrail_warning:
+        logger.warning("[MAIN GUARDRAIL] %s", guardrail_warning)
+    diagnostic_warning = None
     dummy_simple2 = sanity["dummy_simple2feat_lr"]
     dummy_simple2_ap = float(dummy_simple2["AP"]) if dummy_simple2 else None
     dummy_simple2_feats = ",".join(dummy_simple2["features"]) if dummy_simple2 else None

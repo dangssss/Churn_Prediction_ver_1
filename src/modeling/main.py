@@ -217,7 +217,7 @@ def cmd_train_main(args) -> None:
     ok = [v for v in variants if not v.get("guardrail_warning")]
     if not ok:
         raise RuntimeError("All variants failed guardrail. Stop training.")
-    ok.sort(key=lambda r: (r["Lift_at_n"], r["AP_val"], r["F1_val"]), reverse=True)
+    ok.sort(key=lambda r: (r["F1_val"], r["AP_val"], r["Lift_at_n"]), reverse=True)
     best = ok[0]
 
     cfg = dict(cfg)
