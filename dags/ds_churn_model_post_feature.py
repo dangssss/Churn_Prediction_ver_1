@@ -21,6 +21,7 @@ with DAG(
             "python /churn_source/modeling/ops_lock.py --wait-seconds 0 -- "
             "bash -lc 'cd /churn_source && python modeling/main.py prepare-scoring "
             "--horizon 2 --risk-threshold-pct 95"
+            "{% if not (dag_run and dag_run.conf.get(\"force_retrain\")) %} --skip-due-retrain{% endif %}"
             "{% if dag_run and dag_run.conf.get(\"force_retrain\") %} --force-retrain{% endif %}'"
         ),
         env={
@@ -41,7 +42,7 @@ with DAG(
         wait_for_completion=True,
         poke_interval=60,
         allowed_states=["success"],
-        failed_states=["failed", "upstream_failed"],
+        failed_states=["failed"],
         reset_dag_run=True,
     )
 

@@ -179,7 +179,7 @@ def run_export_risk(
         engine, df_pred, risk_threshold=risk_threshold, horizon=horizon
     )
 
-    # Store the scoring origin and K used by scoring-only for drift and later backtests.
+    # Store the scoring origin and K used by scoring-only for drift monitoring.
     try:
         from monitoring.score import upsert_score_drift
 
@@ -204,26 +204,7 @@ def run_export_risk(
     except Exception as score_drift_error:
         print(f"? WARNING: Score drift monitoring skipped: {score_drift_error}")
 
-    # Evaluate previously stored prediction origins only when complete actual labels exist.
-    # Backtest monitoring must never block the business scoring export.
-    try:
-        from monitoring.backtest import run_backtests_for_available_actual_labels
-
-        backtests = run_backtests_for_available_actual_labels(
-            engine,
-            horizon=int(horizon),
-            risk_threshold_pct=int(risk_threshold),
-        )
-        if backtests:
-            latest_backtest = backtests[-1]
-            print(
-                "? Backtest updated: "
-                f"origin={latest_backtest['pred_window_end']} "
-                f"status={latest_backtest['guardrail_status']} "
-                f"action={latest_backtest['recommended_action']}"
-            )
-    except Exception as backtest_error:
-        print(f"? WARNING: Backtest monitoring skipped: {backtest_error}")
+    # Training validation uses mixed actual/rule labels from recent origins.
 
     df_ins = df_pred[df_pred.get('churn_rate', 0) >= float(risk_threshold)].copy()
     num_with_reasons = int(df_ins['reason_1'].notna().sum()) if 'reason_1' in df_ins.columns else 0

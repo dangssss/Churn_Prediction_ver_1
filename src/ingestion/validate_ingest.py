@@ -145,12 +145,18 @@ def _validate_core(cur, details: dict) -> list[str]:
         previous_order = order_tables[-2]
         previous_count = _table_count(cur, "public", previous_order)
         ratio = latest_count / previous_count if previous_count else 0.0
+        min_ratio = _env_float("FRESHNESS_MIN_ROW_RATIO", 0.80)
         details["previous_order_table"] = previous_order
         details["previous_order_rows"] = previous_count
         details["latest_previous_order_row_ratio"] = round(ratio, 6)
-        if previous_count and ratio < _env_float("FRESHNESS_MIN_ROW_RATIO", 0.80):
+        details["latest_previous_order_row_ratio_min"] = min_ratio
+        if previous_count and ratio < min_ratio and _month_index(latest_yymm) <= _month_index(expected_yymm):
             failures.append(
                 f"public.{latest_order} row ratio {ratio:.3f} is below minimum"
+            )
+        elif previous_count and ratio < min_ratio:
+            details["latest_previous_order_row_ratio_policy"] = (
+                "SKIPPED_PARTIAL_CURRENT_MONTH"
             )
 
     max_snapshot_age = _env_int("FRESHNESS_SNAPSHOT_MAX_AGE_DAYS", 14)

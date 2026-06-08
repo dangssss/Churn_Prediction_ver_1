@@ -126,25 +126,25 @@ def preflight_purged_train_val_for_k(
         raise ValueError(f"No feature tables for K={k}")
 
     labelable = []
-    actual_origins = []
     for table in tables:
         _, _, end = parse_feature_table_name(table)
         has_actual = bool(label_tables_for_horizon(engine, end, int(horizon)))
-        has_fallback = False if has_actual else _has_post_origin_activity_tables(
+        has_fallback = _has_post_origin_activity_tables(
             engine,
             origin_yymm=end,
             horizon=int(horizon),
         )
-        if has_actual or has_fallback:
-            labelable.append((table, int(end), "actual" if has_actual else "rule_based"))
-        if has_actual:
-            actual_origins.append(int(end))
+        if has_fallback:
+            source = "mixed_actual_rule" if has_actual else "rule_based"
+            labelable.append((table, int(end), source))
 
     if not labelable:
         raise ValueError(f"No labelable feature tables for K={k}, H={horizon}")
 
-    val_month = max(actual_origins) if actual_origins else max(end for _, end, _ in labelable)
-    train_max_month = int(shift_yymm(str(val_month), -int(horizon)))
+    validation_origin_count = max(1, int(os.getenv("VALIDATION_ORIGIN_COUNT", "2")))
+    validation_months = sorted({end for _, end, _ in labelable})[-validation_origin_count:]
+    val_month = max(validation_months)
+    train_max_month = int(shift_yymm(str(min(validation_months)), -int(horizon)))
     train_tables = [
         table
         for table, end, source in labelable
@@ -165,17 +165,18 @@ def preflight_purged_train_val_for_k(
 
     logger.info(
         "[PURGED PREFLIGHT] K=%d H=%d val_month=%d train_origin_max=%d "
-        "available_tables=%d train_tables=%d train_origins=%d required_origins=%d "
-        "validation_source=%s",
+        "validation_months=%s available_tables=%d train_tables=%d train_origins=%d "
+        "required_origins=%d validation_source=%s",
         k,
         horizon,
         val_month,
         train_max_month,
+        ",".join(str(m) for m in validation_months),
         len(tables),
         len(train_tables),
         len(train_origins),
         min_train_origins,
-        "actual" if actual_origins else "rule_based",
+        "mixed",
     )
     return val_month, train_max_month
 
@@ -265,12 +266,14 @@ def build_labeled_pair(
 
     df_t = load_feature_table(engine, table_t, limit=limit)
 
+    label_col = f"y_churn_t_plus_{horizon}"
     label_tables = label_tables_for_horizon(engine, end, horizon)
+    actual_matched: pd.Series | None = None
+    actual_label_sources = ""
     if label_tables:
         if "cms_code_enc" not in df_t.columns:
             raise KeyError("Missing cms_code_enc to join label")
 
-        label_col = f"y_churn_t_plus_{horizon}"
         d = df_t.copy()
         d["cms_code_enc"] = d["cms_code_enc"].astype(str).str.strip()
         labels = pd.concat(
@@ -305,27 +308,19 @@ def build_labeled_pair(
 
             matched = matched | crm_series.isin(crm_keys).to_numpy()
 
-        d[label_col] = matched.astype(int)
-        if "window_end" not in d.columns:
-            d["window_end"] = end
-        d["source_table_t"] = table_t
-        label_sources = ",".join(f"{LABEL_SCHEMA}.{label_table}" for label_table in label_tables)
-        d["source_table_t_plus_h"] = label_sources
-        d["label_source"] = "actual"
-        d["label_weight"] = 1.0
-
-        n_pos = int(d[label_col].sum())
+        actual_matched = matched.astype(int)
+        actual_label_sources = ",".join(f"{LABEL_SCHEMA}.{label_table}" for label_table in label_tables)
+        n_pos = int(actual_matched.sum())
         logger.info(
-            "Generated %s from actual labels [%s] for window %s: Churn=%d (%.1f%%) | Active=%d | Total=%d",
+            "Loaded actual positives for %s [%s] on window %s: Churn=%d (%.1f%%) | Non-matched=%d | Total=%d",
             label_col,
-            label_sources,
+            actual_label_sources,
             table_t,
             n_pos,
-            100.0 * n_pos / max(len(d), 1),
-            len(d) - n_pos,
-            len(d),
+            100.0 * n_pos / max(len(actual_matched), 1),
+            len(actual_matched) - n_pos,
+            len(actual_matched),
         )
-        return d
 
     # Rule fallback uses raw order tables strictly after the prediction origin.
     df_tp, table_tp = _load_post_origin_activity(
@@ -474,13 +469,13 @@ def build_labeled_pair(
     )
 
     lab = df_tp[["cms_code_enc"]].copy()
-    lab[f"y_churn_t_plus_{horizon}"] = y.values
+    lab[label_col] = y.values
 
     out = df_t.merge(lab, on="cms_code_enc", how="left")
 
     # Customers that cannot be matched to post-origin activity are unlabeled.
     # Drop them to avoid noisy fallback labels and inflated churn ratios.
-    missing_mask = out[f"y_churn_t_plus_{horizon}"].isna()
+    missing_mask = out[label_col].isna()
     if missing_mask.any():
         n_dropped = int(missing_mask.sum())
         logger.info(
@@ -495,9 +490,38 @@ def build_labeled_pair(
         out["window_end"] = end
 
     out["source_table_t"] = table_t
-    out["source_table_t_plus_h"] = table_tp
-    out["label_source"] = "rule_based"
-    out["label_weight"] = float(os.getenv("RULE_LABEL_SAMPLE_WEIGHT", "0.20"))
+    out["source_table_t_plus_h"] = (
+        f"{table_tp};actual={actual_label_sources}"
+        if actual_label_sources
+        else table_tp
+    )
+
+    actual_positive_mask = pd.Series(False, index=out.index)
+    if actual_matched is not None:
+        actual_lab = df_t[["cms_code_enc"]].copy()
+        actual_lab["cms_code_enc"] = actual_lab["cms_code_enc"].astype(str).str.strip()
+        actual_lab["_actual_label"] = actual_matched.to_numpy()
+        actual_lab = (
+            actual_lab.groupby("cms_code_enc", as_index=False)["_actual_label"]
+            .max()
+        )
+        out = out.merge(actual_lab, on="cms_code_enc", how="left")
+        actual_positive_mask = out["_actual_label"].fillna(0).astype(int).eq(1)
+        rule_positive_before = int((out[label_col] == 1).sum())
+        out.loc[actual_positive_mask, label_col] = 1
+        logger.info(
+            "Mixed labels for %s on %s: rule_churn_before=%d actual_positive_override=%d final_churn=%d",
+            label_col,
+            table_t,
+            rule_positive_before,
+            int(actual_positive_mask.sum()),
+            int((out[label_col] == 1).sum()),
+        )
+        out = out.drop(columns=["_actual_label"])
+
+    rule_weight = float(os.getenv("RULE_LABEL_SAMPLE_WEIGHT", "0.20"))
+    out["label_source"] = "mixed_actual_rule" if actual_label_sources else "rule_based"
+    out["label_weight"] = np.where(actual_positive_mask, 1.0, rule_weight)
     return out
 
 def build_dataset_for_k(engine: Engine, k: int, horizon: int = 1, limit_rows_each: Optional[int] = None) -> pd.DataFrame:

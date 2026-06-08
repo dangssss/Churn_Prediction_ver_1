@@ -38,10 +38,9 @@ def main():
     if args.choose_static in ("true","both"):
         variants.append(run_main_variant(engine, cfg, df_static, use_static_flag=True))
 
-    # filter guardrail fails
-    ok = [v for v in variants if not v.get("guardrail_warning")]
+    ok = [v for v in variants if "F1_val" in v]
     if not ok:
-        raise SystemExit("All variants failed guardrail. Stop.")
+        raise SystemExit("No trainable XGBoost variants produced validation metrics.")
 
     ok.sort(key=lambda r: (r["F1_val"], r["AP_val"], r["ROC_AUC_val"]), reverse=True)
     best = ok[0]

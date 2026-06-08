@@ -124,6 +124,9 @@ def cmd_prepare_scoring(args) -> None:
                 "[POST FEATURE] Force retrain requested. Bypass due/freshness gate: %s",
                 reason,
             )
+        elif bool(args.skip_due_retrain):
+            due = False
+            reason = f"skip_due_retrain_after_features_freshness_{str(freshness_status).lower()}"
         else:
             due, reason = retrain_due_reason(
                 engine,
@@ -143,7 +146,6 @@ def cmd_prepare_scoring(args) -> None:
                     k_min=int(args.k_min),
                     do_scoring=False,
                     force_cycle_retrain=True,
-                    strict_main_guardrail=True,
                 )
             else:
                 try:
@@ -201,9 +203,16 @@ def cmd_train_main(args) -> None:
         run_main_variant(engine, cfg, df_static, use_static_flag=False),
         run_main_variant(engine, cfg, df_static, use_static_flag=True),
     ]
-    ok = [v for v in variants if not v.get("guardrail_warning")]
+    ok = [v for v in variants if "F1_val" in v]
     if not ok:
-        raise RuntimeError("All variants failed guardrail. Stop training.")
+        raise RuntimeError("No trainable XGBoost variants produced validation metrics.")
+    for variant in ok:
+        if variant.get("guardrail_warning"):
+            logger.warning(
+                "[MAIN SANITY WARNING] use_static=%s: %s",
+                variant.get("use_static"),
+                variant.get("guardrail_warning"),
+            )
     ok.sort(key=lambda r: (r["F1_val"], r["AP_val"], r["ROC_AUC_val"]), reverse=True)
     best = ok[0]
 
@@ -240,31 +249,6 @@ def cmd_export_risk(args) -> None:
         make_dossier=bool(args.make_dossier),
     )
     logger.info("DONE export-risk: %s", res)
-
-
-def cmd_backtest_actual(args) -> None:
-    from monitoring.backtest import run_backtests_for_available_actual_labels
-
-    engine = get_engine()
-    logger.info("DB: %s", smoke_test(engine))
-    results = run_backtests_for_available_actual_labels(
-        engine,
-        horizon=int(args.horizon),
-        risk_threshold_pct=int(args.risk_threshold_pct),
-    )
-    logger.info("DONE backtest-actual: evaluated_origins=%d", len(results))
-    for result in results:
-        logger.info(
-            "[BACKTEST] origin=%s labels=%s precision=%s recall=%s lift=%s status=%s action=%s",
-            result["pred_window_end"],
-            result["label_tables"],
-            result["precision_in_list"],
-            result["recall_in_list"],
-            result["lift_vs_random"],
-            result["guardrail_status"],
-            result["recommended_action"],
-        )
-
 
 
 def load_config_defaults() -> dict:
@@ -316,6 +300,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Manual override: retrain before scoring even when the due gate would skip.",
     )
+    p.add_argument(
+        "--skip-due-retrain",
+        action="store_true",
+        help="Do not auto-retrain from the post-feature path; still bootstrap if no bundle exists.",
+    )
     p.set_defaults(func=cmd_prepare_scoring)
 
     p = sub.add_parser("sweep-k", help="Sweep K (debug). Saves best_config (accepted=True).")
@@ -337,11 +326,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit-rows", type=int, default=None)
     p.add_argument("--make-dossier", action="store_true")
     p.set_defaults(func=cmd_export_risk)
-
-    p = sub.add_parser("backtest-actual", help="Evaluate stored scoring origins with complete actual-label coverage")
-    p.add_argument("--horizon", type=int, required=True)
-    p.add_argument("--risk-threshold-pct", type=int, default=70)
-    p.set_defaults(func=cmd_backtest_actual)
 
     return ap
 

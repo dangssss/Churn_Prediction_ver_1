@@ -19,7 +19,6 @@ def start_run(
     risk_threshold_pct: int | None = None,
     prev_best_k: int | None = None,
     prev_best_f1: float | None = None,
-    prev_best_lift_at_n: float | None = None,
     notes: str | None = None,
     schema: str = DEFAULT_SCHEMA,
 ) -> None:
@@ -27,11 +26,11 @@ def start_run(
     q = text(f"""
         INSERT INTO {schema}.churn_ops_runs (
             run_id, status, horizon, risk_threshold_pct,
-            prev_best_k, prev_best_f1, prev_best_lift_at_n, notes
+            prev_best_k, prev_best_f1, notes
         )
         VALUES (
             :run_id, :status, :horizon, :risk_threshold_pct,
-            :prev_best_k, :prev_best_f1, :prev_best_lift_at_n, :notes
+            :prev_best_k, :prev_best_f1, :notes
         )
         ON CONFLICT (run_id) DO NOTHING
     """)
@@ -43,7 +42,6 @@ def start_run(
             "risk_threshold_pct": risk_threshold_pct,
             "prev_best_k": prev_best_k,
             "prev_best_f1": prev_best_f1,
-            "prev_best_lift_at_n": prev_best_lift_at_n,
             "notes": notes,
         })
 
@@ -55,7 +53,6 @@ def finish_run(
     window_end: int | None = None,
     cand_best_k: int | None = None,
     cand_best_f1: float | None = None,
-    cand_best_lift_at_n: float | None = None,
     cand_is_accepted: bool | None = None,
     did_retrain: bool | None = None,
     did_score: bool | None = None,
@@ -70,7 +67,6 @@ def finish_run(
             window_end = COALESCE(:window_end, window_end),
             cand_best_k = COALESCE(:cand_best_k, cand_best_k),
             cand_best_f1 = COALESCE(:cand_best_f1, cand_best_f1),
-            cand_best_lift_at_n = COALESCE(:cand_best_lift_at_n, cand_best_lift_at_n),
             cand_is_accepted = COALESCE(:cand_is_accepted, cand_is_accepted),
             did_retrain = COALESCE(:did_retrain, did_retrain),
             did_score = COALESCE(:did_score, did_score),
@@ -84,7 +80,6 @@ def finish_run(
             "window_end": window_end,
             "cand_best_k": cand_best_k,
             "cand_best_f1": cand_best_f1,
-            "cand_best_lift_at_n": cand_best_lift_at_n,
             "cand_is_accepted": cand_is_accepted,
             "did_retrain": did_retrain,
             "did_score": did_score,

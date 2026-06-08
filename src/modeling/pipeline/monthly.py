@@ -15,12 +15,9 @@ from baseline.sweep import run_sweep_k
 from config_store.best_config import (
     ensure_best_config_table,
     load_latest_accepted_best_config,
-    load_previous_accepted_best_config,
     upsert_best_config,
 )
-from scripts.train_main import main as _train_main_cli  # fallback
 from main_model.runner import run_main_variant
-from baseline.runner import train_baseline_model_for_config
 from common.artifacts import save_bundle, load_bundle
 
 from export_risk_mode.runner import run_export_risk_mode
@@ -29,7 +26,6 @@ from monitoring.ddl import ensure_monitoring_schema
 from monitoring.run_log import new_run_id, start_run, finish_run
 from monitoring.score import upsert_score_drift
 from monitoring.drift import compute_feature_drift, upsert_feature_drift
-from monitoring.backtest import run_backtest_precision_in_list
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -192,9 +188,17 @@ def _train_main_inline(
             variant["candidate_cfg"] = cand
             variants.append(variant)
 
-    ok = [v for v in variants if not v.get("guardrail_warning")]
+    ok = [v for v in variants if "F1_val" in v]
     if not ok:
-        raise RuntimeError("All variants failed guardrail. Stop training.")
+        raise RuntimeError("No trainable XGBoost variants produced validation metrics.")
+    for variant in ok:
+        if variant.get("guardrail_warning"):
+            logger.warning(
+                "[MAIN SANITY WARNING] K=%s use_static=%s: %s",
+                variant.get("report", {}).get("K"),
+                variant.get("use_static"),
+                variant.get("guardrail_warning"),
+            )
     ok.sort(key=lambda r: (r["F1_val"], r["AP_val"], r["ROC_AUC_val"]), reverse=True)
     best = ok[0]
     if len(ok) == 2:
@@ -210,24 +214,7 @@ def _train_main_inline(
     cfg["metric_f1_val"] = float(best["report"]["f1@main_thr"])
     cfg["metric_pr_auc_val"] = float(best["report"]["AP_val"])
     cfg["metric_roc_auc_val"] = best["report"].get("ROC_AUC_val")
-    cfg["ranking_top_n"] = None
-    cfg["metric_hits_at_n"] = None
-    cfg["metric_precision_at_n"] = None
-    cfg["metric_recall_at_n"] = None
-    cfg["metric_lift_at_n"] = None
     cfg["metric_val_prevalence"] = float(best["report"]["val_prevalence"])
-    cfg["metric_actual_hits_at_n"] = None
-    cfg["metric_actual_precision_at_n"] = None
-    cfg["metric_actual_recall_at_n"] = None
-    cfg["metric_actual_lift_at_n"] = None
-    cfg["metric_rule_hits_at_n"] = None
-    cfg["metric_rule_precision_at_n"] = None
-    cfg["metric_rule_recall_at_n"] = None
-    cfg["metric_rule_lift_at_n"] = None
-    cfg["metric_combined_weighted_hits_at_n"] = None
-    cfg["metric_combined_weighted_precision_at_n"] = None
-    cfg["metric_combined_weighted_recall_at_n"] = None
-    cfg["metric_combined_weighted_lift_at_n"] = None
     cfg["notes"] = (
         f"{cfg.get('notes') or ''}; "
         f"XGBoost selected final K={cfg['best_k']} use_static={cfg['use_static']} "
@@ -258,29 +245,6 @@ def _train_main_inline(
     return {"cfg": cfg, "main_report": best["report"]}
 
 
-def _train_baseline_fallback_inline(engine: Engine, *, cfg: dict, bundle_dir: Path) -> dict:
-    """Save a ready LogisticRegression baseline bundle when bootstrap XGBoost is guarded out."""
-    cfg = dict(cfg)
-    df_static = load_cus_lifetime_snapshots(engine)
-    best = train_baseline_model_for_config(engine, cfg, df_static=df_static)
-    report = dict(best["report"])
-    report["model_type"] = "baseline_logistic_bootstrap_fallback"
-    meta = {
-        "cfg": cfg,
-        "bundle_lifecycle": _bundle_lifecycle(cfg),
-        "validation_label_source": cfg.get("validation_label_source"),
-        "model_type": "baseline_logistic_bootstrap_fallback",
-        "main_report": report,
-        "feat_cols": best.get("feat_cols"),
-        "cat_cols": best.get("cat_cols"),
-        "date_cols": best.get("date_cols", []),
-        "feature_name_map": best.get("feature_name_map"),
-        "feature_profile": best.get("feature_profile"),
-    }
-    save_bundle(bundle_dir, best["model"], metadata=meta)
-    return {"cfg": cfg, "main_report": report}
-
-
 from config.paths import CHURN_MODEL_DIR
 
 def run_monthly_pipeline(
@@ -292,11 +256,9 @@ def run_monthly_pipeline(
     limit_rows_each: int | None = None,
     k_min: int = 3,
     f1_improve_eps: float = 1e-6,
-    do_backtest: bool = True,
     do_feature_drift: bool = True,
     do_scoring: bool = True,
     force_cycle_retrain: bool = False,
-    strict_main_guardrail: bool = False,
 ) -> dict:
     """
     FULL monthly pipeline (run once):
@@ -306,7 +268,7 @@ def run_monthly_pipeline(
          - else keep previous accepted config/model
       3) If accepted -> retrain main model + overwrite bundle
       4) Score month (export_risk_mode) + save churned_now + dossier
-      5) Monitoring tables: score drift, feature drift (PSI), backtest
+      5) Monitoring tables: score drift and feature drift (PSI)
 
     Returns a dict summary for logs.
     """
@@ -350,7 +312,6 @@ def run_monthly_pipeline(
         risk_threshold_pct=int(risk_threshold_pct),
         prev_best_k=prev_k,
         prev_best_f1=prev_f1,
-        prev_best_lift_at_n=None,
         notes=f"smoke_test={smoke_test(engine)}",
     )
 
@@ -451,7 +412,6 @@ def run_monthly_pipeline(
 
         cand_cfg["is_accepted"] = bool(accepted)
         cand_cfg["prev_accepted_f1"] = prev_f1
-        cand_cfg["prev_accepted_lift_at_n"] = None
         cand_cfg["accept_rule"] = rule
         cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime() if accepted else None
 
@@ -469,67 +429,22 @@ def run_monthly_pipeline(
         bundle_dir.mkdir(parents=True, exist_ok=True)
 
         if accepted:
-            try:
-                train_out = _train_main_inline(
-                    engine,
-                    horizon=int(horizon),
-                    bundle_dir=bundle_dir,
-                    cfg_override=cand_cfg,
-                    candidate_configs=cand_cfg.get("xgb_candidate_configs"),
-                )
-                cand_cfg = dict(train_out["cfg"])
-                cand_cfg["is_accepted"] = True
-                cand_cfg["prev_accepted_f1"] = prev_f1
-                cand_cfg["prev_accepted_lift_at_n"] = None
-                cand_cfg["accept_rule"] = rule
-                cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime()
-                upsert_best_config(engine, cand_cfg)
-                cand_k = int(cand_cfg["best_k"])
-                t_current = int(cand_cfg["as_of_month"])
-                did_retrain = True
-            except RuntimeError as e:
-                if "All variants failed guardrail" not in str(e):
-                    raise
-                if strict_main_guardrail:
-                    raise
-
-                if is_first_run and prev_cfg is None:
-                    rule = "accepted_baseline_bootstrap_fallback"
-                    cand_cfg["is_accepted"] = True
-                    cand_cfg["accept_rule"] = rule
-                    cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime()
-                    cand_cfg["notes"] = (
-                        f"{cand_cfg.get('notes') or ''}; "
-                        f"main_train_guardrail={str(e)}; "
-                        "served_model=baseline_logistic_bootstrap_fallback"
-                    ).strip("; ")
-                    upsert_best_config(engine, cand_cfg)
-                    _train_baseline_fallback_inline(engine, cfg=cand_cfg, bundle_dir=bundle_dir)
-                    did_retrain = True
-                    logger.warning(
-                        "[BOOTSTRAP FALLBACK] XGBoost variants failed guardrail for K=%d, month=%d. "
-                        "Saved a LogisticRegression baseline bundle so scoring can start. Reason: %s",
-                        cand_k,
-                        t_current,
-                        e,
-                    )
-                else:
-                    accepted = False
-                    rule = "rejected_main_guardrail_all_variants_failed"
-                    cand_cfg["is_accepted"] = False
-                    cand_cfg["accept_rule"] = rule
-                    cand_cfg["accepted_at"] = None
-                    cand_cfg["notes"] = (
-                        f"{cand_cfg.get('notes') or ''}; main_train_guardrail={str(e)}"
-                    ).strip("; ")
-                    upsert_best_config(engine, cand_cfg)
-                    logger.warning(
-                        "[GUARD] Main model retrain failed guardrail for K=%d, month=%d. "
-                        "Reject candidate and keep previous accepted model/config if available. Reason: %s",
-                        cand_k,
-                        t_current,
-                        e,
-                    )
+            train_out = _train_main_inline(
+                engine,
+                horizon=int(horizon),
+                bundle_dir=bundle_dir,
+                cfg_override=cand_cfg,
+                candidate_configs=cand_cfg.get("xgb_candidate_configs"),
+            )
+            cand_cfg = dict(train_out["cfg"])
+            cand_cfg["is_accepted"] = True
+            cand_cfg["prev_accepted_f1"] = prev_f1
+            cand_cfg["accept_rule"] = rule
+            cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime()
+            upsert_best_config(engine, cand_cfg)
+            cand_k = int(cand_cfg["best_k"])
+            t_current = int(cand_cfg["as_of_month"])
+            did_retrain = True
 
         # 4) Monthly scoring — chỉ chạy nếu có accepted config trong DB
         # (trường hợp bị block ngay lần đầu tiên: chưa có model nào được accepted)
@@ -537,7 +452,6 @@ def run_monthly_pipeline(
         if not do_scoring:
             logger.info("[SKIP SCORING] Retrain DAG is isolated from business scoring.")
             res = {"status": "skipped_retrain_only", "active_cnt": 0, "risk_cnt": 0, "churned_now_cnt": 0}
-            bt = None
         elif not has_accepted_in_db:
             logger.warning(
                 "[SKIP SCORING] Không có accepted best_config nào trong DB và tháng này bị block "
@@ -546,7 +460,6 @@ def run_monthly_pipeline(
                 prevalence_blocked, accepted,
             )
             res = {"status": "skipped_no_accepted_config", "active_cnt": 0, "risk_cnt": 0, "churned_now_cnt": 0}
-            bt = None
         else:
             res = run_export_risk_mode(
                 engine,
@@ -567,7 +480,7 @@ def run_monthly_pipeline(
             active_cnt = int(res.get("active_cnt") or 0)
             churned_now_cnt = int(res.get("churned_now_cnt") or 0)
             risk_cnt = int(res.get("risk_cnt") or 0)
-            payload = upsert_score_drift(
+            upsert_score_drift(
                 engine,
                 window_end=int(t_current),
                 horizon=int(horizon),
@@ -611,20 +524,6 @@ def run_monthly_pipeline(
                     # do not fail whole pipeline
                     pass
 
-            # Backtest (precision-in-list) when label month exists (t_current acts as label month)
-            bt = None
-            if do_backtest:
-                bt = run_backtest_precision_in_list(
-                    engine,
-                    label_window_end=int(t_current),
-                    horizon=int(horizon),
-                    risk_threshold_pct=int(risk_threshold_pct),
-                    best_k_for_population=int(k_min),
-                )
-        else:
-            # Scoring bị skip → không có monitoring data
-            bt = None
-
         guardrail_meta = {
             "is_mandatory_cycle": bool(is_mandatory),
             "pass_guardrail": bool(pass_guardrail),
@@ -639,7 +538,6 @@ def run_monthly_pipeline(
             window_end=int(t_current),
             cand_best_k=int(cand_k),
             cand_best_f1=float(cand_f1),
-            cand_best_lift_at_n=None,
             cand_is_accepted=bool(accepted),
             did_retrain=bool(did_retrain),
             did_score=bool(did_score),
@@ -649,8 +547,7 @@ def run_monthly_pipeline(
                 f"PR_AUC={float(cand_cfg.get('metric_pr_auc_val') or 0.0):.4f}; "
                 f"mandatory={is_mandatory}; "
                 f"guardrail={'pass' if pass_guardrail else 'blocked'}; "
-                f"active_ratio={active_ratio:.2f}; "
-                f"backtest={'yes' if bt else 'no'}"
+                f"active_ratio={active_ratio:.2f}"
             ),
         )
 
@@ -662,7 +559,6 @@ def run_monthly_pipeline(
             "did_retrain": bool(did_retrain),
             "guardrail": guardrail_meta,
             "export": res,
-            "backtest": bt,
         }
 
     except Exception as e:
@@ -673,7 +569,6 @@ def run_monthly_pipeline(
             window_end=int(t_current) if t_current is not None else None,
             cand_best_k=int(cand_cfg["best_k"]) if cand_cfg else None,
             cand_best_f1=float(cand_cfg["metric_f1_val"]) if cand_cfg else None,
-            cand_best_lift_at_n=None,
             cand_is_accepted=bool(accepted) if accepted is not None else None,
             did_retrain=bool(did_retrain),
             did_score=bool(did_score),

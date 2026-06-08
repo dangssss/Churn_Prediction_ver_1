@@ -95,14 +95,19 @@ def time_split_train_val_last_month(
     time_col: str = "window_end",
     *,
     horizon: int = 0,
+    validation_origin_count: int | None = None,
 ):
     df2 = df.copy()
     df2[time_col] = df2[time_col].astype(int)
     months = sorted(df2[time_col].unique())
     if len(months) < 2:
         return None, None, None
-    val_month = months[-1]
-    train_max_month = int(shift_yymm(str(val_month), -int(horizon)))
+    if validation_origin_count is None:
+        validation_origin_count = int(os.getenv("VALIDATION_ORIGIN_COUNT", "2"))
+    validation_origin_count = max(1, min(int(validation_origin_count), len(months) - 1))
+    validation_months = months[-validation_origin_count:]
+    val_month = validation_months[-1]
+    train_max_month = int(shift_yymm(str(validation_months[0]), -int(horizon)))
     historical_train = df2[time_col] <= train_max_month
     future_rule_holdout = pd.Series(False, index=df2.index)
     if "label_source" in df2.columns:
@@ -111,11 +116,11 @@ def time_split_train_val_last_month(
             & (df2[time_col] > val_month)
         )
     df_tr = df2[historical_train].copy()
-    df_va = df2[df2[time_col] == val_month].copy()
+    df_va = df2[df2[time_col].isin(validation_months)].copy()
     logger.info(
-        "[PURGED SPLIT] val_month=%s horizon=%s train_origin_max=%s "
+        "[PURGED SPLIT] val_months=%s horizon=%s train_origin_max=%s "
         "historical_train_rows=%d future_rule_holdout_rows=%d train_rows=%d val_rows=%d",
-        val_month,
+        ",".join(str(m) for m in validation_months),
         horizon,
         train_max_month,
         int(historical_train.sum()),
