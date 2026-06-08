@@ -21,8 +21,8 @@ CREATE TABLE IF NOT EXISTS data_static.{TABLE_NAME} (
     satisfaction_last         DOUBLE PRECISION,
 
     -- Risk scores:
-    -- churn_rate is a CRM-facing display risk score percentile in 0-100.
-    -- model_probability_pct is the raw model probability percent for audit.
+    -- churn_rate is the model churn probability expressed as a 0-100 percentage.
+    -- model_probability_pct keeps the same probability percent for audit.
     churn_rate                DOUBLE PRECISION NOT NULL,
     model_probability_pct     DOUBLE PRECISION,
 

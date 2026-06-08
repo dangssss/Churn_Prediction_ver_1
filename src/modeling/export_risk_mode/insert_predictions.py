@@ -100,18 +100,14 @@ def make_predictions(
         print("   Fallback to standard predict_proba")
         prob = model.predict_proba(X)[:, 1]
     
-    # Combine results. `churn_rate` is intentionally a CRM-facing display risk
-    # score in the familiar 0-100 format, not a calibrated probability. It is a
-    # percentile rank where 95 means "higher risk than 95% of active customers".
-    # Keep the raw model probability separately for technical audit.
+    # Combine results. `churn_rate` is kept for CRM/output compatibility, but its
+    # value is the model churn probability expressed as a 0-100 percentage.
     df_out = df_data.copy()
     df_out["churn_probability"] = prob
-    risk_percentile = pd.Series(prob, index=df_out.index).rank(method="first", pct=True) * 100.0
     df_out["model_probability_pct"] = (prob * 100).round(6)
-    df_out["churn_rate"] = risk_percentile.round(2)
+    df_out["churn_rate"] = df_out["model_probability_pct"].round(2)
 
-    # Operational threshold is a percentile threshold from export-risk
-    # (e.g. 95 means export the top 5% highest-risk active customers).
+    # Operational threshold is applied to the model probability percentage.
     thr = float(risk_threshold) if risk_threshold is not None else cfg.get("main_threshold", cfg.get("best_threshold", 0.5))
     df_out["risk_score"] = df_out["churn_rate"]
     thr_pct = float(thr) * 100.0 if float(thr) <= 1.0 else float(thr)
@@ -757,14 +753,14 @@ def insert_predictions_to_risk_table(
     risk_threshold: float = 90.0,
     horizon: int = 1,
 ) -> int:
-    """Insert customers whose CRM display risk score (`churn_rate`) meets the percentile threshold."""
+    """Insert customers whose model probability percentage (`churn_rate`) meets the threshold."""
     risk_pct = int(risk_threshold)
     table_name = f"cus_risk_{risk_pct}"
     
     if "churn_rate" not in df_predictions.columns:
         raise KeyError("Missing 'churn_rate' column in predictions")
     
-    # Filter by display risk score percentile (e.g. 95 keeps the top 5%).
+    # Filter by model probability percentage.
     df_risk = df_predictions[df_predictions["churn_rate"] >= float(risk_threshold)].copy()
     
     if df_risk.empty:
