@@ -161,6 +161,7 @@ def _train_main_inline(
     bundle_dir: Path,
     cfg_override: dict | None = None,
     candidate_configs: list[dict] | None = None,
+    save_output: bool = True,
 ) -> dict:
     """
     Inline training (no subprocess). Trains both use_static variants (if allowed by cfg) and saves bundle.
@@ -241,8 +242,9 @@ def _train_main_inline(
         "feature_name_map": best.get("feature_name_map"),
         "feature_profile": best.get("feature_profile"),
     }
-    save_bundle(bundle_dir, best["model"], metadata=meta)
-    return {"cfg": cfg, "main_report": best["report"]}
+    if save_output:
+        save_bundle(bundle_dir, best["model"], metadata=meta)
+    return {"cfg": cfg, "main_report": best["report"], "model": best["model"], "metadata": meta}
 
 
 from config.paths import CHURN_MODEL_DIR
@@ -259,16 +261,18 @@ def run_monthly_pipeline(
     do_feature_drift: bool = True,
     do_scoring: bool = True,
     force_cycle_retrain: bool = False,
+    always_train_candidate: bool = False,
 ) -> dict:
     """
     FULL monthly pipeline (run once):
-      1) Sweep K (candidate)
-      2) Compare candidate F1 vs previous accepted F1
+      1) Sweep K (LR shortlist candidate)
+      2) Optionally train the XGBoost candidate before comparison
+      3) Compare candidate F1 vs previous accepted F1
          - accept if improved
          - else keep previous accepted config/model
-      3) If accepted -> retrain main model + overwrite bundle
-      4) Score month (export_risk_mode) + save churned_now + dossier
-      5) Monitoring tables: score drift and feature drift (PSI)
+      4) If accepted -> overwrite bundle
+      5) Score month (export_risk_mode) + save churned_now + dossier
+      6) Monitoring tables: score drift and feature drift (PSI)
 
     Returns a dict summary for logs.
     """
@@ -354,12 +358,40 @@ def run_monthly_pipeline(
                 )
 
         # 2) Decide accept
-        is_mandatory = force_cycle_retrain or is_mandatory_retrain_month(t_current)
+        # Retrain means "train/evaluate a candidate". Promotion still requires
+        # the candidate to beat the accepted bundle, except for first-run cases.
+        is_mandatory = bool(force_cycle_retrain)
         pass_guardrail = True
         active_ratio = 1.0
         active_cnt_cur = 0
         active_cnt_prev = 0
         t_prev = None
+        candidate_train_out = None
+
+        if always_train_candidate and not prevalence_blocked:
+            logger.info(
+                "[RETRAIN EVAL] Training fresh XGBoost candidate before acceptance comparison."
+            )
+            bundle_dir = Path(bundle_dir)
+            bundle_dir.mkdir(parents=True, exist_ok=True)
+            candidate_train_out = _train_main_inline(
+                engine,
+                horizon=int(horizon),
+                bundle_dir=bundle_dir,
+                cfg_override=cand_cfg,
+                candidate_configs=cand_cfg.get("xgb_candidate_configs"),
+                save_output=False,
+            )
+            cand_cfg = dict(candidate_train_out["cfg"])
+            cand_f1 = float(cand_cfg["metric_f1_val"])
+            cand_k = int(cand_cfg["best_k"])
+            t_current = int(cand_cfg["as_of_month"])
+            logger.info(
+                "[RETRAIN EVAL] Fresh XGBoost candidate: K=%d F1=%.4f prev_F1=%s",
+                cand_k,
+                cand_f1,
+                f"{prev_f1:.4f}" if prev_f1 is not None else "None",
+            )
 
         if is_first_run:
             # Lần đầu tiên → chạy mới hoàn toàn, không áp dụng bất kỳ guard nào
@@ -424,18 +456,22 @@ def run_monthly_pipeline(
         best_k_for_scoring = int(cand_k) if accepted or prev_k is None else int(prev_k)
         t_current = int(max_window_end_for_k(engine, best_k_for_scoring))
 
-        # 3) Retrain only if accepted
+        # 3) Promote only if accepted
         bundle_dir = Path(bundle_dir)
         bundle_dir.mkdir(parents=True, exist_ok=True)
 
         if accepted:
-            train_out = _train_main_inline(
-                engine,
-                horizon=int(horizon),
-                bundle_dir=bundle_dir,
-                cfg_override=cand_cfg,
-                candidate_configs=cand_cfg.get("xgb_candidate_configs"),
-            )
+            if candidate_train_out is None:
+                train_out = _train_main_inline(
+                    engine,
+                    horizon=int(horizon),
+                    bundle_dir=bundle_dir,
+                    cfg_override=cand_cfg,
+                    candidate_configs=cand_cfg.get("xgb_candidate_configs"),
+                )
+            else:
+                train_out = candidate_train_out
+                save_bundle(bundle_dir, train_out["model"], metadata=train_out["metadata"])
             cand_cfg = dict(train_out["cfg"])
             cand_cfg["is_accepted"] = True
             cand_cfg["prev_accepted_f1"] = prev_f1

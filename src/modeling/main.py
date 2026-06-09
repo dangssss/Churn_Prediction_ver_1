@@ -68,14 +68,18 @@ def cmd_run_monthly(args) -> None:
 def cmd_retrain_if_due(args) -> None:
     engine = get_engine()
     logger.info("DB: %s", smoke_test(engine))
-    due, reason = retrain_due_reason(
-        engine,
-        horizon=int(args.horizon),
-        interval_months=int(args.interval_months),
-    )
-    if not due:
-        logger.info("SKIP retrain: %s", reason)
-        return
+    if bool(args.force_evaluate):
+        due = True
+        reason = "manual_or_scheduled_force_retrain_evaluation"
+    else:
+        due, reason = retrain_due_reason(
+            engine,
+            horizon=int(args.horizon),
+            interval_months=int(args.interval_months),
+        )
+        if not due:
+            logger.info("SKIP retrain: %s", reason)
+            return
 
     logger.info("START retrain: %s", reason)
     out = run_monthly_pipeline(
@@ -85,7 +89,8 @@ def cmd_retrain_if_due(args) -> None:
         limit_rows_each=args.limit_rows_each,
         k_min=int(args.k_min),
         do_scoring=False,
-        force_cycle_retrain=reason.startswith("accepted_bundle_age_gte_"),
+        force_cycle_retrain=False,
+        always_train_candidate=True,
     )
     logger.info("DONE retrain-if-due: %s", out)
 
@@ -286,6 +291,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bundle-dir", type=str, default=str(CHURN_MODEL_DIR / "bundles/latest"))
     p.add_argument("--limit-rows-each", type=int, default=None)
     p.add_argument("--k-min", type=int, default=3)
+    p.add_argument(
+        "--force-evaluate",
+        action="store_true",
+        help="Always train a fresh XGBoost candidate and compare it with the accepted bundle.",
+    )
     p.set_defaults(func=cmd_retrain_if_due)
 
     p = sub.add_parser("prepare-scoring", help="Bootstrap/retrain when needed before triggering the scoring DAG")

@@ -6,7 +6,7 @@ from pendulum import datetime
 
 with DAG(
     dag_id="ds_churn_model_retrain",
-    description="Retrain gate: Monday after the weekly pipeline, every 3 accepted months or drift ALERT",
+    description="Retrain evaluation: train a fresh candidate and promote only if it beats the accepted bundle",
     start_date=datetime(2026, 1, 1, tz="Asia/Ho_Chi_Minh"),
     schedule="0 1 * * 1",
     catchup=False,
@@ -18,7 +18,7 @@ with DAG(
         task_id="run_retrain_if_due",
         bash_command=(
             "python /churn_source/modeling/ops_lock.py --skip-if-busy -- "
-            "bash -lc 'cd /churn_source && python modeling/main.py retrain-if-due --horizon 2'"
+            "bash -lc 'cd /churn_source && python modeling/main.py retrain-if-due --horizon 2 --force-evaluate'"
         ),
         env={
             "TZ": "Asia/Ho_Chi_Minh",
