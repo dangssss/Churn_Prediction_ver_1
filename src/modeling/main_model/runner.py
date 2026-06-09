@@ -454,43 +454,124 @@ def train_main_xgb_option_B(
     return model, report, feat_cols, cat_cols, feature_name_map, date_cols
 
 def run_main_variant(engine, cfg: dict, df_static: pd.DataFrame, use_static_flag: bool):
-    from preprocess.trainval import build_train_val_for_main
-    _df_all, df_tr, df_va, val_month_main = build_train_val_for_main(
-        engine, cfg, df_static, use_static_override=use_static_flag
+    from preprocess.trainval import build_walk_forward_for_main
+    df_all, folds = build_walk_forward_for_main(
+        engine,
+        cfg,
+        df_static,
+        use_static_override=use_static_flag,
     )
     cfg_tmp = dict(cfg)
     cfg_tmp["use_static"] = bool(use_static_flag)
 
-    try:
-        model, report, feat_cols, cat_cols, fmap, date_cols = train_main_xgb_option_B(
-            df_tr,
-            df_va,
-            cfg_tmp,
+    fold_outputs = []
+    for fold_idx, fold in enumerate(folds, start=1):
+        try:
+            model, report, feat_cols, cat_cols, fmap, date_cols = train_main_xgb_option_B(
+                fold["train"],
+                fold["val"],
+                cfg_tmp,
+            )
+        except ValueError as e:
+            logger.warning(
+                "Variant K=%d use_static=%s fold=%d/%d rejected: %s",
+                cfg["best_k"],
+                use_static_flag,
+                fold_idx,
+                len(folds),
+                e,
+            )
+            continue
+        logger.info(
+            "[MAIN WALK FORWARD] K=%d use_static=%s fold=%d/%d train<=%s val=%s "
+            "F1=%.4f AP=%.4f ROC_AUC=%s",
+            cfg["best_k"],
+            use_static_flag,
+            fold_idx,
+            len(folds),
+            fold["train_max_month"],
+            ",".join(str(m) for m in fold["validation_months"]),
+            float(report["f1@main_thr"]),
+            float(report["AP_val"]),
+            f"{report.get('ROC_AUC_val'):.4f}" if report.get("ROC_AUC_val") is not None else "n/a",
         )
-    except ValueError as e:
-        logger.warning("Variant K=%d use_static=%s rejected: %s",
-                       cfg['best_k'], use_static_flag, e)
-        return {"use_static": bool(use_static_flag), "guardrail_warning": str(e),
+        fold_outputs.append({
+            "model": model,
+            "report": report,
+            "feat_cols": feat_cols,
+            "cat_cols": cat_cols,
+            "feature_name_map": fmap,
+            "date_cols": date_cols,
+            "fold": fold,
+        })
+
+    if not fold_outputs:
+        return {"use_static": bool(use_static_flag), "guardrail_warning": "all walk-forward folds rejected",
                 "F1_val": 0.0, "AP_val": 0.0, "ROC_AUC_val": 0.0}
 
-    # baseline profile for monitoring drift (built on train split)
-    feature_profile = compute_feature_profile(df_tr, feat_cols=feat_cols, cat_cols=cat_cols)
+    latest = fold_outputs[-1]
+    fold_reports = [out["report"] for out in fold_outputs]
+    f1_mean = float(np.mean([r["f1@main_thr"] for r in fold_reports]))
+    ap_mean = float(np.mean([r["AP_val"] for r in fold_reports]))
+    roc_values = [r.get("ROC_AUC_val") for r in fold_reports if r.get("ROC_AUC_val") is not None]
+    roc_mean = float(np.mean(roc_values)) if roc_values else 0.0
+    precision_mean = float(np.mean([r["precision@main_thr"] for r in fold_reports]))
+    recall_mean = float(np.mean([r["recall@main_thr"] for r in fold_reports]))
+    val_prevalence_mean = float(np.mean([r["val_prevalence"] for r in fold_reports]))
+
+    report = dict(latest["report"])
+    report["walk_forward_folds"] = len(fold_outputs)
+    report["walk_forward_reports"] = fold_reports
+    report["f1@main_thr_latest"] = float(latest["report"]["f1@main_thr"])
+    report["AP_val_latest"] = float(latest["report"]["AP_val"])
+    report["ROC_AUC_val_latest"] = latest["report"].get("ROC_AUC_val")
+    report["precision@main_thr_latest"] = float(latest["report"]["precision@main_thr"])
+    report["recall@main_thr_latest"] = float(latest["report"]["recall@main_thr"])
+    report["val_prevalence_latest"] = float(latest["report"]["val_prevalence"])
+    report["f1@main_thr"] = f1_mean
+    report["AP_val"] = ap_mean
+    report["ROC_AUC_val"] = roc_mean
+    report["precision@main_thr"] = precision_mean
+    report["recall@main_thr"] = recall_mean
+    report["val_prevalence"] = val_prevalence_mean
+    report["val_month"] = int(latest["report"]["val_month"])
+
+    logger.info(
+        "[MAIN WALK FORWARD METRICS] K=%d use_static=%s folds=%d F1_mean=%.4f "
+        "precision_mean=%.4f recall_mean=%.4f AP_mean=%.4f ROC_AUC_mean=%.4f latest_F1=%.4f",
+        cfg["best_k"],
+        use_static_flag,
+        len(fold_outputs),
+        f1_mean,
+        precision_mean,
+        recall_mean,
+        ap_mean,
+        roc_mean,
+        float(latest["report"]["f1@main_thr"]),
+    )
+
+    # baseline profile for monitoring drift (built on all historical labeled rows)
+    feature_profile = compute_feature_profile(
+        df_all,
+        feat_cols=latest["feat_cols"],
+        cat_cols=latest["cat_cols"],
+    )
 
     out = {
         "use_static": bool(use_static_flag),
-        "val_month": int(val_month_main),
-        "train_rows": int(len(df_tr)),
-        "val_rows": int(len(df_va)),
-        "AP_val": float(report["AP_val"]),
-        "F1_val": float(report["f1@main_thr"]),
+        "val_month": int(report["val_month"]),
+        "train_rows": int(sum(len(out["fold"]["train"]) for out in fold_outputs)),
+        "val_rows": int(sum(len(out["fold"]["val"]) for out in fold_outputs)),
+        "AP_val": ap_mean,
+        "F1_val": f1_mean,
         "ROC_AUC_val": float(report["ROC_AUC_val"] or 0.0),
         "guardrail_warning": report.get("guardrail_warning"),
         "report": report,
-        "model": model,
-        "feat_cols": feat_cols,
-        "cat_cols": cat_cols,
-        "date_cols": date_cols,
-        "feature_name_map": fmap,
+        "model": latest["model"],
+        "feat_cols": latest["feat_cols"],
+        "cat_cols": latest["cat_cols"],
+        "date_cols": latest["date_cols"],
+        "feature_name_map": latest["feature_name_map"],
         "feature_profile": feature_profile,
     }
     return out

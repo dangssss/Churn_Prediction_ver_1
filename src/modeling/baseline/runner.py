@@ -131,6 +131,64 @@ def time_split_train_val_last_month(
     return df_tr, df_va, val_month
 
 
+def time_series_purged_splits(
+    df: pd.DataFrame,
+    time_col: str = "window_end",
+    *,
+    horizon: int = 0,
+    validation_origin_count: int | None = None,
+    n_folds: int | None = None,
+):
+    """Create recent walk-forward folds with a purge gap equal to horizon."""
+    df2 = df.copy()
+    df2[time_col] = df2[time_col].astype(int)
+    months = sorted(df2[time_col].unique())
+    if len(months) < 2:
+        return []
+    if validation_origin_count is None:
+        validation_origin_count = int(os.getenv("VALIDATION_ORIGIN_COUNT", "2"))
+    validation_origin_count = max(1, min(int(validation_origin_count), len(months) - 1))
+    if n_folds is None:
+        n_folds = int(os.getenv("MODEL_WALK_FORWARD_FOLDS", "3"))
+    n_folds = max(1, int(n_folds))
+
+    folds = []
+    latest_start = len(months) - validation_origin_count
+    for start_idx in range(latest_start, -1, -1):
+        validation_months = months[start_idx : start_idx + validation_origin_count]
+        if len(validation_months) < validation_origin_count:
+            continue
+        val_month = validation_months[-1]
+        train_max_month = int(shift_yymm(str(validation_months[0]), -int(horizon)))
+        df_tr = df2[df2[time_col] <= train_max_month].copy()
+        df_va = df2[df2[time_col].isin(validation_months)].copy()
+        if df_tr.empty or df_va.empty:
+            continue
+        folds.append(
+            {
+                "train": df_tr,
+                "val": df_va,
+                "val_month": int(val_month),
+                "validation_months": [int(m) for m in validation_months],
+                "train_max_month": int(train_max_month),
+            }
+        )
+        if len(folds) >= n_folds:
+            break
+    folds = list(reversed(folds))
+    logger.info(
+        "[WALK FORWARD SPLIT] folds=%d requested=%d validation_origin_count=%d details=%s",
+        len(folds),
+        n_folds,
+        validation_origin_count,
+        "; ".join(
+            f"train<= {f['train_max_month']} val={','.join(str(m) for m in f['validation_months'])}"
+            for f in folds
+        ),
+    )
+    return folds
+
+
 def eval_one_k_train_val(
     engine: Engine,
     k: int,
@@ -162,166 +220,236 @@ def eval_one_k_train_val(
             raise ValueError("use_static=True nhưng df_static=None")
         df_k = attach_static(df_k, df_static)
 
-    df_tr, df_va, val_month = time_split_train_val_last_month(
+    folds = time_series_purged_splits(
         df_k,
         time_col="window_end",
         horizon=horizon,
     )
-    if df_tr is None or df_tr.empty or df_va.empty:
+    if not folds:
         return None
-    val_label_sources = (
-        sorted(df_va["label_source"].dropna().astype(str).unique())
-        if "label_source" in df_va.columns
-        else []
-    )
-    validation_label_source = (
-        "unknown"
-        if not val_label_sources
-        else val_label_sources[0]
-        if len(val_label_sources) == 1
-        else "mixed"
-    )
-    bundle_lifecycle = "PRODUCTION"
-    logger.info(
-        "[VALIDATION PROVENANCE] val_month=%s source=%s lifecycle=%s policy=mixed_actual_rule",
-        val_month,
-        validation_label_source,
-        bundle_lifecycle,
-    )
 
     num_cols, cat_cols = select_feature_cols_mixed(df_k, label_col=label_col)
-    X_tr = df_tr[num_cols + cat_cols]
-    y_tr = df_tr[label_col].astype(int)
-    X_va = df_va[num_cols + cat_cols]
-    y_va = df_va[label_col].astype(int)
-    sample_weight = (
-        pd.to_numeric(df_tr["label_weight"], errors="coerce").fillna(1.0)
-        if "label_weight" in df_tr.columns
-        else pd.Series(1.0, index=df_tr.index)
-    )
+    fold_reports = []
+    bundle_lifecycle = "PRODUCTION"
+    last_class_weight_used = {0: 1.0, 1: 1.0}
+    last_spw_raw = 1.0
+    last_churn_ratio = 0.0
+    last_threshold = 0.5
+    last_validation_label_source = "unknown"
 
-    n_pos = int((y_tr == 1).sum())
-    n_neg = int((y_tr == 0).sum())
-    weighted_pos = float(sample_weight[y_tr == 1].sum())
-    weighted_neg = float(sample_weight[y_tr == 0].sum())
-    spw_raw = weighted_neg / max(weighted_pos, 1.0)
-    max_positive_class_weight = float(
-        os.getenv("BASELINE_MAX_POSITIVE_CLASS_WEIGHT", "100")
-    )
-    spw = min(spw_raw, max_positive_class_weight)
-
-    # Mixed actual/rule labels are no longer extremely sparse in normal runs.
-    # Above this rate, keep only row-level label_weight and avoid probability
-    # distortion from class_weight.
-    CHURN_RATIO_THRESHOLD = float(os.getenv("BASELINE_CLASS_WEIGHT_MAX_RATE", "0.10"))
-    churn_ratio = n_pos / max(n_pos + n_neg, 1)
-    min_positive_rows = int(os.getenv("BASELINE_MIN_POSITIVE_ROWS", "500"))
-    min_positive_rate = float(os.getenv("BASELINE_MIN_POSITIVE_RATE", "0.001"))
-    if n_pos < min_positive_rows or churn_ratio < min_positive_rate:
-        raise SparseChurnLabelsError(
-            "Baseline training aborted before fit: implausibly sparse churn labels "
-            f"for K={k} (positive_rows={n_pos}, total_rows={n_pos + n_neg}, "
-            f"positive_rate={churn_ratio:.6%}). "
-            f"Required: rows>={min_positive_rows} and rate>={min_positive_rate:.4%}. "
-            "Check label ingestion and label generation before running modeling."
+    for fold_idx, fold in enumerate(folds, start=1):
+        df_tr = fold["train"]
+        df_va = fold["val"]
+        val_month = int(fold["val_month"])
+        val_label_sources = (
+            sorted(df_va["label_source"].dropna().astype(str).unique())
+            if "label_source" in df_va.columns
+            else []
+        )
+        validation_label_source = (
+            "unknown"
+            if not val_label_sources
+            else val_label_sources[0]
+            if len(val_label_sources) == 1
+            else "mixed"
+        )
+        logger.info(
+            "[VALIDATION PROVENANCE] fold=%d/%d val_month=%s source=%s lifecycle=%s policy=mixed_actual_rule",
+            fold_idx,
+            len(folds),
+            val_month,
+            validation_label_source,
+            bundle_lifecycle,
         )
 
-    if churn_ratio >= CHURN_RATIO_THRESHOLD:
-        class_weight_used = {0: 1.0, 1: 1.0}
-        spw_rule = (
-            f"churn_ratio >= {CHURN_RATIO_THRESHOLD:.1%} -> "
-            "class_weight={1:1.0} (mixed labels are sufficiently dense)"
-        )
-    else:
-        class_weight_used = {0: 1.0, 1: spw}
-        spw_rule = (
-            f"churn_ratio < {CHURN_RATIO_THRESHOLD:.1%} -> weighted class_weight={{1:{spw:.2f}}} "
-            f"(raw={spw_raw:.2f}, cap={max_positive_class_weight:.2f})"
+        X_tr = df_tr[num_cols + cat_cols]
+        y_tr = df_tr[label_col].astype(int)
+        X_va = df_va[num_cols + cat_cols]
+        y_va = df_va[label_col].astype(int)
+        sample_weight = (
+            pd.to_numeric(df_tr["label_weight"], errors="coerce").fillna(1.0)
+            if "label_weight" in df_tr.columns
+            else pd.Series(1.0, index=df_tr.index)
         )
 
-    logger.info(
-        "[BASELINE K=%d] Tập huấn luyện: Churn=%d | Active=%d | Total=%d | "
-        "Tỷ lệ Churn=%.2f%% | Quyết định: %s",
-        k, n_pos, n_neg, n_pos + n_neg, churn_ratio * 100, spw_rule,
-    )
+        n_pos = int((y_tr == 1).sum())
+        n_neg = int((y_tr == 0).sum())
+        weighted_pos = float(sample_weight[y_tr == 1].sum())
+        weighted_neg = float(sample_weight[y_tr == 0].sum())
+        spw_raw = weighted_neg / max(weighted_pos, 1.0)
+        max_positive_class_weight = float(os.getenv("BASELINE_MAX_POSITIVE_CLASS_WEIGHT", "100"))
+        spw = min(spw_raw, max_positive_class_weight)
 
-    if "label_source" in df_tr.columns:
-        provenance = (
-            df_tr.assign(_label_weight=sample_weight)
-            .groupby("label_source", dropna=False)
-            .agg(
-                rows=(label_col, "size"),
-                positives=(label_col, "sum"),
-                effective_weight=("_label_weight", "sum"),
+        churn_ratio = n_pos / max(n_pos + n_neg, 1)
+        min_positive_rows = int(os.getenv("BASELINE_MIN_POSITIVE_ROWS", "500"))
+        min_positive_rate = float(os.getenv("BASELINE_MIN_POSITIVE_RATE", "0.001"))
+        if n_pos < min_positive_rows or churn_ratio < min_positive_rate:
+            raise SparseChurnLabelsError(
+                "Baseline training aborted before fit: implausibly sparse churn labels "
+                f"for K={k} fold={fold_idx} (positive_rows={n_pos}, total_rows={n_pos + n_neg}, "
+                f"positive_rate={churn_ratio:.6%}). "
+                f"Required: rows>={min_positive_rows} and rate>={min_positive_rate:.4%}. "
+                "Check label ingestion and label generation before running modeling."
             )
-            .reset_index()
+
+        class_weight_threshold = float(os.getenv("BASELINE_CLASS_WEIGHT_MAX_RATE", "0.10"))
+        if churn_ratio >= class_weight_threshold:
+            class_weight_used = {0: 1.0, 1: 1.0}
+            spw_rule = (
+                f"churn_ratio >= {class_weight_threshold:.1%} -> "
+                "class_weight={1:1.0} (mixed labels are sufficiently dense)"
+            )
+        else:
+            class_weight_used = {0: 1.0, 1: spw}
+            spw_rule = (
+                f"churn_ratio < {class_weight_threshold:.1%} -> weighted class_weight={{1:{spw:.2f}}} "
+                f"(raw={spw_raw:.2f}, cap={max_positive_class_weight:.2f})"
+            )
+
+        logger.info(
+            "[BASELINE K=%d FOLD=%d/%d] Train: Churn=%d | Active=%d | Total=%d | "
+            "Churn rate=%.2f%% | Decision: %s",
+            k,
+            fold_idx,
+            len(folds),
+            n_pos,
+            n_neg,
+            n_pos + n_neg,
+            churn_ratio * 100,
+            spw_rule,
         )
-        logger.info("[BASELINE K=%d] Label provenance:\n%s", k, provenance.to_string(index=False))
 
-    pre = make_preprocess(num_cols, cat_cols)
-    clf = LogisticRegression(
-        max_iter=5000,
-        solver="saga",   # saga: solver duy nhất hỗ trợ ElasticNet (l1_ratio ∈ (0,1))
-        tol=1e-3,
-        class_weight=class_weight_used,
-        l1_ratio=0.5,    # ElasticNet: 0=L2, 1=L1, 0.5=50/50 mix — penalty string deprecated từ sklearn 1.8
-        C=0.1,           # regularization strength (ngược với lambda); 0.1 = mạnh hơn default (1.0)
-    )
-    pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
+        if "label_source" in df_tr.columns:
+            provenance = (
+                df_tr.assign(_label_weight=sample_weight)
+                .groupby("label_source", dropna=False)
+                .agg(
+                    rows=(label_col, "size"),
+                    positives=(label_col, "sum"),
+                    effective_weight=("_label_weight", "sum"),
+                )
+                .reset_index()
+            )
+            logger.info("[BASELINE K=%d FOLD=%d] Label provenance:\n%s", k, fold_idx, provenance.to_string(index=False))
 
-    pipe.fit(X_tr, y_tr, clf__sample_weight=sample_weight.to_numpy())
+        pre = make_preprocess(num_cols, cat_cols)
+        clf = LogisticRegression(
+            max_iter=5000,
+            solver="saga",
+            tol=1e-3,
+            class_weight=class_weight_used,
+            l1_ratio=0.5,
+            C=0.1,
+        )
+        pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
+        pipe.fit(X_tr, y_tr, clf__sample_weight=sample_weight.to_numpy())
 
-    va_prob = pipe.predict_proba(X_va)[:, 1]
-    pr_auc  = average_precision_score(y_va, va_prob)
-    roc_auc = roc_auc_score(y_va, va_prob)
+        va_prob = pipe.predict_proba(X_va)[:, 1]
+        pr_auc = average_precision_score(y_va, va_prob)
+        roc_auc = roc_auc_score(y_va, va_prob)
+        thr = best_threshold_by_f1(y_va.to_numpy(), va_prob)
+        yhat = (va_prob >= thr).astype(int)
 
-    thr = best_threshold_by_f1(y_va.to_numpy(), va_prob)
-    yhat = (va_prob >= thr).astype(int)
+        f1_val = float(f1_score(y_va, yhat, zero_division=0))
+        precision_val = float(precision_score(y_va, yhat, zero_division=0))
+        recall_val = float(recall_score(y_va, yhat, zero_division=0))
+        prevalence = float(y_va.mean())
+        dummy_f1 = 2 * prevalence / (prevalence + 1 + 1e-9)
+        is_degenerate = abs(f1_val - dummy_f1) < 0.005
+        if is_degenerate:
+            logger.warning(
+                "K=%d use_static=%s fold=%d: model degenerate (F1=%.4f ~= dummy=%.4f, predict-all-positive)",
+                k,
+                use_static,
+                fold_idx,
+                f1_val,
+                dummy_f1,
+            )
 
-    f1_val = float(f1_score(y_va, yhat, zero_division=0))
-    precision_val = float(precision_score(y_va, yhat, zero_division=0))
-    recall_val = float(recall_score(y_va, yhat, zero_division=0))
+        logger.info(
+            "[CLASSIFICATION METRICS] K=%d use_static=%s fold=%d/%d val=%s source=%s "
+            "F1=%.4f precision=%.4f recall=%.4f PR_AUC=%.4f ROC_AUC=%.4f prevalence=%.4f%%",
+            k,
+            use_static,
+            fold_idx,
+            len(folds),
+            val_month,
+            validation_label_source,
+            f1_val,
+            precision_val,
+            recall_val,
+            float(pr_auc),
+            float(roc_auc),
+            100.0 * prevalence,
+        )
 
-    # Bug #2: đánh dấu degenerate nếu F1 gần bằng predict-all-positive
-    prevalence = float(y_va.mean())
-    dummy_f1 = 2 * prevalence / (prevalence + 1 + 1e-9)
-    is_degenerate = abs(f1_val - dummy_f1) < 0.005
-    if is_degenerate:
-        logger.warning("K=%d use_static=%s: model degenerate (F1=%.4f ≈ dummy=%.4f, predict-all-positive)", k, use_static, f1_val, dummy_f1)
+        fold_reports.append({
+            "val_month": val_month,
+            "validation_label_source": validation_label_source,
+            "spw_used": float(class_weight_used.get(1, 1.0)),
+            "spw_raw": float(spw_raw),
+            "churn_ratio_train": float(churn_ratio),
+            "PR_AUC_val": float(pr_auc),
+            "ROC_AUC_val": float(roc_auc),
+            "val_prevalence": float(prevalence),
+            "best_threshold": float(thr),
+            "precision": precision_val,
+            "recall": recall_val,
+            "f1": f1_val,
+            "degenerate": is_degenerate,
+        })
+        last_class_weight_used = class_weight_used
+        last_spw_raw = spw_raw
+        last_churn_ratio = churn_ratio
+        last_threshold = thr
+        last_validation_label_source = validation_label_source
 
+    if not fold_reports:
+        return None
+
+    metric_frame = pd.DataFrame(fold_reports)
+    latest = fold_reports[-1]
+    is_degenerate = bool(metric_frame["degenerate"].all())
+    f1_val = float(metric_frame["f1"].mean())
+    precision_val = float(metric_frame["precision"].mean())
+    recall_val = float(metric_frame["recall"].mean())
+    pr_auc = float(metric_frame["PR_AUC_val"].mean())
+    roc_auc = float(metric_frame["ROC_AUC_val"].mean())
+    prevalence = float(metric_frame["val_prevalence"].mean())
     logger.info(
-        "[CLASSIFICATION METRICS] K=%d use_static=%s val=%s source=%s "
-        "F1=%.4f precision=%.4f recall=%.4f PR_AUC=%.4f ROC_AUC=%.4f prevalence=%.4f%%",
+        "[WALK FORWARD METRICS] K=%d use_static=%s folds=%d F1_mean=%.4f precision_mean=%.4f "
+        "recall_mean=%.4f PR_AUC_mean=%.4f ROC_AUC_mean=%.4f latest_val=%s latest_F1=%.4f",
         k,
         use_static,
-        val_month,
-        validation_label_source,
+        len(fold_reports),
         f1_val,
         precision_val,
         recall_val,
-        float(pr_auc),
-        float(roc_auc),
-        100.0 * prevalence,
+        pr_auc,
+        roc_auc,
+        latest["val_month"],
+        latest["f1"],
     )
 
     return {
         "K": int(k),
         "H": int(horizon),
         "use_static": bool(use_static),
-        "val_month": int(val_month),
-        "validation_label_source": validation_label_source,
+        "val_month": int(latest["val_month"]),
+        "validation_label_source": last_validation_label_source,
         "bundle_lifecycle": bundle_lifecycle,
         "n_rows": int(len(df_k)),
         "n_months": int(df_k["window_end"].nunique()),
-        "spw_used": float(class_weight_used.get(1, 1.0)),
-        "spw_raw": float(spw_raw),
-        "churn_ratio_train": float(churn_ratio),
+        "n_folds": int(len(fold_reports)),
+        "spw_used": float(last_class_weight_used.get(1, 1.0)),
+        "spw_raw": float(last_spw_raw),
+        "churn_ratio_train": float(last_churn_ratio),
         "n_num": int(len(num_cols)),
         "n_cat": int(len(cat_cols)),
-        "PR_AUC_val": float(pr_auc),
-        "ROC_AUC_val": float(roc_auc),
-        "val_prevalence": float(prevalence),
-        "best_threshold": float(thr),
+        "PR_AUC_val": pr_auc,
+        "ROC_AUC_val": roc_auc,
+        "val_prevalence": prevalence,
+        "best_threshold": float(last_threshold),
         "precision": precision_val,
         "recall": recall_val,
         "f1": f1_val,
