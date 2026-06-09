@@ -210,8 +210,10 @@ def eval_one_k_train_val(
     )
     spw = min(spw_raw, max_positive_class_weight)
 
-    # ---------- Guardrail: tự động chọn class_weight ----------
-    CHURN_RATIO_THRESHOLD = 0.35
+    # Mixed actual/rule labels are no longer extremely sparse in normal runs.
+    # Above this rate, keep only row-level label_weight and avoid probability
+    # distortion from class_weight.
+    CHURN_RATIO_THRESHOLD = float(os.getenv("BASELINE_CLASS_WEIGHT_MAX_RATE", "0.10"))
     churn_ratio = n_pos / max(n_pos + n_neg, 1)
     min_positive_rows = int(os.getenv("BASELINE_MIN_POSITIVE_ROWS", "500"))
     min_positive_rate = float(os.getenv("BASELINE_MIN_POSITIVE_RATE", "0.001"))
@@ -224,16 +226,16 @@ def eval_one_k_train_val(
             "Check label ingestion and label generation before running modeling."
         )
 
-    if churn_ratio > CHURN_RATIO_THRESHOLD:
+    if churn_ratio >= CHURN_RATIO_THRESHOLD:
         class_weight_used = {0: 1.0, 1: 1.0}
-        spw_rule = "churn_ratio > 35% → class_weight={1:1.0} (dữ liệu đủ cân bằng)"
+        spw_rule = (
+            f"churn_ratio >= {CHURN_RATIO_THRESHOLD:.1%} -> "
+            "class_weight={1:1.0} (mixed labels are sufficiently dense)"
+        )
     else:
         class_weight_used = {0: 1.0, 1: spw}
-        spw_rule = f"churn_ratio <= 35% → class_weight={{1:{spw:.2f}}} (bù mất cân bằng)"
-
-    if churn_ratio <= CHURN_RATIO_THRESHOLD:
         spw_rule = (
-            f"churn_ratio <= 35% -> weighted class_weight={{1:{spw:.2f}}} "
+            f"churn_ratio < {CHURN_RATIO_THRESHOLD:.1%} -> weighted class_weight={{1:{spw:.2f}}} "
             f"(raw={spw_raw:.2f}, cap={max_positive_class_weight:.2f})"
         )
 

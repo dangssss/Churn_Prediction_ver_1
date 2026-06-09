@@ -77,15 +77,19 @@ def _xgb_scale_pos_weight(
     sample_weight: np.ndarray,
     baseline_spw: float,
 ) -> tuple[float, float, float]:
-    """Keep source weights, then add only a capped class-balance multiplier for XGB."""
+    """Keep source weights, then add class balance only when labels are sparse."""
     pos_w = float(sample_weight[y == 1].sum())
     neg_w = float(sample_weight[y == 0].sum())
     weighted_ratio = neg_w / max(pos_w, 1e-9)
     max_spw = max(_env_float("MAIN_XGB_MAX_SCALE_POS_WEIGHT", 20.0), 1.0)
-    mode = (os.getenv("MAIN_XGB_SCALE_POS_WEIGHT_MODE") or "sqrt_weighted").strip().lower()
+    mode = (os.getenv("MAIN_XGB_SCALE_POS_WEIGHT_MODE") or "auto").strip().lower()
+    churn_ratio = float(np.mean(y == 1)) if len(y) else 0.0
+    balance_max_rate = max(_env_float("MAIN_XGB_CLASS_WEIGHT_MAX_RATE", 0.10), 0.0)
 
     if mode in {"none", "off", "1", "false"}:
         effective = 1.0
+    elif mode == "auto":
+        effective = 1.0 if churn_ratio >= balance_max_rate else float(np.sqrt(max(weighted_ratio, 1.0)))
     elif mode in {"baseline", "best_spw"}:
         effective = baseline_spw
     elif mode in {"weighted", "raw_weighted"}:
@@ -208,12 +212,13 @@ def train_main_xgb_option_B(
 
     logger.info(
         "[MAIN MODEL][XGB BALANCE] baseline_spw=%.2f | weighted_spw_raw=%.2f | "
-        "xgb_spw=%.2f | spw_cap=%.2f | mode=%s",
+        "xgb_spw=%.2f | spw_cap=%.2f | mode=%s | auto_no_balance_rate>=%.2f%%",
         baseline_spw,
         weighted_spw_raw,
         spw,
         spw_cap,
-        (os.getenv("MAIN_XGB_SCALE_POS_WEIGHT_MODE") or "sqrt_weighted"),
+        (os.getenv("MAIN_XGB_SCALE_POS_WEIGHT_MODE") or "auto"),
+        _env_float("MAIN_XGB_CLASS_WEIGHT_MAX_RATE", 0.10) * 100.0,
     )
 
     logger.info(
