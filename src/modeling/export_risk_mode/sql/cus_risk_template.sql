@@ -1,5 +1,5 @@
 -- Template for cus_risk table creation (Simplified)
--- Replace {THRESHOLD} with actual threshold value (e.g., 70)
+-- Replace {THRESHOLD} with score percentile threshold value (e.g., 95)
 -- Replace {TABLE_NAME} with table name (e.g., cus_risk_70)  
 
 CREATE SCHEMA IF NOT EXISTS data_static;

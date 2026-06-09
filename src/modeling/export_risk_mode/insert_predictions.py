@@ -107,13 +107,48 @@ def make_predictions(
     df_out["model_probability_pct"] = (prob * 100).round(6)
     df_out["churn_rate"] = df_out["model_probability_pct"].round(2)
 
-    # Operational threshold is applied to the model probability percentage.
+    # `risk_percentile_pct` is the rank of the model probability within the
+    # scored active population. It drives operational top-tail selection, while
+    # `churn_rate` remains the raw model probability percentage for CRM output.
     thr = float(risk_threshold) if risk_threshold is not None else cfg.get("main_threshold", cfg.get("best_threshold", 0.5))
     df_out["risk_score"] = df_out["churn_rate"]
     thr_pct = float(thr) * 100.0 if float(thr) <= 1.0 else float(thr)
-    df_out["risk_flag"] = (df_out["risk_score"] >= thr_pct).astype(int)
+    df_out["risk_percentile_pct"] = _score_percentile_pct(df_out["churn_probability"])
+    df_out["risk_flag"] = (df_out["risk_percentile_pct"] >= thr_pct).astype(int)
 
     return df_out
+
+
+def _score_percentile_pct(scores: pd.Series | np.ndarray) -> pd.Series:
+    score_series = pd.Series(scores).astype(float)
+    return score_series.rank(method="first", pct=True).mul(100.0)
+
+
+def filter_risk_predictions(
+    df_predictions: pd.DataFrame,
+    risk_threshold: float,
+) -> pd.DataFrame:
+    """Keep the top-tail customers by model score percentile.
+
+    The CLI argument is still named risk-threshold-pct for backwards
+    compatibility. A value of 95 means "customers at or above the 95th score
+    percentile", not "churn_probability >= 95%".
+    """
+    if df_predictions.empty:
+        return df_predictions.copy()
+
+    threshold = float(risk_threshold)
+    if "risk_percentile_pct" not in df_predictions.columns:
+        if "churn_probability" in df_predictions.columns:
+            percentiles = _score_percentile_pct(df_predictions["churn_probability"])
+        elif "churn_rate" in df_predictions.columns:
+            percentiles = _score_percentile_pct(df_predictions["churn_rate"])
+        else:
+            raise KeyError("Missing score column for risk percentile filtering")
+        df_predictions = df_predictions.copy()
+        df_predictions["risk_percentile_pct"] = percentiles
+
+    return df_predictions[df_predictions["risk_percentile_pct"] >= threshold].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -753,18 +788,17 @@ def insert_predictions_to_risk_table(
     risk_threshold: float = 90.0,
     horizon: int = 1,
 ) -> int:
-    """Insert customers whose model probability percentage (`churn_rate`) meets the threshold."""
+    """Insert customers whose score percentile meets the operational threshold."""
     risk_pct = int(risk_threshold)
     table_name = f"cus_risk_{risk_pct}"
     
     if "churn_rate" not in df_predictions.columns:
         raise KeyError("Missing 'churn_rate' column in predictions")
     
-    # Filter by model probability percentage.
-    df_risk = df_predictions[df_predictions["churn_rate"] >= float(risk_threshold)].copy()
+    df_risk = filter_risk_predictions(df_predictions, risk_threshold)
     
     if df_risk.empty:
-        print(f"??  No customers with churn_rate >= {risk_threshold}%")
+        print(f"??  No customers with risk_percentile_pct >= {risk_threshold}")
         return 0
     
     # Normalize column names

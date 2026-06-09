@@ -16,6 +16,7 @@ from .insert_predictions import (
     insert_predictions_to_risk_table,
     compute_simple_reasons,
     compute_shap_reasons,
+    filter_risk_predictions,
 )
 import os
 
@@ -171,6 +172,8 @@ def run_export_risk(
         "p90": float(np.quantile(scores, 0.90)) if scores.size else None,
         "p99": float(np.quantile(scores, 0.99)) if scores.size else None,
     }
+    threshold_pct = float(risk_threshold) / 100.0
+    score_cutoff = float(np.quantile(scores, threshold_pct)) if scores.size else None
 
     # [6/6] Insert to risk table
     print("\n[6/6] Insert to risk table...")
@@ -206,7 +209,7 @@ def run_export_risk(
 
     # Training validation uses mixed actual/rule labels from recent origins.
 
-    df_ins = df_pred[df_pred.get('churn_rate', 0) >= float(risk_threshold)].copy()
+    df_ins = filter_risk_predictions(df_pred, risk_threshold)
     num_with_reasons = int(df_ins['reason_1'].notna().sum()) if 'reason_1' in df_ins.columns else 0
 
     # CSV Export requirement
@@ -260,11 +263,13 @@ def run_export_risk(
     print("\nEXPORT RISK TABLE COMPLETED")
     print(f"Table:              data_static.{table_name}")
     print(f"Month scored:       {month_used}")
-    print(f"Risk threshold:     >= {risk_threshold}%")
+    print(f"Risk threshold:     score percentile >= {risk_threshold}")
     print(f"Active customers:   {len(df_active)}")
     print(f"Inserted:           {num_customers}")
     print(f"With reasons:       {num_with_reasons}")
     print(f"Score stats:        p50={score_stats['p50']:.2%}, p90={score_stats['p90']:.2%}, p99={score_stats['p99']:.2%}")
+    if score_cutoff is not None:
+        print(f"Score cutoff:       p{int(risk_threshold)}={score_cutoff:.2%}")
     print("="*70 + "\n")
 
     return {
@@ -274,6 +279,7 @@ def run_export_risk(
         "active_cnt": int(len(df_active)),
         "risk_cnt": int(num_customers),
         "score_stats": score_stats,
+        "score_cutoff": score_cutoff,
         "num_inserted": int(num_customers),
         "num_with_reasons": int(num_with_reasons),
         "status": "success" if num_customers > 0 else "warning",
