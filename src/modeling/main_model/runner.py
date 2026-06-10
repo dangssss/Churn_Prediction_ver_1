@@ -331,7 +331,15 @@ def train_main_xgb_option_B(
     p_b, r_b, f1_b = prf1_at_threshold(y_va, va_prob, thr_baseline)
 
     # optimize threshold on MAIN val
-    thr_opt, p_opt, r_opt, f1_opt = best_threshold_by_f1_np(y_va, va_prob, n_grid=600)
+    min_threshold = _env_float("MAIN_XGB_THRESHOLD_MIN", 0.005)
+    max_pred_pos_rate = _env_float("MAIN_XGB_MAX_PREDICTED_POSITIVE_RATE", 0.80)
+    thr_opt, p_opt, r_opt, f1_opt = best_threshold_by_f1_np(
+        y_va,
+        va_prob,
+        n_grid=600,
+        min_threshold=min_threshold,
+        max_predicted_positive_rate=max_pred_pos_rate,
+    )
     ap = average_precision_np(y_va, va_prob)
     roc_auc = float(roc_auc_score(y_va, va_prob)) if len(np.unique(y_va)) == 2 else None
     primary_sources = (
@@ -348,7 +356,7 @@ def train_main_xgb_option_B(
     )
     logger.info(
         "[MAIN CLASSIFICATION METRICS][%s] F1=%.4f precision=%.4f recall=%.4f "
-        "AP=%.4f ROC_AUC=%s prevalence=%.4f%%",
+        "AP=%.4f ROC_AUC=%s prevalence=%.4f%% threshold=%.6f threshold_min=%.6f max_pred_pos_rate=%.2f%%",
         primary_label_source.upper(),
         f1_opt,
         p_opt,
@@ -356,6 +364,9 @@ def train_main_xgb_option_B(
         ap,
         f"{roc_auc:.4f}" if roc_auc is not None else "n/a",
         100.0 * float(y_va.mean()),
+        thr_opt,
+        min_threshold,
+        100.0 * max_pred_pos_rate,
     )
     
     # Calculate confusion matrix at optimal threshold
@@ -446,6 +457,8 @@ def train_main_xgb_option_B(
         "f1@baseline_thr": float(f1_b),
 
         "thr_main_opt": float(thr_opt),
+        "thr_main_min": float(min_threshold),
+        "max_predicted_positive_rate": float(max_pred_pos_rate),
         "precision@main_thr": float(p_opt),
         "recall@main_thr": float(r_opt),
         "f1@main_thr": float(f1_opt),

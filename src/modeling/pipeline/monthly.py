@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import traceback
 import pandas as pd
 
@@ -224,12 +225,17 @@ def _train_main_inline(
     cfg.pop("xgb_candidate_configs", None)
     cfg.pop("xgb_candidate_ks", None)
     logger.info(
-        "[XGB SELECTED] K=%d use_static=%s F1=%.4f AP=%.4f ROC_AUC=%s",
+        "[XGB SELECTED] K=%d use_static=%s F1=%.4f precision=%.4f recall=%.4f "
+        "AP=%.4f ROC_AUC=%s threshold=%.6f latest_F1=%.4f",
         int(cfg["best_k"]),
         bool(cfg["use_static"]),
         float(best["report"]["f1@main_thr"]),
+        float(best["report"]["precision@main_thr"]),
+        float(best["report"]["recall@main_thr"]),
         float(best["report"]["AP_val"]),
         f"{best['report'].get('ROC_AUC_val'):.4f}" if best["report"].get("ROC_AUC_val") is not None else "n/a",
+        float(best["report"]["thr_main_opt"]),
+        float(best["report"].get("f1@main_thr_latest", best["report"]["f1@main_thr"])),
     )
     meta = {
         "cfg": cfg,
@@ -416,9 +422,10 @@ def run_monthly_pipeline(
                 t_prev = int(shift_yymm(str(t_current), -1))
                 active_cnt_cur = get_active_count_for_month(engine, cand_k, t_current)
                 active_cnt_prev = get_active_count_for_month(engine, cand_k, t_prev)
+                min_active_ratio = float(os.getenv("MODEL_RETRAIN_MIN_ACTIVE_RATIO", "0.50"))
                 if active_cnt_prev > 0:
                     active_ratio = active_cnt_cur / active_cnt_prev
-                    if active_ratio < 0.80:
+                    if active_ratio < min_active_ratio:
                         pass_guardrail = False
                 else:
                     logger.warning("[GUARD-RAIL] Không có active customers ở tháng trước %s. Tự động kích hoạt guardrail.", t_prev)
@@ -431,9 +438,9 @@ def run_monthly_pipeline(
                 accepted = False
                 rule = "rejected_by_guardrail_incomplete_data"
                 logger.warning(
-                    "[GUARD] Tháng %d chưa hoàn thành dữ liệu (Active: %d vs tháng trước %s: %d, Tỷ lệ: %.2f < 0.80). "
+                    "[GUARD] Tháng %d chưa hoàn thành dữ liệu (Active: %d vs tháng trước %s: %d, Tỷ lệ: %.2f < %.2f). "
                     "HỦY RETRAIN, giữ nguyên model cũ và chỉ chạy scoring.",
-                    t_current, active_cnt_cur, t_prev, active_cnt_prev, active_ratio
+                    t_current, active_cnt_cur, t_prev, active_cnt_prev, active_ratio, min_active_ratio
                 )
             elif prev_f1 is None:
                 accepted = True
