@@ -74,13 +74,12 @@ def _score_stats(prob: np.ndarray) -> dict:
 
 def _xgb_scale_pos_weight(
     y: np.ndarray,
-    sample_weight: np.ndarray,
     baseline_spw: float,
 ) -> tuple[float, float, float]:
-    """Keep source weights, then add class balance only when labels are sparse."""
-    pos_w = float(sample_weight[y == 1].sum())
-    neg_w = float(sample_weight[y == 0].sum())
-    weighted_ratio = neg_w / max(pos_w, 1e-9)
+    """Add class balance only when labels are sparse."""
+    pos = float(np.sum(y == 1))
+    neg = float(np.sum(y == 0))
+    class_ratio = neg / max(pos, 1e-9)
     max_spw = max(_env_float("MAIN_XGB_MAX_SCALE_POS_WEIGHT", 20.0), 1.0)
     mode = (os.getenv("MAIN_XGB_SCALE_POS_WEIGHT_MODE") or "auto").strip().lower()
     churn_ratio = float(np.mean(y == 1)) if len(y) else 0.0
@@ -89,16 +88,16 @@ def _xgb_scale_pos_weight(
     if mode in {"none", "off", "1", "false"}:
         effective = 1.0
     elif mode == "auto":
-        effective = 1.0 if churn_ratio >= balance_max_rate else float(np.sqrt(max(weighted_ratio, 1.0)))
+        effective = 1.0 if churn_ratio >= balance_max_rate else float(np.sqrt(max(class_ratio, 1.0)))
     elif mode in {"baseline", "best_spw"}:
         effective = baseline_spw
     elif mode in {"weighted", "raw_weighted"}:
-        effective = weighted_ratio
+        effective = class_ratio
     else:
-        effective = float(np.sqrt(max(weighted_ratio, 1.0)))
+        effective = float(np.sqrt(max(class_ratio, 1.0)))
 
     effective = min(max(float(effective), 1.0), max_spw)
-    return effective, weighted_ratio, max_spw
+    return effective, class_ratio, max_spw
 
 
 def select_feature_cols_for_model(df: pd.DataFrame, label_col: str):
@@ -189,16 +188,9 @@ def train_main_xgb_option_B(
     X_va = df_va[feat_cols].copy()
     y_tr = df_tr[label_col].astype(int).to_numpy()
     y_va = df_va[label_col].astype(int).to_numpy()
-    sample_weight = (
-        pd.to_numeric(df_tr["label_weight"], errors="coerce").fillna(1.0).to_numpy()
-        if "label_weight" in df_tr.columns
-        else np.ones(len(df_tr), dtype=float)
-    )
 
-    # Baseline SPW is tuned for LR. XGB also receives row-level label_weight, so
-    # use a capped XGB-specific multiplier to avoid double-counting positives.
     baseline_spw = float(cfg["best_spw"])
-    spw, weighted_spw_raw, spw_cap = _xgb_scale_pos_weight(y_tr, sample_weight, baseline_spw)
+    spw, weighted_spw_raw, spw_cap = _xgb_scale_pos_weight(y_tr, baseline_spw)
     thr_baseline = float(cfg["best_threshold"])
     es_rounds = int(cfg.get("main_es_rounds", 200))
 
@@ -284,7 +276,6 @@ def train_main_xgb_option_B(
             X_va_s,
             y_va,
             es_rounds=es_rounds,
-            sample_weight=sample_weight,
         )
 
         used_mode = "native_categorical"
@@ -304,7 +295,6 @@ def train_main_xgb_option_B(
             X_va_oh,
             y_va,
             es_rounds=es_rounds,
-            sample_weight=sample_weight,
         )
 
         used_mode = "one_hot"

@@ -519,9 +519,7 @@ def build_labeled_pair(
         )
         out = out.drop(columns=["_actual_label"])
 
-    rule_weight = float(os.getenv("RULE_LABEL_SAMPLE_WEIGHT", "0.20"))
     out["label_source"] = "mixed_actual_rule" if actual_label_sources else "rule_based"
-    out["label_weight"] = np.where(actual_positive_mask, 1.0, rule_weight)
     return out
 
 def build_dataset_for_k(engine: Engine, k: int, horizon: int = 1, limit_rows_each: Optional[int] = None) -> pd.DataFrame:

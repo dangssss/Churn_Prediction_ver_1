@@ -266,17 +266,10 @@ def eval_one_k_train_val(
         y_tr = df_tr[label_col].astype(int)
         X_va = df_va[num_cols + cat_cols]
         y_va = df_va[label_col].astype(int)
-        sample_weight = (
-            pd.to_numeric(df_tr["label_weight"], errors="coerce").fillna(1.0)
-            if "label_weight" in df_tr.columns
-            else pd.Series(1.0, index=df_tr.index)
-        )
 
         n_pos = int((y_tr == 1).sum())
         n_neg = int((y_tr == 0).sum())
-        weighted_pos = float(sample_weight[y_tr == 1].sum())
-        weighted_neg = float(sample_weight[y_tr == 0].sum())
-        spw_raw = weighted_neg / max(weighted_pos, 1.0)
+        spw_raw = float(n_neg) / max(float(n_pos), 1.0)
         max_positive_class_weight = float(os.getenv("BASELINE_MAX_POSITIVE_CLASS_WEIGHT", "100"))
         spw = min(spw_raw, max_positive_class_weight)
 
@@ -321,12 +314,10 @@ def eval_one_k_train_val(
 
         if "label_source" in df_tr.columns:
             provenance = (
-                df_tr.assign(_label_weight=sample_weight)
-                .groupby("label_source", dropna=False)
+                df_tr.groupby("label_source", dropna=False)
                 .agg(
                     rows=(label_col, "size"),
                     positives=(label_col, "sum"),
-                    effective_weight=("_label_weight", "sum"),
                 )
                 .reset_index()
             )
@@ -342,7 +333,7 @@ def eval_one_k_train_val(
             C=0.1,
         )
         pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
-        pipe.fit(X_tr, y_tr, clf__sample_weight=sample_weight.to_numpy())
+        pipe.fit(X_tr, y_tr)
 
         va_prob = pipe.predict_proba(X_va)[:, 1]
         pr_auc = average_precision_score(y_va, va_prob)
@@ -500,11 +491,6 @@ def train_baseline_model_for_config(
     y_tr = df_tr[label_col].astype(int)
     X_va = df_va[num_cols + cat_cols]
     y_va = df_va[label_col].astype(int)
-    sample_weight = (
-        pd.to_numeric(df_tr["label_weight"], errors="coerce").fillna(1.0)
-        if "label_weight" in df_tr.columns
-        else pd.Series(1.0, index=df_tr.index)
-    )
 
     class_weight_used = {0: 1.0, 1: float(cfg.get("best_spw") or 1.0)}
     pre = make_preprocess(num_cols, cat_cols)
@@ -517,7 +503,7 @@ def train_baseline_model_for_config(
         C=0.1,
     )
     pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
-    pipe.fit(X_tr, y_tr, clf__sample_weight=sample_weight.to_numpy())
+    pipe.fit(X_tr, y_tr)
 
     va_prob = pipe.predict_proba(X_va)[:, 1]
     pr_auc = average_precision_score(y_va, va_prob)
