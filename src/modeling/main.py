@@ -61,6 +61,9 @@ def cmd_run_monthly(args) -> None:
         bundle_dir=args.bundle_dir,
         limit_rows_each=args.limit_rows_each,
         k_min=int(args.k_min),
+        tune_hyperparams=args.tune_hyperparams,
+        optuna_trials=args.optuna_trials,
+        optuna_timeout_seconds=args.optuna_timeout_seconds,
     )
     logger.info("DONE run-monthly: %s", out)
 
@@ -91,6 +94,9 @@ def cmd_retrain_if_due(args) -> None:
         do_scoring=False,
         force_cycle_retrain=False,
         always_train_candidate=True,
+        tune_hyperparams=args.tune_hyperparams,
+        optuna_trials=args.optuna_trials,
+        optuna_timeout_seconds=args.optuna_timeout_seconds,
     )
     logger.info("DONE retrain-if-due: %s", out)
 
@@ -118,6 +124,9 @@ def cmd_prepare_scoring(args) -> None:
             k_min=int(args.k_min),
             do_scoring=False,
             force_cycle_retrain=True,
+            tune_hyperparams=args.tune_hyperparams,
+            optuna_trials=args.optuna_trials,
+            optuna_timeout_seconds=args.optuna_timeout_seconds,
         )
         if not _bundle_is_ready(bundle_dir):
             raise RuntimeError("Bootstrap completed without producing a ready model bundle")
@@ -151,6 +160,9 @@ def cmd_prepare_scoring(args) -> None:
                     k_min=int(args.k_min),
                     do_scoring=False,
                     force_cycle_retrain=True,
+                    tune_hyperparams=args.tune_hyperparams,
+                    optuna_trials=args.optuna_trials,
+                    optuna_timeout_seconds=args.optuna_timeout_seconds,
                 )
             else:
                 try:
@@ -163,6 +175,9 @@ def cmd_prepare_scoring(args) -> None:
                         k_min=int(args.k_min),
                         do_scoring=False,
                         force_cycle_retrain=reason.startswith("accepted_bundle_age_gte_"),
+                        tune_hyperparams=args.tune_hyperparams,
+                        optuna_trials=args.optuna_trials,
+                        optuna_timeout_seconds=args.optuna_timeout_seconds,
                     )
                 except Exception:
                     logger.exception(
@@ -270,6 +285,34 @@ def load_config_defaults() -> dict:
     return defaults
 
 
+def add_tuning_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--tune-hyperparams",
+        dest="tune_hyperparams",
+        action="store_true",
+        default=None,
+        help="Enable Optuna tuning for the top XGBoost retrain candidate(s).",
+    )
+    parser.add_argument(
+        "--no-tune-hyperparams",
+        dest="tune_hyperparams",
+        action="store_false",
+        help="Disable Optuna tuning even if MAIN_XGB_OPTUNA_ENABLED is set.",
+    )
+    parser.add_argument(
+        "--optuna-trials",
+        type=int,
+        default=None,
+        help="Override MAIN_XGB_OPTUNA_TRIALS for this run.",
+    )
+    parser.add_argument(
+        "--optuna-timeout-seconds",
+        type=int,
+        default=None,
+        help="Override MAIN_XGB_OPTUNA_TIMEOUT_SECONDS for this run.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     defaults = load_config_defaults()
     
@@ -283,6 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bundle-dir", type=str, default=str(CHURN_MODEL_DIR / "bundles/latest"))
     p.add_argument("--limit-rows-each", type=int, default=None)
     p.add_argument("--k-min", type=int, default=3)
+    add_tuning_args(p)
     p.set_defaults(func=cmd_run_monthly)
 
     p = sub.add_parser("retrain-if-due", help="Retrain-only gate: interval/drift trigger; freshness is audit-only")
@@ -291,6 +335,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bundle-dir", type=str, default=str(CHURN_MODEL_DIR / "bundles/latest"))
     p.add_argument("--limit-rows-each", type=int, default=None)
     p.add_argument("--k-min", type=int, default=3)
+    add_tuning_args(p)
     p.add_argument(
         "--force-evaluate",
         action="store_true",
@@ -305,6 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bundle-dir", type=str, default=str(CHURN_MODEL_DIR / "bundles/latest"))
     p.add_argument("--limit-rows-each", type=int, default=None)
     p.add_argument("--k-min", type=int, default=3)
+    add_tuning_args(p)
     p.add_argument(
         "--force-retrain",
         action="store_true",

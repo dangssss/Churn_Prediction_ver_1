@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 import logging
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,13 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _score_stats(prob: np.ndarray) -> dict:
     if len(prob) == 0:
         return {}
@@ -98,6 +106,51 @@ def _xgb_scale_pos_weight(
 
     effective = min(max(float(effective), 1.0), max_spw)
     return effective, class_ratio, max_spw
+
+
+def _xgb_training_params(cfg: dict, spw: float) -> tuple[dict[str, Any], int]:
+    """Build XGBoost params from env defaults plus optional tuned overrides."""
+    tuned = dict(cfg.get("main_xgb_params") or {})
+    es_rounds = int(tuned.pop("early_stopping_rounds", cfg.get("main_es_rounds", _env_int("MAIN_XGB_ES_ROUNDS", 200))))
+
+    params: dict[str, Any] = dict(
+        n_estimators=_env_int("MAIN_XGB_N_ESTIMATORS", 5000),
+        learning_rate=_env_float("MAIN_XGB_LEARNING_RATE", 0.03),
+        max_depth=_env_int("MAIN_XGB_MAX_DEPTH", 6),
+        max_leaves=_env_int("MAIN_XGB_MAX_LEAVES", 63),
+        subsample=_env_float("MAIN_XGB_SUBSAMPLE", 0.8),
+        colsample_bytree=_env_float("MAIN_XGB_COLSAMPLE_BYTREE", 0.8),
+        colsample_bylevel=_env_float("MAIN_XGB_COLSAMPLE_BYLEVEL", 0.7),
+        reg_lambda=_env_float("MAIN_XGB_REG_LAMBDA", 1.0),
+        reg_alpha=_env_float("MAIN_XGB_REG_ALPHA", 0.1),
+        min_child_weight=_env_float("MAIN_XGB_MIN_CHILD_WEIGHT", 2.0),
+        gamma=_env_float("MAIN_XGB_GAMMA", 0.0),
+        tree_method=os.getenv("MAIN_XGB_TREE_METHOD", "hist"),
+        random_state=int(cfg.get("seed", 42)),
+        scale_pos_weight=float(spw),
+        eval_metric=["aucpr", "logloss"],
+    )
+    n_jobs = _env_int("MAIN_XGB_N_JOBS", 0)
+    if n_jobs > 0:
+        params["n_jobs"] = int(n_jobs)
+
+    params.update(tuned)
+    params["scale_pos_weight"] = float(params.get("scale_pos_weight", spw))
+    params["random_state"] = int(params.get("random_state", cfg.get("seed", 42)))
+    if "eval_metric" not in params or params["eval_metric"] in (None, ""):
+        params["eval_metric"] = ["aucpr", "logloss"]
+    return params, max(int(es_rounds), 1)
+
+
+def _cfg_float(cfg: dict, key: str, env_name: str, default: float) -> float:
+    value = cfg.get(key)
+    if value is None:
+        return _env_float(env_name, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid cfg float %s=%r. Falling back to %s.", key, value, env_name)
+        return _env_float(env_name, default)
 
 
 def select_feature_cols_for_model(df: pd.DataFrame, label_col: str):
@@ -192,7 +245,8 @@ def train_main_xgb_option_B(
     baseline_spw = float(cfg["best_spw"])
     spw, weighted_spw_raw, spw_cap = _xgb_scale_pos_weight(y_tr, baseline_spw)
     thr_baseline = float(cfg["best_threshold"])
-    es_rounds = int(cfg.get("main_es_rounds", 200))
+    params, es_rounds = _xgb_training_params(cfg, spw)
+    effective_spw = float(params.get("scale_pos_weight", spw))
 
     n_churn_train = int(y_tr.sum())
     n_active_train = len(y_tr) - n_churn_train
@@ -207,7 +261,7 @@ def train_main_xgb_option_B(
         "xgb_spw=%.2f | spw_cap=%.2f | mode=%s | auto_no_balance_rate>=%.2f%%",
         baseline_spw,
         weighted_spw_raw,
-        spw,
+        effective_spw,
         spw_cap,
         (os.getenv("MAIN_XGB_SCALE_POS_WEIGHT_MODE") or "auto"),
         _env_float("MAIN_XGB_CLASS_WEIGHT_MAX_RATE", 0.10) * 100.0,
@@ -215,7 +269,7 @@ def train_main_xgb_option_B(
 
     logger.info(
         "[MAIN MODEL] Train: Churn=%d | Active=%d | Total=%d | Tỷ lệ Churn=%.2f%% | spw=%.2f",
-        n_churn_train, n_active_train, len(y_tr), churn_ratio_train * 100, spw,
+        n_churn_train, n_active_train, len(y_tr), churn_ratio_train * 100, effective_spw,
     )
     logger.info(
         "[MAIN MODEL] Val:   Churn=%d | Active=%d | Total=%d | Tỷ lệ Churn=%.2f%%",
@@ -242,24 +296,6 @@ def train_main_xgb_option_B(
         if c not in cat_cols and c not in date_cols:
             X_tr[c] = pd.to_numeric(X_tr[c], errors="coerce")
             X_va[c] = pd.to_numeric(X_va[c], errors="coerce")
-
-    params = dict(
-        n_estimators=_env_int("MAIN_XGB_N_ESTIMATORS", 5000),
-        learning_rate=_env_float("MAIN_XGB_LEARNING_RATE", 0.03),
-        max_depth=_env_int("MAIN_XGB_MAX_DEPTH", 6),
-        max_leaves=_env_int("MAIN_XGB_MAX_LEAVES", 63),
-        subsample=_env_float("MAIN_XGB_SUBSAMPLE", 0.8),
-        colsample_bytree=_env_float("MAIN_XGB_COLSAMPLE_BYTREE", 0.8),
-        colsample_bylevel=_env_float("MAIN_XGB_COLSAMPLE_BYLEVEL", 0.7),
-        reg_lambda=_env_float("MAIN_XGB_REG_LAMBDA", 1.0),
-        reg_alpha=_env_float("MAIN_XGB_REG_ALPHA", 0.1),
-        min_child_weight=_env_float("MAIN_XGB_MIN_CHILD_WEIGHT", 2.0),
-        gamma=_env_float("MAIN_XGB_GAMMA", 0.0),
-        tree_method="hist",
-        random_state=42,
-        scale_pos_weight=spw,
-        eval_metric=["aucpr", "logloss"]
-    )
 
     feature_name_map = None
 
@@ -321,8 +357,13 @@ def train_main_xgb_option_B(
     p_b, r_b, f1_b = prf1_at_threshold(y_va, va_prob, thr_baseline)
 
     # optimize threshold on MAIN val
-    min_threshold = _env_float("MAIN_XGB_THRESHOLD_MIN", 0.005)
-    max_pred_pos_rate = _env_float("MAIN_XGB_MAX_PREDICTED_POSITIVE_RATE", 0.80)
+    min_threshold = _cfg_float(cfg, "main_threshold_min", "MAIN_XGB_THRESHOLD_MIN", 0.005)
+    max_pred_pos_rate = _cfg_float(
+        cfg,
+        "main_max_predicted_positive_rate",
+        "MAIN_XGB_MAX_PREDICTED_POSITIVE_RATE",
+        0.80,
+    )
     thr_opt, p_opt, r_opt, f1_opt = best_threshold_by_f1_np(
         y_va,
         va_prob,
@@ -419,7 +460,7 @@ def train_main_xgb_option_B(
         "train_rows": int(len(df_tr)),
         "val_rows": int(len(df_va)),
 
-        "spw_used": float(spw),
+        "spw_used": float(effective_spw),
         "spw_baseline": float(baseline_spw),
         "spw_weighted_raw": float(weighted_spw_raw),
         "spw_cap": float(spw_cap),
@@ -432,6 +473,7 @@ def train_main_xgb_option_B(
         "xgb_es_rounds": int(es_rounds),
         "xgb_best_iteration": int(best_it) if best_it is not None else None,
         "xgb_best_score": float(best_score) if best_score is not None else None,
+        "xgb_params": dict(params),
 
         "val_prevalence": float(sanity["val_prevalence"]),
         "dummy_ap_const0": float(sanity["dummy_const0"]["AP"]),
@@ -456,7 +498,184 @@ def train_main_xgb_option_B(
 
     return model, report, feat_cols, cat_cols, feature_name_map, date_cols
 
-def run_main_variant(engine, cfg: dict, df_static: pd.DataFrame, use_static_flag: bool):
+
+def _build_optuna_trial_cfg(base_cfg: dict, trial) -> dict:
+    n_min = _env_int("MAIN_XGB_OPTUNA_N_ESTIMATORS_MIN", 800)
+    n_max = _env_int("MAIN_XGB_OPTUNA_N_ESTIMATORS_MAX", 5000)
+    n_step = max(_env_int("MAIN_XGB_OPTUNA_N_ESTIMATORS_STEP", 200), 1)
+    if n_max < n_min:
+        n_max = n_min
+
+    params: dict[str, Any] = {
+        "n_estimators": trial.suggest_int("n_estimators", n_min, n_max, step=n_step),
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.20, log=True),
+        "max_depth": trial.suggest_int("max_depth", 3, 10),
+        "max_leaves": trial.suggest_categorical("max_leaves", [0, 31, 63, 127, 255]),
+        "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 30.0, log=True),
+        "gamma": trial.suggest_float("gamma", 0.0, 8.0),
+        "subsample": trial.suggest_float("subsample", 0.55, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.55, 1.0),
+        "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.50, 1.0),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 0.05, 50.0, log=True),
+        "tree_method": os.getenv("MAIN_XGB_TREE_METHOD", "hist"),
+        "random_state": int(base_cfg.get("seed", 42)),
+        "eval_metric": ["aucpr", "logloss"],
+    }
+    n_jobs = _env_int("MAIN_XGB_N_JOBS", 0)
+    if n_jobs > 0:
+        params["n_jobs"] = int(n_jobs)
+
+    if _env_bool("MAIN_XGB_OPTUNA_TUNE_SCALE_POS_WEIGHT", True):
+        max_spw = max(_env_float("MAIN_XGB_OPTUNA_SCALE_POS_WEIGHT_MAX", _env_float("MAIN_XGB_MAX_SCALE_POS_WEIGHT", 20.0)), 0.5)
+        params["scale_pos_weight"] = trial.suggest_float("scale_pos_weight", 0.5, max_spw, log=True)
+
+    tuned_cfg = dict(base_cfg)
+    tuned_cfg["main_xgb_params"] = params
+    tuned_cfg["main_es_rounds"] = trial.suggest_int("early_stopping_rounds", 50, 350, step=50)
+    tuned_cfg["main_max_predicted_positive_rate"] = trial.suggest_float(
+        "max_predicted_positive_rate",
+        _env_float("MAIN_XGB_OPTUNA_MAX_PRED_POS_RATE_MIN", 0.35),
+        _env_float("MAIN_XGB_OPTUNA_MAX_PRED_POS_RATE_MAX", 0.90),
+    )
+    tuned_cfg["main_threshold_min"] = _env_float("MAIN_XGB_THRESHOLD_MIN", 0.005)
+    return tuned_cfg
+
+
+def tune_xgb_hyperparams_for_folds(
+    cfg: dict,
+    folds: list[dict],
+    *,
+    n_trials: int | None = None,
+    timeout_seconds: int | None = None,
+) -> tuple[dict, dict]:
+    """Tune XGBoost params with Optuna on the existing walk-forward folds."""
+    n_trials = int(n_trials if n_trials is not None else _env_int("MAIN_XGB_OPTUNA_TRIALS", 25))
+    timeout_seconds = int(
+        timeout_seconds
+        if timeout_seconds is not None
+        else _env_int("MAIN_XGB_OPTUNA_TIMEOUT_SECONDS", 0)
+    )
+    if n_trials <= 0:
+        return dict(cfg), {"enabled": False, "reason": "n_trials<=0"}
+
+    try:
+        import optuna
+        from optuna.pruners import MedianPruner
+        from optuna.samplers import TPESampler
+    except ImportError as exc:
+        logger.warning("[OPTUNA] optuna is not installed; using default XGBoost params: %s", exc)
+        return dict(cfg), {"enabled": False, "reason": "optuna_not_installed"}
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    seed = int(cfg.get("seed", 42))
+    study_name = f"churn_xgb_k{cfg.get('best_k')}_static{int(bool(cfg.get('use_static', False)))}"
+    study = optuna.create_study(
+        study_name=study_name,
+        direction="maximize",
+        sampler=TPESampler(seed=seed),
+        pruner=MedianPruner(
+            n_startup_trials=max(_env_int("MAIN_XGB_OPTUNA_PRUNER_STARTUP_TRIALS", 5), 0),
+            n_warmup_steps=max(_env_int("MAIN_XGB_OPTUNA_PRUNER_WARMUP_STEPS", 1), 0),
+        ),
+    )
+
+    def objective(trial) -> float:
+        trial_cfg = _build_optuna_trial_cfg(cfg, trial)
+        fold_f1: list[float] = []
+        fold_ap: list[float] = []
+        fold_roc: list[float] = []
+        for fold_idx, fold in enumerate(folds):
+            try:
+                _model, report, *_rest = train_main_xgb_option_B(
+                    fold["train"],
+                    fold["val"],
+                    trial_cfg,
+                )
+            except Exception as exc:
+                trial.set_user_attr("rejected_reason", str(exc))
+                return 0.0
+
+            fold_f1.append(float(report["f1@main_thr"]))
+            fold_ap.append(float(report["AP_val"]))
+            if report.get("ROC_AUC_val") is not None:
+                fold_roc.append(float(report["ROC_AUC_val"]))
+            score = float(np.mean(fold_f1))
+            trial.report(score, step=fold_idx)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        trial_cfg["optuna_objective"] = "walk_forward_f1_mean"
+        trial.set_user_attr("candidate_cfg", trial_cfg)
+        trial.set_user_attr("fold_f1", fold_f1)
+        trial.set_user_attr("fold_ap", fold_ap)
+        trial.set_user_attr("fold_roc", fold_roc)
+        trial.set_user_attr("ap_mean", float(np.mean(fold_ap)) if fold_ap else 0.0)
+        trial.set_user_attr("roc_auc_mean", float(np.mean(fold_roc)) if fold_roc else 0.0)
+        return float(np.mean(fold_f1)) if fold_f1 else 0.0
+
+    logger.info(
+        "[OPTUNA] Start XGBoost tuning K=%s use_static=%s trials=%d timeout=%s objective=walk_forward_f1_mean",
+        cfg.get("best_k"),
+        cfg.get("use_static"),
+        n_trials,
+        timeout_seconds or "none",
+    )
+    study.optimize(
+        objective,
+        n_trials=int(n_trials),
+        timeout=int(timeout_seconds) if timeout_seconds > 0 else None,
+        n_jobs=max(_env_int("MAIN_XGB_OPTUNA_N_JOBS", 1), 1),
+        show_progress_bar=False,
+        gc_after_trial=True,
+    )
+
+    complete_trials = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+    ]
+    if not complete_trials:
+        logger.warning("[OPTUNA] No completed trials for K=%s use_static=%s; using defaults.", cfg.get("best_k"), cfg.get("use_static"))
+        return dict(cfg), {"enabled": True, "status": "no_completed_trials"}
+
+    best = study.best_trial
+    tuned_cfg = dict(best.user_attrs.get("candidate_cfg") or cfg)
+    tuning_meta = {
+        "enabled": True,
+        "status": "completed",
+        "study_name": study.study_name,
+        "objective": "walk_forward_f1_mean",
+        "n_trials": len(study.trials),
+        "completed_trials": len(complete_trials),
+        "best_value": float(best.value),
+        "best_params": dict(best.params),
+        "fold_f1": best.user_attrs.get("fold_f1", []),
+        "fold_ap": best.user_attrs.get("fold_ap", []),
+        "fold_roc": best.user_attrs.get("fold_roc", []),
+        "ap_mean": best.user_attrs.get("ap_mean"),
+        "roc_auc_mean": best.user_attrs.get("roc_auc_mean"),
+    }
+    tuned_cfg["optuna_tuning"] = tuning_meta
+    logger.info(
+        "[OPTUNA] Best K=%s use_static=%s F1_mean=%.4f params=%s",
+        cfg.get("best_k"),
+        cfg.get("use_static"),
+        float(best.value),
+        dict(best.params),
+    )
+    return tuned_cfg, tuning_meta
+
+
+def run_main_variant(
+    engine,
+    cfg: dict,
+    df_static: pd.DataFrame,
+    use_static_flag: bool,
+    *,
+    tune_hyperparams: bool = False,
+    optuna_trials: int | None = None,
+    optuna_timeout_seconds: int | None = None,
+):
     from preprocess.trainval import build_walk_forward_for_main
     df_all, folds = build_walk_forward_for_main(
         engine,
@@ -466,6 +685,16 @@ def run_main_variant(engine, cfg: dict, df_static: pd.DataFrame, use_static_flag
     )
     cfg_tmp = dict(cfg)
     cfg_tmp["use_static"] = bool(use_static_flag)
+    tuning_meta = None
+
+    if tune_hyperparams:
+        cfg_tmp, tuning_meta = tune_xgb_hyperparams_for_folds(
+            cfg_tmp,
+            folds,
+            n_trials=optuna_trials,
+            timeout_seconds=optuna_timeout_seconds,
+        )
+        cfg_tmp["use_static"] = bool(use_static_flag)
 
     fold_outputs = []
     for fold_idx, fold in enumerate(folds, start=1):
@@ -531,6 +760,8 @@ def run_main_variant(engine, cfg: dict, df_static: pd.DataFrame, use_static_flag
     report["precision@main_thr_latest"] = float(latest["report"]["precision@main_thr"])
     report["recall@main_thr_latest"] = float(latest["report"]["recall@main_thr"])
     report["val_prevalence_latest"] = float(latest["report"]["val_prevalence"])
+    if tuning_meta is not None:
+        report["optuna_tuning"] = tuning_meta
     report["f1@main_thr"] = f1_mean
     report["AP_val"] = ap_mean
     report["ROC_AUC_val"] = roc_mean
@@ -576,5 +807,7 @@ def run_main_variant(engine, cfg: dict, df_static: pd.DataFrame, use_static_flag
         "date_cols": latest["date_cols"],
         "feature_name_map": latest["feature_name_map"],
         "feature_profile": feature_profile,
+        "cfg": cfg_tmp,
+        "optuna_tuning": tuning_meta,
     }
     return out

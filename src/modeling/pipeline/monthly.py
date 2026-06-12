@@ -163,6 +163,9 @@ def _train_main_inline(
     cfg_override: dict | None = None,
     candidate_configs: list[dict] | None = None,
     save_output: bool = True,
+    tune_hyperparams: bool | None = None,
+    optuna_trials: int | None = None,
+    optuna_timeout_seconds: int | None = None,
 ) -> dict:
     """
     Inline training (no subprocess). Trains both use_static variants (if allowed by cfg) and saves bundle.
@@ -174,6 +177,11 @@ def _train_main_inline(
     df_static = load_cus_lifetime_snapshots(engine)
     variants = []
     seen = set()
+    tune_enabled = (
+        str(os.getenv("MAIN_XGB_OPTUNA_ENABLED", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
+        if tune_hyperparams is None
+        else bool(tune_hyperparams)
+    )
     for cand in candidates:
         cand = dict(cand)
         for use_static_flag in [False, True]:
@@ -187,7 +195,7 @@ def _train_main_inline(
                 bool(use_static_flag),
             )
             variant = run_main_variant(engine, cand, df_static, use_static_flag=use_static_flag)
-            variant["candidate_cfg"] = cand
+            variant["candidate_cfg"] = dict(variant.get("cfg") or cand)
             variants.append(variant)
 
     ok = [v for v in variants if "F1_val" in v]
@@ -200,6 +208,48 @@ def _train_main_inline(
                 variant.get("report", {}).get("K"),
                 variant.get("use_static"),
                 variant.get("guardrail_warning"),
+            )
+    if tune_enabled:
+        try:
+            top_n = max(int(os.getenv("MAIN_XGB_OPTUNA_TOP_N_VARIANTS", "1")), 1)
+        except ValueError:
+            logger.warning("Invalid MAIN_XGB_OPTUNA_TOP_N_VARIANTS=%r. Using 1.", os.getenv("MAIN_XGB_OPTUNA_TOP_N_VARIANTS"))
+            top_n = 1
+        ranked_for_tuning = sorted(
+            ok,
+            key=lambda r: (r["F1_val"], r["AP_val"], r["ROC_AUC_val"]),
+            reverse=True,
+        )[:top_n]
+        tuned_variants = []
+        for base in ranked_for_tuning:
+            base_cfg = dict(base.get("candidate_cfg") or cfg)
+            use_static_flag = bool(base.get("use_static"))
+            logger.info(
+                "[OPTUNA] Retuning top candidate K=%d use_static=%s base_F1=%.4f",
+                int(base_cfg["best_k"]),
+                use_static_flag,
+                float(base["F1_val"]),
+            )
+            tuned = run_main_variant(
+                engine,
+                base_cfg,
+                df_static,
+                use_static_flag=use_static_flag,
+                tune_hyperparams=True,
+                optuna_trials=optuna_trials,
+                optuna_timeout_seconds=optuna_timeout_seconds,
+            )
+            tuned["candidate_cfg"] = dict(tuned.get("cfg") or base_cfg)
+            tuned["is_optuna_tuned"] = True
+            tuned_variants.append(tuned)
+
+        tuned_ok = [v for v in tuned_variants if "F1_val" in v]
+        ok.extend(tuned_ok)
+        if tuned_ok:
+            logger.info(
+                "[OPTUNA] Added %d tuned candidate(s). Best tuned F1=%.4f",
+                len(tuned_ok),
+                max(float(v["F1_val"]) for v in tuned_ok),
             )
     ok.sort(key=lambda r: (r["F1_val"], r["AP_val"], r["ROC_AUC_val"]), reverse=True)
     best = ok[0]
@@ -268,6 +318,9 @@ def run_monthly_pipeline(
     do_scoring: bool = True,
     force_cycle_retrain: bool = False,
     always_train_candidate: bool = False,
+    tune_hyperparams: bool | None = None,
+    optuna_trials: int | None = None,
+    optuna_timeout_seconds: int | None = None,
 ) -> dict:
     """
     FULL monthly pipeline (run once):
@@ -387,6 +440,9 @@ def run_monthly_pipeline(
                 cfg_override=cand_cfg,
                 candidate_configs=cand_cfg.get("xgb_candidate_configs"),
                 save_output=False,
+                tune_hyperparams=tune_hyperparams,
+                optuna_trials=optuna_trials,
+                optuna_timeout_seconds=optuna_timeout_seconds,
             )
             cand_cfg = dict(candidate_train_out["cfg"])
             cand_f1 = float(cand_cfg["metric_f1_val"])
@@ -475,6 +531,9 @@ def run_monthly_pipeline(
                     bundle_dir=bundle_dir,
                     cfg_override=cand_cfg,
                     candidate_configs=cand_cfg.get("xgb_candidate_configs"),
+                    tune_hyperparams=tune_hyperparams,
+                    optuna_trials=optuna_trials,
+                    optuna_timeout_seconds=optuna_timeout_seconds,
                 )
             else:
                 train_out = candidate_train_out

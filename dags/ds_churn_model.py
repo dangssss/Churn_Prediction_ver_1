@@ -18,12 +18,14 @@ with DAG(
         task_id="run_retrain_if_due",
         bash_command=(
             "python /churn_source/modeling/ops_lock.py --skip-if-busy -- "
-            "bash -lc 'cd /churn_source && python modeling/main.py retrain-if-due --horizon 2 --force-evaluate'"
+            "bash -lc 'cd /churn_source && python modeling/main.py retrain-if-due --horizon 2 --force-evaluate --tune-hyperparams'"
         ),
         env={
             "TZ": "Asia/Ho_Chi_Minh",
             "PYTHONUNBUFFERED": "1",
             "PYTHONPATH": "/churn_source/modeling",
+            "MAIN_XGB_OPTUNA_TRIALS": "20",
+            "MAIN_XGB_OPTUNA_TOP_N_VARIANTS": "1",
         },
         append_env=True,
     )
