@@ -19,6 +19,7 @@ from sklearn.metrics import (
 )
 
 from preprocess.dataset import build_dataset_for_k, preflight_purged_train_val_for_k
+from preprocess.eligibility import filter_churn_eligible
 from preprocess.static_features import attach_static
 from infra.yymm import shift_yymm
 from logging_config import get_logger
@@ -36,6 +37,10 @@ def select_feature_cols_mixed(df: pd.DataFrame, label_col: str):
         "source_table_t", "source_table_t_plus_h",
         "is_active_now", "is_churned_now", "gate_group",
         "label_source", "label_weight",
+        "is_churn_eligible", "churn_ineligible_reason",
+        "churn_active_months_in_window", "churn_required_active_months",
+        "churn_item_sum_for_eligibility", "churn_revenue_sum_for_eligibility",
+        "churn_avg_revenue_per_item_for_eligibility",
         label_col
     }
     num_cols, cat_cols = [], []
@@ -212,6 +217,7 @@ def eval_one_k_train_val(
 
     # train churn-risk chỉ trên active_now + có label
     df_k = df_k[df_k["is_active_now"] == 1].dropna(subset=[label_col]).copy()
+    df_k = filter_churn_eligible(df_k, k=k, context=f"baseline_k{k}")
     if df_k.empty or df_k[label_col].nunique() < 2:
         return None
 
@@ -470,6 +476,7 @@ def train_baseline_model_for_config(
         raise ValueError(f"Dataset empty for baseline fallback K={k}, H={horizon}")
 
     df_k = df_k[df_k["is_active_now"] == 1].dropna(subset=[label_col]).copy()
+    df_k = filter_churn_eligible(df_k, k=k, context=f"baseline_bundle_k{k}")
     if df_k.empty or df_k[label_col].nunique() < 2:
         raise ValueError(f"Not enough labeled data for baseline fallback K={k}, H={horizon}")
 

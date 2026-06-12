@@ -6,6 +6,7 @@ import numpy as np
 from sqlalchemy.engine import Engine
 
 from preprocess.dataset import load_scoring_table_for_k
+from preprocess.eligibility import filter_churn_eligible
 from preprocess.static_features import load_cus_lifetime, attach_static, LIFETIME_RATIO_REQUIRED_COLS
 from common.artifacts import load_bundle
 from config_store.best_config import load_latest_accepted_best_config as load_latest_best_config
@@ -80,7 +81,12 @@ def run_export_risk(
 
     # Filter active customers (item_last > 0 OR revenue_last > 0)
     df_active = df_raw[df_raw.get("is_active_now", 1) == 1].copy()
-    print(f"? Table: {table_t} | month={month_used} | active customers={len(df_active)}")
+    active_before_eligibility = len(df_active)
+    df_active = filter_churn_eligible(df_active, k=k, context=f"scoring_k{k}_month{month_used}")
+    print(
+        f"? Table: {table_t} | month={month_used} | active customers={active_before_eligibility} "
+        f"| churn-eligible={len(df_active)}"
+    )
 
     if df_active.empty:
         print("No active customers to score")
@@ -115,6 +121,10 @@ def run_export_risk(
                 "cms_code_enc", "window_size", "window_start", "window_end",
                 "source_table_t", "source_table_t_plus_h",
                 "is_active_now", "is_churned_now", "gate_group",
+                "is_churn_eligible", "churn_ineligible_reason",
+                "churn_active_months_in_window", "churn_required_active_months",
+                "churn_item_sum_for_eligibility", "churn_revenue_sum_for_eligibility",
+                "churn_avg_revenue_per_item_for_eligibility",
             }
             _feat_cols = [c for c in df_engineered.columns if c not in drop_cols]
 

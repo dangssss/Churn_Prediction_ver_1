@@ -159,6 +159,10 @@ def select_feature_cols_for_model(df: pd.DataFrame, label_col: str):
         "source_table_t", "source_table_t_plus_h",
         "is_active_now", "is_churned_now", "gate_group",
         "label_source", "label_weight",
+        "is_churn_eligible", "churn_ineligible_reason",
+        "churn_active_months_in_window", "churn_required_active_months",
+        "churn_item_sum_for_eligibility", "churn_revenue_sum_for_eligibility",
+        "churn_avg_revenue_per_item_for_eligibility",
         label_col
     }
     return [c for c in df.columns if c not in drop_cols]

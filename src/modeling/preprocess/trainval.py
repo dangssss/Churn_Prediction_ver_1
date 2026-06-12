@@ -7,6 +7,7 @@ from .dataset import build_dataset_for_k
 from baseline.runner import time_split_train_val_last_month
 from baseline.runner import time_series_purged_splits
 from .static_features import attach_static, LIFETIME_RATIO_REQUIRED_COLS
+from .eligibility import filter_churn_eligible
 
 
 def _build_main_dataset(
@@ -27,6 +28,7 @@ def _build_main_dataset(
 
     if "is_active_now" in df.columns:
         df = df[df["is_active_now"] == 1].copy()
+    df = filter_churn_eligible(df, k=k, context=f"main_train_k{k}")
     df = df.dropna(subset=[label_col]).copy()
     if df.empty or df[label_col].nunique() < 2:
         raise ValueError("Not enough labeled data to train main model")

@@ -11,6 +11,7 @@ from sqlalchemy.engine import Engine
 from infra.yymm import shift_yymm
 from infra.db import smoke_test
 from preprocess.feature_tables import max_window_end_for_k
+from preprocess.eligibility import ChurnEligibilityConfig
 from preprocess.static_features import load_cus_lifetime_snapshots
 from baseline.sweep import run_sweep_k
 from config_store.best_config import (
@@ -291,6 +292,7 @@ def _train_main_inline(
         "cfg": cfg,
         "bundle_lifecycle": _bundle_lifecycle(cfg),
         "validation_label_source": cfg.get("validation_label_source"),
+        "churn_eligibility": ChurnEligibilityConfig.from_env().__dict__,
         "main_report": best["report"],
         "feat_cols": best.get("feat_cols"),
         "cat_cols": best.get("cat_cols"),

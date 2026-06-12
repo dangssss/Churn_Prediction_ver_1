@@ -20,6 +20,7 @@ from export_risk_mode.runner import run_export_risk_mode
 from config_store.best_config import load_latest_accepted_best_config
 from config.paths import CHURN_MODEL_DIR
 from preprocess.static_features import load_cus_lifetime_snapshots
+from preprocess.eligibility import ChurnEligibilityConfig
 from main_model.runner import run_main_variant
 from common.artifacts import save_bundle
 from logging_config import get_logger
@@ -245,6 +246,7 @@ def cmd_train_main(args) -> None:
         "cfg": cfg,
         "bundle_lifecycle": str(cfg.get("bundle_lifecycle") or "PRODUCTION").upper(),
         "validation_label_source": cfg.get("validation_label_source"),
+        "churn_eligibility": ChurnEligibilityConfig.from_env().__dict__,
         "main_report": best["report"],
         "feat_cols": best.get("feat_cols"),
         "cat_cols": best.get("cat_cols"),
