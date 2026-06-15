@@ -361,7 +361,8 @@ def train_main_xgb_option_B(
 
     p_b, r_b, f1_b = prf1_at_threshold(y_va, va_prob, thr_baseline)
 
-    # optimize threshold on MAIN val
+    # optimize threshold on MAIN val unless a final-holdout threshold was fixed
+    # from tuning folds.
     min_threshold = _cfg_float(cfg, "main_threshold_min", "MAIN_XGB_THRESHOLD_MIN", 0.005)
     max_pred_pos_rate = _cfg_float(
         cfg,
@@ -369,13 +370,21 @@ def train_main_xgb_option_B(
         "MAIN_XGB_MAX_PREDICTED_POSITIVE_RATE",
         0.80,
     )
-    thr_opt, p_opt, r_opt, f1_opt = best_threshold_by_f1_np(
+    thr_search_opt, p_search_opt, r_search_opt, f1_search_opt = best_threshold_by_f1_np(
         y_va,
         va_prob,
         n_grid=600,
         min_threshold=min_threshold,
         max_predicted_positive_rate=max_pred_pos_rate,
     )
+    fixed_threshold = cfg.get("main_fixed_threshold")
+    if fixed_threshold is not None:
+        thr_opt = float(fixed_threshold)
+        p_opt, r_opt, f1_opt = prf1_at_threshold(y_va, va_prob, thr_opt)
+        threshold_source = str(cfg.get("main_fixed_threshold_source") or "fixed")
+    else:
+        thr_opt, p_opt, r_opt, f1_opt = thr_search_opt, p_search_opt, r_search_opt, f1_search_opt
+        threshold_source = "optimized_on_validation_fold"
     ap = average_precision_np(y_va, va_prob)
     roc_auc = float(roc_auc_score(y_va, va_prob)) if len(np.unique(y_va)) == 2 else None
     primary_sources = (
@@ -392,7 +401,8 @@ def train_main_xgb_option_B(
     )
     logger.info(
         "[MAIN CLASSIFICATION METRICS][%s] F1=%.4f precision=%.4f recall=%.4f "
-        "AP=%.4f ROC_AUC=%s prevalence=%.4f%% threshold=%.6f threshold_min=%.6f max_pred_pos_rate=%.2f%%",
+        "AP=%.4f ROC_AUC=%s prevalence=%.4f%% threshold=%.6f threshold_source=%s "
+        "search_opt_threshold=%.6f threshold_min=%.6f max_pred_pos_rate=%.2f%%",
         primary_label_source.upper(),
         f1_opt,
         p_opt,
@@ -401,6 +411,8 @@ def train_main_xgb_option_B(
         f"{roc_auc:.4f}" if roc_auc is not None else "n/a",
         100.0 * float(y_va.mean()),
         thr_opt,
+        threshold_source,
+        thr_search_opt,
         min_threshold,
         100.0 * max_pred_pos_rate,
     )
@@ -494,11 +506,16 @@ def train_main_xgb_option_B(
         "f1@baseline_thr": float(f1_b),
 
         "thr_main_opt": float(thr_opt),
+        "thr_main_search_opt": float(thr_search_opt),
+        "threshold_source": threshold_source,
         "thr_main_min": float(min_threshold),
         "max_predicted_positive_rate": float(max_pred_pos_rate),
         "precision@main_thr": float(p_opt),
         "recall@main_thr": float(r_opt),
         "f1@main_thr": float(f1_opt),
+        "precision@search_thr": float(p_search_opt),
+        "recall@search_thr": float(r_search_opt),
+        "f1@search_thr": float(f1_search_opt),
     }
 
     return model, report, feat_cols, cat_cols, feature_name_map, date_cols
@@ -955,7 +972,8 @@ def run_main_variant(
     tuning_folds = folds
 
     if tune_hyperparams:
-        if _env_bool("MAIN_XGB_FINAL_HOLDOUT_ENABLED", True) and len(folds) >= 3:
+        min_tuning_folds = max(_env_int("MAIN_XGB_MIN_TUNING_FOLDS", 5), 1)
+        if _env_bool("MAIN_XGB_FINAL_HOLDOUT_ENABLED", True) and len(folds) >= min_tuning_folds + 1:
             final_holdout_fold = folds[-1]
             tuning_folds = folds[:-1]
             logger.info(
@@ -967,25 +985,64 @@ def run_main_variant(
             )
         elif _env_bool("MAIN_XGB_FINAL_HOLDOUT_ENABLED", True):
             logger.warning(
-                "[FINAL HOLDOUT] Not enough folds to reserve a separate holdout; "
-                "using all %d fold(s) for tuning.",
+                "[FINAL HOLDOUT] Not enough folds for %d tuning fold(s) + 1 holdout; "
+                "using all %d fold(s) for training/evaluation.",
+                min_tuning_folds,
                 len(folds),
             )
-        cfg_tmp, tuning_meta = tune_xgb_hyperparams_for_folds(
-            cfg_tmp,
-            tuning_folds,
-            n_trials=optuna_trials,
-            timeout_seconds=optuna_timeout_seconds,
-        )
-        cfg_tmp["use_static"] = bool(use_static_flag)
+        if len(tuning_folds) < min_tuning_folds:
+            logger.warning(
+                "[HYPERPARAM TUNING] Skipping tuning because tuning_folds=%d < min_tuning_folds=%d. "
+                "Using base XGBoost parameters.",
+                len(tuning_folds),
+                min_tuning_folds,
+            )
+            tuning_meta = {
+                "enabled": False,
+                "reason": "insufficient_tuning_folds",
+                "tuning_folds": len(tuning_folds),
+                "min_tuning_folds": min_tuning_folds,
+            }
+        else:
+            cfg_tmp, tuning_meta = tune_xgb_hyperparams_for_folds(
+                cfg_tmp,
+                tuning_folds,
+                n_trials=optuna_trials,
+                timeout_seconds=optuna_timeout_seconds,
+            )
+            cfg_tmp["use_static"] = bool(use_static_flag)
 
     fold_outputs = []
     for fold_idx, fold in enumerate(folds, start=1):
+        fold_cfg = cfg_tmp
+        is_final_holdout = final_holdout_fold is not None and fold is final_holdout_fold
+        if is_final_holdout:
+            threshold_values = [
+                float(out["report"]["thr_main_opt"])
+                for out in fold_outputs
+                if out["report"].get("threshold_source") != "fixed_from_tuning_folds"
+                and out["report"].get("thr_main_opt") is not None
+            ]
+            if threshold_values:
+                fixed_threshold = float(np.median(threshold_values))
+                fold_cfg = dict(cfg_tmp)
+                fold_cfg["main_fixed_threshold"] = fixed_threshold
+                fold_cfg["main_fixed_threshold_source"] = "fixed_from_tuning_folds"
+                logger.info(
+                    "[FINAL HOLDOUT] Using fixed threshold=%.6f from %d tuning fold threshold(s): %s",
+                    fixed_threshold,
+                    len(threshold_values),
+                    ",".join(f"{x:.6f}" for x in threshold_values),
+                )
+            else:
+                logger.warning(
+                    "[FINAL HOLDOUT] No tuning-fold threshold available; holdout will optimize threshold on itself."
+                )
         try:
             model, report, feat_cols, cat_cols, fmap, date_cols = train_main_xgb_option_B(
                 fold["train"],
                 fold["val"],
-                cfg_tmp,
+                fold_cfg,
             )
         except ValueError as e:
             logger.warning(
@@ -1025,7 +1082,18 @@ def run_main_variant(
                 "F1_val": 0.0, "AP_val": 0.0, "ROC_AUC_val": 0.0}
 
     latest = fold_outputs[-1]
-    fold_reports = [out["report"] for out in fold_outputs]
+    holdout_outputs = [
+        out for out in fold_outputs
+        if final_holdout_fold is not None and out["fold"] is final_holdout_fold
+    ]
+    selection_outputs = [
+        out for out in fold_outputs
+        if final_holdout_fold is None or out["fold"] is not final_holdout_fold
+    ]
+    if not selection_outputs:
+        selection_outputs = fold_outputs
+    fold_reports = [out["report"] for out in selection_outputs]
+    all_fold_reports = [out["report"] for out in fold_outputs]
     f1_mean = float(np.mean([r["f1@main_thr"] for r in fold_reports]))
     ap_mean = float(np.mean([r["AP_val"] for r in fold_reports]))
     roc_values = [r.get("ROC_AUC_val") for r in fold_reports if r.get("ROC_AUC_val") is not None]
@@ -1035,8 +1103,11 @@ def run_main_variant(
     val_prevalence_mean = float(np.mean([r["val_prevalence"] for r in fold_reports]))
 
     report = dict(latest["report"])
-    report["walk_forward_folds"] = len(fold_outputs)
+    report["walk_forward_folds"] = len(selection_outputs)
+    report["walk_forward_total_folds"] = len(fold_outputs)
+    report["walk_forward_holdout_excluded_from_selection"] = bool(holdout_outputs)
     report["walk_forward_reports"] = fold_reports
+    report["walk_forward_all_reports"] = all_fold_reports
     report["f1@main_thr_latest"] = float(latest["report"]["f1@main_thr"])
     report["AP_val_latest"] = float(latest["report"]["AP_val"])
     report["ROC_AUC_val_latest"] = latest["report"].get("ROC_AUC_val")
@@ -1053,38 +1124,44 @@ def run_main_variant(
     report["val_prevalence"] = val_prevalence_mean
     report["val_month"] = int(latest["report"]["val_month"])
     if final_holdout_fold is not None:
+        holdout_report = holdout_outputs[-1]["report"] if holdout_outputs else latest["report"]
         report["final_holdout"] = {
             "enabled": True,
             "used_for_hyperparameter_search": False,
+            "used_for_model_selection": False,
             "train_max_month": final_holdout_fold["train_max_month"],
             "validation_months": list(final_holdout_fold["validation_months"]),
-            "f1": float(latest["report"]["f1@main_thr"]),
-            "precision": float(latest["report"]["precision@main_thr"]),
-            "recall": float(latest["report"]["recall@main_thr"]),
-            "ap": float(latest["report"]["AP_val"]),
-            "roc_auc": latest["report"].get("ROC_AUC_val"),
-            "threshold": float(latest["report"]["thr_main_opt"]),
-            "val_prevalence": float(latest["report"]["val_prevalence"]),
+            "f1": float(holdout_report["f1@main_thr"]),
+            "precision": float(holdout_report["precision@main_thr"]),
+            "recall": float(holdout_report["recall@main_thr"]),
+            "ap": float(holdout_report["AP_val"]),
+            "roc_auc": holdout_report.get("ROC_AUC_val"),
+            "threshold": float(holdout_report["thr_main_opt"]),
+            "search_opt_threshold": float(holdout_report.get("thr_main_search_opt", holdout_report["thr_main_opt"])),
+            "threshold_source": holdout_report.get("threshold_source"),
+            "val_prevalence": float(holdout_report["val_prevalence"]),
         }
         logger.info(
             "[FINAL HOLDOUT] K=%d use_static=%s val=%s F1=%.4f precision=%.4f "
-            "recall=%.4f AP=%.4f ROC_AUC=%s threshold=%.6f",
+            "recall=%.4f AP=%.4f ROC_AUC=%s threshold=%.6f threshold_source=%s",
             cfg["best_k"],
             use_static_flag,
             ",".join(str(m) for m in final_holdout_fold["validation_months"]),
-            float(latest["report"]["f1@main_thr"]),
-            float(latest["report"]["precision@main_thr"]),
-            float(latest["report"]["recall@main_thr"]),
-            float(latest["report"]["AP_val"]),
-            f"{latest['report'].get('ROC_AUC_val'):.4f}" if latest["report"].get("ROC_AUC_val") is not None else "n/a",
-            float(latest["report"]["thr_main_opt"]),
+            float(holdout_report["f1@main_thr"]),
+            float(holdout_report["precision@main_thr"]),
+            float(holdout_report["recall@main_thr"]),
+            float(holdout_report["AP_val"]),
+            f"{holdout_report.get('ROC_AUC_val'):.4f}" if holdout_report.get("ROC_AUC_val") is not None else "n/a",
+            float(holdout_report["thr_main_opt"]),
+            holdout_report.get("threshold_source"),
         )
 
     logger.info(
-        "[MAIN WALK FORWARD METRICS] K=%d use_static=%s folds=%d F1_mean=%.4f "
-        "precision_mean=%.4f recall_mean=%.4f AP_mean=%.4f ROC_AUC_mean=%.4f latest_F1=%.4f",
+        "[MAIN WALK FORWARD METRICS] K=%d use_static=%s selection_folds=%d total_folds=%d "
+        "F1_mean=%.4f precision_mean=%.4f recall_mean=%.4f AP_mean=%.4f ROC_AUC_mean=%.4f latest_F1=%.4f",
         cfg["best_k"],
         use_static_flag,
+        len(selection_outputs),
         len(fold_outputs),
         f1_mean,
         precision_mean,

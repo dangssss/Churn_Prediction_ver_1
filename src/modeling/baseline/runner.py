@@ -154,7 +154,7 @@ def time_series_purged_splits(
         validation_origin_count = int(os.getenv("VALIDATION_ORIGIN_COUNT", "2"))
     validation_origin_count = max(1, min(int(validation_origin_count), len(months) - 1))
     if n_folds is None:
-        n_folds = int(os.getenv("MODEL_WALK_FORWARD_FOLDS", "3"))
+        n_folds = int(os.getenv("MODEL_WALK_FORWARD_FOLDS", "6"))
     n_folds = max(1, int(n_folds))
 
     folds = []
