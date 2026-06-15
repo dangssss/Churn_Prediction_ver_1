@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -503,25 +504,81 @@ def train_main_xgb_option_B(
     return model, report, feat_cols, cat_cols, feature_name_map, date_cols
 
 
-def _build_optuna_trial_cfg(base_cfg: dict, trial) -> dict:
+def _wide_xgb_tuning_space() -> dict[str, dict[str, Any]]:
     n_min = _env_int("MAIN_XGB_OPTUNA_N_ESTIMATORS_MIN", 800)
     n_max = _env_int("MAIN_XGB_OPTUNA_N_ESTIMATORS_MAX", 5000)
     n_step = max(_env_int("MAIN_XGB_OPTUNA_N_ESTIMATORS_STEP", 200), 1)
     if n_max < n_min:
         n_max = n_min
 
+    pred_min = _env_float("MAIN_XGB_OPTUNA_MAX_PRED_POS_RATE_MIN", 0.35)
+    pred_max = _env_float("MAIN_XGB_OPTUNA_MAX_PRED_POS_RATE_MAX", 0.90)
+    if pred_max < pred_min:
+        pred_max = pred_min
+
+    space: dict[str, dict[str, Any]] = {
+        "n_estimators": {"type": "int", "low": n_min, "high": n_max, "step": n_step},
+        "learning_rate": {"type": "float", "low": 0.01, "high": 0.20, "log": True},
+        "max_depth": {"type": "int", "low": 3, "high": 10, "step": 1},
+        "max_leaves": {"type": "categorical", "choices": [0, 31, 63, 127, 255]},
+        "min_child_weight": {"type": "float", "low": 1.0, "high": 30.0, "log": True},
+        "gamma": {"type": "float", "low": 0.0, "high": 8.0, "log": False},
+        "subsample": {"type": "float", "low": 0.55, "high": 1.0, "log": False},
+        "colsample_bytree": {"type": "float", "low": 0.55, "high": 1.0, "log": False},
+        "colsample_bylevel": {"type": "float", "low": 0.50, "high": 1.0, "log": False},
+        "reg_alpha": {"type": "float", "low": 1e-8, "high": 10.0, "log": True},
+        "reg_lambda": {"type": "float", "low": 0.05, "high": 50.0, "log": True},
+        "early_stopping_rounds": {"type": "int", "low": 50, "high": 350, "step": 50},
+        "max_predicted_positive_rate": {"type": "float", "low": pred_min, "high": pred_max, "log": False},
+    }
+    if _env_bool("MAIN_XGB_OPTUNA_TUNE_SCALE_POS_WEIGHT", True):
+        max_spw = max(
+            _env_float(
+                "MAIN_XGB_OPTUNA_SCALE_POS_WEIGHT_MAX",
+                _env_float("MAIN_XGB_MAX_SCALE_POS_WEIGHT", 20.0),
+            ),
+            0.5,
+        )
+        space["scale_pos_weight"] = {"type": "float", "low": 0.5, "high": max_spw, "log": True}
+    return space
+
+
+def _suggest_from_space(trial, name: str, spec: dict[str, Any]) -> Any:
+    kind = spec["type"]
+    if kind == "categorical":
+        return trial.suggest_categorical(name, list(spec["choices"]))
+    if kind == "int":
+        return trial.suggest_int(
+            name,
+            int(spec["low"]),
+            int(spec["high"]),
+            step=max(int(spec.get("step", 1)), 1),
+        )
+    if kind == "float":
+        return trial.suggest_float(
+            name,
+            float(spec["low"]),
+            float(spec["high"]),
+            log=bool(spec.get("log", False)),
+        )
+    raise ValueError(f"Unsupported tuning space type for {name}: {kind}")
+
+
+def _build_tuning_trial_cfg(base_cfg: dict, trial, space: dict[str, dict[str, Any]]) -> dict:
+    sampled = {name: _suggest_from_space(trial, name, spec) for name, spec in space.items()}
+
     params: dict[str, Any] = {
-        "n_estimators": trial.suggest_int("n_estimators", n_min, n_max, step=n_step),
-        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.20, log=True),
-        "max_depth": trial.suggest_int("max_depth", 3, 10),
-        "max_leaves": trial.suggest_categorical("max_leaves", [0, 31, 63, 127, 255]),
-        "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 30.0, log=True),
-        "gamma": trial.suggest_float("gamma", 0.0, 8.0),
-        "subsample": trial.suggest_float("subsample", 0.55, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.55, 1.0),
-        "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.50, 1.0),
-        "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-        "reg_lambda": trial.suggest_float("reg_lambda", 0.05, 50.0, log=True),
+        "n_estimators": int(sampled["n_estimators"]),
+        "learning_rate": float(sampled["learning_rate"]),
+        "max_depth": int(sampled["max_depth"]),
+        "max_leaves": int(sampled["max_leaves"]),
+        "min_child_weight": float(sampled["min_child_weight"]),
+        "gamma": float(sampled["gamma"]),
+        "subsample": float(sampled["subsample"]),
+        "colsample_bytree": float(sampled["colsample_bytree"]),
+        "colsample_bylevel": float(sampled["colsample_bylevel"]),
+        "reg_alpha": float(sampled["reg_alpha"]),
+        "reg_lambda": float(sampled["reg_lambda"]),
         "tree_method": os.getenv("MAIN_XGB_TREE_METHOD", "hist"),
         "random_state": int(base_cfg.get("seed", 42)),
         "eval_metric": ["aucpr", "logloss"],
@@ -530,20 +587,131 @@ def _build_optuna_trial_cfg(base_cfg: dict, trial) -> dict:
     if n_jobs > 0:
         params["n_jobs"] = int(n_jobs)
 
-    if _env_bool("MAIN_XGB_OPTUNA_TUNE_SCALE_POS_WEIGHT", True):
-        max_spw = max(_env_float("MAIN_XGB_OPTUNA_SCALE_POS_WEIGHT_MAX", _env_float("MAIN_XGB_MAX_SCALE_POS_WEIGHT", 20.0)), 0.5)
-        params["scale_pos_weight"] = trial.suggest_float("scale_pos_weight", 0.5, max_spw, log=True)
+    if "scale_pos_weight" in sampled:
+        params["scale_pos_weight"] = float(sampled["scale_pos_weight"])
 
     tuned_cfg = dict(base_cfg)
     tuned_cfg["main_xgb_params"] = params
-    tuned_cfg["main_es_rounds"] = trial.suggest_int("early_stopping_rounds", 50, 350, step=50)
-    tuned_cfg["main_max_predicted_positive_rate"] = trial.suggest_float(
-        "max_predicted_positive_rate",
-        _env_float("MAIN_XGB_OPTUNA_MAX_PRED_POS_RATE_MIN", 0.35),
-        _env_float("MAIN_XGB_OPTUNA_MAX_PRED_POS_RATE_MAX", 0.90),
-    )
+    tuned_cfg["main_es_rounds"] = int(sampled["early_stopping_rounds"])
+    tuned_cfg["main_max_predicted_positive_rate"] = float(sampled["max_predicted_positive_rate"])
     tuned_cfg["main_threshold_min"] = _env_float("MAIN_XGB_THRESHOLD_MIN", 0.005)
     return tuned_cfg
+
+
+def _complete_trials(study, optuna_module) -> list:
+    return [
+        t for t in study.trials
+        if t.state == optuna_module.trial.TrialState.COMPLETE and t.value is not None
+    ]
+
+
+def _top_trials_for_narrowing(trials: list) -> list:
+    if not trials:
+        return []
+    ranked = sorted(trials, key=lambda t: float(t.value), reverse=True)
+    frac = min(max(_env_float("MAIN_XGB_RANDOM_SEARCH_TOP_FRACTION", 0.25), 0.05), 1.0)
+    min_top = max(_env_int("MAIN_XGB_RANDOM_SEARCH_TOP_MIN", 5), 1)
+    top_n = min(len(ranked), max(min_top, int(np.ceil(len(ranked) * frac))))
+    return ranked[:top_n]
+
+
+def _align_int_to_step(value: float, origin: int, step: int, direction: str) -> int:
+    if step <= 1:
+        return int(np.floor(value) if direction == "down" else np.ceil(value))
+    offset = (float(value) - float(origin)) / float(step)
+    k = np.floor(offset) if direction == "down" else np.ceil(offset)
+    return int(origin + int(k) * step)
+
+
+def _narrow_numeric_spec(spec: dict[str, Any], values: list[float]) -> dict[str, Any]:
+    clean = [float(v) for v in values if v is not None and np.isfinite(float(v))]
+    if not clean:
+        return dict(spec)
+    out = dict(spec)
+    orig_low = float(spec["low"])
+    orig_high = float(spec["high"])
+    if orig_high <= orig_low:
+        return out
+
+    margin_frac = max(_env_float("MAIN_XGB_RANDOM_SEARCH_NARROW_MARGIN_FRAC", 0.20), 0.0)
+    min_width_frac = max(_env_float("MAIN_XGB_RANDOM_SEARCH_NARROW_MIN_WIDTH_FRAC", 0.15), 0.0)
+
+    if bool(spec.get("log", False)):
+        log_values = [np.log(v) for v in clean if v > 0]
+        if not log_values or orig_low <= 0:
+            return out
+        low_v = float(np.min(log_values))
+        high_v = float(np.max(log_values))
+        orig_low_log = float(np.log(orig_low))
+        orig_high_log = float(np.log(orig_high))
+        orig_span = orig_high_log - orig_low_log
+        span = high_v - low_v
+        margin = max(span * margin_frac, orig_span * min_width_frac)
+        narrowed_low = float(np.exp(max(orig_low_log, low_v - margin)))
+        narrowed_high = float(np.exp(min(orig_high_log, high_v + margin)))
+    else:
+        low_v = float(np.min(clean))
+        high_v = float(np.max(clean))
+        orig_span = orig_high - orig_low
+        span = high_v - low_v
+        margin = max(span * margin_frac, orig_span * min_width_frac)
+        narrowed_low = max(orig_low, low_v - margin)
+        narrowed_high = min(orig_high, high_v + margin)
+
+    if spec["type"] == "int":
+        step = max(int(spec.get("step", 1)), 1)
+        origin = int(spec["low"])
+        low_i = _align_int_to_step(narrowed_low, origin, step, "down")
+        high_i = _align_int_to_step(narrowed_high, origin, step, "up")
+        low_i = max(int(spec["low"]), low_i)
+        high_i = min(int(spec["high"]), high_i)
+        if high_i < low_i:
+            high_i = low_i
+        out["low"] = low_i
+        out["high"] = high_i
+    else:
+        if narrowed_high < narrowed_low:
+            narrowed_high = narrowed_low
+        out["low"] = float(narrowed_low)
+        out["high"] = float(narrowed_high)
+    return out
+
+
+def _narrow_search_space(
+    wide_space: dict[str, dict[str, Any]],
+    random_trials: list,
+) -> dict[str, dict[str, Any]]:
+    top_trials = _top_trials_for_narrowing(random_trials)
+    if not top_trials:
+        return {name: dict(spec) for name, spec in wide_space.items()}
+
+    narrowed: dict[str, dict[str, Any]] = {}
+    for name, spec in wide_space.items():
+        values = [t.params.get(name) for t in top_trials if name in t.params]
+        if spec["type"] == "categorical":
+            chosen = []
+            for value in values:
+                if value not in chosen:
+                    chosen.append(value)
+            narrowed[name] = {"type": "categorical", "choices": chosen or list(spec["choices"])}
+        else:
+            narrowed[name] = _narrow_numeric_spec(spec, values)
+    return narrowed
+
+
+def _space_for_log(space: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    logged: dict[str, Any] = {}
+    for name, spec in space.items():
+        if spec["type"] == "categorical":
+            logged[name] = list(spec["choices"])
+        else:
+            logged[name] = {
+                "low": spec["low"],
+                "high": spec["high"],
+                **({"step": spec["step"]} if "step" in spec else {}),
+                **({"log": spec["log"]} if "log" in spec else {}),
+            }
+    return logged
 
 
 def tune_xgb_hyperparams_for_folds(
@@ -553,42 +721,46 @@ def tune_xgb_hyperparams_for_folds(
     n_trials: int | None = None,
     timeout_seconds: int | None = None,
 ) -> tuple[dict, dict]:
-    """Tune XGBoost params with Optuna on the existing walk-forward folds."""
-    n_trials = int(n_trials if n_trials is not None else _env_int("MAIN_XGB_OPTUNA_TRIALS", 25))
+    """Tune XGBoost with random exploration, narrowed TPE Optuna, and walk-forward folds."""
+    tpe_trials = int(n_trials if n_trials is not None else _env_int("MAIN_XGB_OPTUNA_TRIALS", 50))
+    random_trials = _env_int("MAIN_XGB_RANDOM_SEARCH_TRIALS", 20)
     timeout_seconds = int(
         timeout_seconds
         if timeout_seconds is not None
         else _env_int("MAIN_XGB_OPTUNA_TIMEOUT_SECONDS", 0)
     )
-    if n_trials <= 0:
-        return dict(cfg), {"enabled": False, "reason": "n_trials<=0"}
+    random_timeout_seconds = _env_int("MAIN_XGB_RANDOM_SEARCH_TIMEOUT_SECONDS", 0)
+    if random_trials <= 0 and tpe_trials <= 0:
+        return dict(cfg), {"enabled": False, "reason": "random_and_tpe_trials<=0"}
 
     try:
         import optuna
-        from optuna.pruners import MedianPruner
-        from optuna.samplers import TPESampler
+        from optuna.pruners import MedianPruner, NopPruner
+        from optuna.samplers import RandomSampler, TPESampler
     except ImportError as exc:
         logger.warning("[OPTUNA] optuna is not installed; using default XGBoost params: %s", exc)
         return dict(cfg), {"enabled": False, "reason": "optuna_not_installed"}
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     seed = int(cfg.get("seed", 42))
-    study_name = f"churn_xgb_k{cfg.get('best_k')}_static{int(bool(cfg.get('use_static', False)))}"
-    study = optuna.create_study(
-        study_name=study_name,
-        direction="maximize",
-        sampler=TPESampler(seed=seed),
-        pruner=MedianPruner(
+    pruning_enabled = _env_bool("MAIN_XGB_OPTUNA_PRUNING_ENABLED", True)
+    prune_after_seconds = max(_env_int("MAIN_XGB_OPTUNA_PRUNE_AFTER_SECONDS", 60), 0)
+
+    def make_pruner():
+        if not pruning_enabled:
+            return NopPruner()
+        return MedianPruner(
             n_startup_trials=max(_env_int("MAIN_XGB_OPTUNA_PRUNER_STARTUP_TRIALS", 5), 0),
             n_warmup_steps=max(_env_int("MAIN_XGB_OPTUNA_PRUNER_WARMUP_STEPS", 1), 0),
-        ),
-    )
+        )
 
-    def objective(trial) -> float:
-        trial_cfg = _build_optuna_trial_cfg(cfg, trial)
+    def objective(trial, *, phase: str, space: dict[str, dict[str, Any]]) -> float:
+        trial_cfg = _build_tuning_trial_cfg(cfg, trial, space)
+        trial_cfg["hyperparameter_search_phase"] = phase
         fold_f1: list[float] = []
         fold_ap: list[float] = []
         fold_roc: list[float] = []
+        started_at = time.monotonic()
         for fold_idx, fold in enumerate(folds):
             try:
                 _model, report, *_rest = train_main_xgb_option_B(
@@ -596,8 +768,12 @@ def tune_xgb_hyperparams_for_folds(
                     fold["val"],
                     trial_cfg,
                 )
+            except optuna.TrialPruned:
+                raise
             except Exception as exc:
                 trial.set_user_attr("rejected_reason", str(exc))
+                trial.set_user_attr("phase", phase)
+                trial.set_user_attr("duration_seconds", float(time.monotonic() - started_at))
                 return 0.0
 
             fold_f1.append(float(report["f1@main_thr"]))
@@ -606,51 +782,131 @@ def tune_xgb_hyperparams_for_folds(
                 fold_roc.append(float(report["ROC_AUC_val"]))
             score = float(np.mean(fold_f1))
             trial.report(score, step=fold_idx)
-            if trial.should_prune():
+            elapsed = float(time.monotonic() - started_at)
+            if pruning_enabled and elapsed >= prune_after_seconds and trial.should_prune():
+                trial.set_user_attr("phase", phase)
+                trial.set_user_attr("duration_seconds", elapsed)
                 raise optuna.TrialPruned()
 
         trial_cfg["optuna_objective"] = "walk_forward_f1_mean"
+        trial.set_user_attr("phase", phase)
         trial.set_user_attr("candidate_cfg", trial_cfg)
         trial.set_user_attr("fold_f1", fold_f1)
         trial.set_user_attr("fold_ap", fold_ap)
         trial.set_user_attr("fold_roc", fold_roc)
         trial.set_user_attr("ap_mean", float(np.mean(fold_ap)) if fold_ap else 0.0)
         trial.set_user_attr("roc_auc_mean", float(np.mean(fold_roc)) if fold_roc else 0.0)
+        trial.set_user_attr("duration_seconds", float(time.monotonic() - started_at))
         return float(np.mean(fold_f1)) if fold_f1 else 0.0
 
+    n_jobs = max(_env_int("MAIN_XGB_OPTUNA_N_JOBS", 1), 1)
+    wide_space = _wide_xgb_tuning_space()
     logger.info(
-        "[OPTUNA] Start XGBoost tuning K=%s use_static=%s trials=%d timeout=%s objective=walk_forward_f1_mean",
+        "[HYPERPARAM TUNING] Strategy=random_search_then_narrowed_optuna_tpe "
+        "K=%s use_static=%s random_trials=%d optuna_trials=%d pruning=%s prune_after=%ss folds=%d",
         cfg.get("best_k"),
         cfg.get("use_static"),
-        n_trials,
-        timeout_seconds or "none",
-    )
-    study.optimize(
-        objective,
-        n_trials=int(n_trials),
-        timeout=int(timeout_seconds) if timeout_seconds > 0 else None,
-        n_jobs=max(_env_int("MAIN_XGB_OPTUNA_N_JOBS", 1), 1),
-        show_progress_bar=False,
-        gc_after_trial=True,
+        random_trials,
+        tpe_trials,
+        pruning_enabled,
+        prune_after_seconds,
+        len(folds),
     )
 
-    complete_trials = [
-        t for t in study.trials
-        if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
-    ]
+    random_study = None
+    random_complete: list = []
+    if random_trials > 0:
+        random_study = optuna.create_study(
+            study_name=f"churn_xgb_random_k{cfg.get('best_k')}_static{int(bool(cfg.get('use_static', False)))}",
+            direction="maximize",
+            sampler=RandomSampler(seed=seed),
+            pruner=make_pruner(),
+        )
+        logger.info(
+            "[RANDOM SEARCH] Start XGBoost exploration K=%s use_static=%s trials=%d timeout=%s objective=walk_forward_f1_mean",
+            cfg.get("best_k"),
+            cfg.get("use_static"),
+            random_trials,
+            random_timeout_seconds or "none",
+        )
+        random_study.optimize(
+            lambda trial: objective(trial, phase="random_search", space=wide_space),
+            n_trials=int(random_trials),
+            timeout=int(random_timeout_seconds) if random_timeout_seconds > 0 else None,
+            n_jobs=n_jobs,
+            show_progress_bar=False,
+            gc_after_trial=True,
+        )
+        random_complete = _complete_trials(random_study, optuna)
+        if random_complete:
+            logger.info(
+                "[RANDOM SEARCH] Completed=%d/%d best_F1=%.4f best_params=%s",
+                len(random_complete),
+                len(random_study.trials),
+                float(max(t.value for t in random_complete)),
+                dict(max(random_complete, key=lambda t: float(t.value)).params),
+            )
+        else:
+            logger.warning("[RANDOM SEARCH] No completed trials; Optuna will use the wide space.")
+
+    narrowed_space = _narrow_search_space(wide_space, random_complete)
+    logger.info("[SEARCH SPACE NARROWED] %s", _space_for_log(narrowed_space))
+
+    tpe_study = None
+    tpe_complete: list = []
+    if tpe_trials > 0:
+        tpe_study = optuna.create_study(
+            study_name=f"churn_xgb_tpe_k{cfg.get('best_k')}_static{int(bool(cfg.get('use_static', False)))}",
+            direction="maximize",
+            sampler=TPESampler(seed=seed + 1),
+            pruner=make_pruner(),
+        )
+        logger.info(
+            "[OPTUNA] Start narrowed TPE tuning K=%s use_static=%s trials=%d timeout=%s objective=walk_forward_f1_mean",
+            cfg.get("best_k"),
+            cfg.get("use_static"),
+            tpe_trials,
+            timeout_seconds or "none",
+        )
+        tpe_study.optimize(
+            lambda trial: objective(trial, phase="optuna_tpe", space=narrowed_space),
+            n_trials=int(tpe_trials),
+            timeout=int(timeout_seconds) if timeout_seconds > 0 else None,
+            n_jobs=n_jobs,
+            show_progress_bar=False,
+            gc_after_trial=True,
+        )
+        tpe_complete = _complete_trials(tpe_study, optuna)
+        if tpe_complete:
+            logger.info(
+                "[OPTUNA] Completed=%d/%d best_F1=%.4f best_params=%s",
+                len(tpe_complete),
+                len(tpe_study.trials),
+                float(max(t.value for t in tpe_complete)),
+                dict(max(tpe_complete, key=lambda t: float(t.value)).params),
+            )
+        else:
+            logger.warning("[OPTUNA] No completed narrowed TPE trials.")
+
+    complete_trials = random_complete + tpe_complete
     if not complete_trials:
         logger.warning("[OPTUNA] No completed trials for K=%s use_static=%s; using defaults.", cfg.get("best_k"), cfg.get("use_static"))
         return dict(cfg), {"enabled": True, "status": "no_completed_trials"}
 
-    best = study.best_trial
+    best = max(complete_trials, key=lambda t: float(t.value))
     tuned_cfg = dict(best.user_attrs.get("candidate_cfg") or cfg)
     tuning_meta = {
         "enabled": True,
         "status": "completed",
-        "study_name": study.study_name,
+        "strategy": "random_search_then_narrowed_optuna_tpe",
         "objective": "walk_forward_f1_mean",
-        "n_trials": len(study.trials),
+        "random_search_trials": len(random_study.trials) if random_study is not None else 0,
+        "random_search_completed_trials": len(random_complete),
+        "optuna_tpe_trials": len(tpe_study.trials) if tpe_study is not None else 0,
+        "optuna_tpe_completed_trials": len(tpe_complete),
+        "n_trials": (len(random_study.trials) if random_study is not None else 0) + (len(tpe_study.trials) if tpe_study is not None else 0),
         "completed_trials": len(complete_trials),
+        "best_phase": best.user_attrs.get("phase"),
         "best_value": float(best.value),
         "best_params": dict(best.params),
         "fold_f1": best.user_attrs.get("fold_f1", []),
@@ -658,12 +914,17 @@ def tune_xgb_hyperparams_for_folds(
         "fold_roc": best.user_attrs.get("fold_roc", []),
         "ap_mean": best.user_attrs.get("ap_mean"),
         "roc_auc_mean": best.user_attrs.get("roc_auc_mean"),
+        "pruning_enabled": pruning_enabled,
+        "prune_after_seconds": prune_after_seconds,
+        "wide_space": _space_for_log(wide_space),
+        "narrowed_space": _space_for_log(narrowed_space),
     }
     tuned_cfg["optuna_tuning"] = tuning_meta
     logger.info(
-        "[OPTUNA] Best K=%s use_static=%s F1_mean=%.4f params=%s",
+        "[HYPERPARAM TUNING] Best K=%s use_static=%s phase=%s F1_mean=%.4f params=%s",
         cfg.get("best_k"),
         cfg.get("use_static"),
+        best.user_attrs.get("phase"),
         float(best.value),
         dict(best.params),
     )
@@ -690,11 +951,29 @@ def run_main_variant(
     cfg_tmp = dict(cfg)
     cfg_tmp["use_static"] = bool(use_static_flag)
     tuning_meta = None
+    final_holdout_fold = None
+    tuning_folds = folds
 
     if tune_hyperparams:
+        if _env_bool("MAIN_XGB_FINAL_HOLDOUT_ENABLED", True) and len(folds) >= 3:
+            final_holdout_fold = folds[-1]
+            tuning_folds = folds[:-1]
+            logger.info(
+                "[FINAL HOLDOUT] Reserving latest fold for final evaluation only: "
+                "train<=%s val=%s tuning_folds=%d",
+                final_holdout_fold["train_max_month"],
+                ",".join(str(m) for m in final_holdout_fold["validation_months"]),
+                len(tuning_folds),
+            )
+        elif _env_bool("MAIN_XGB_FINAL_HOLDOUT_ENABLED", True):
+            logger.warning(
+                "[FINAL HOLDOUT] Not enough folds to reserve a separate holdout; "
+                "using all %d fold(s) for tuning.",
+                len(folds),
+            )
         cfg_tmp, tuning_meta = tune_xgb_hyperparams_for_folds(
             cfg_tmp,
-            folds,
+            tuning_folds,
             n_trials=optuna_trials,
             timeout_seconds=optuna_timeout_seconds,
         )
@@ -773,6 +1052,33 @@ def run_main_variant(
     report["recall@main_thr"] = recall_mean
     report["val_prevalence"] = val_prevalence_mean
     report["val_month"] = int(latest["report"]["val_month"])
+    if final_holdout_fold is not None:
+        report["final_holdout"] = {
+            "enabled": True,
+            "used_for_hyperparameter_search": False,
+            "train_max_month": final_holdout_fold["train_max_month"],
+            "validation_months": list(final_holdout_fold["validation_months"]),
+            "f1": float(latest["report"]["f1@main_thr"]),
+            "precision": float(latest["report"]["precision@main_thr"]),
+            "recall": float(latest["report"]["recall@main_thr"]),
+            "ap": float(latest["report"]["AP_val"]),
+            "roc_auc": latest["report"].get("ROC_AUC_val"),
+            "threshold": float(latest["report"]["thr_main_opt"]),
+            "val_prevalence": float(latest["report"]["val_prevalence"]),
+        }
+        logger.info(
+            "[FINAL HOLDOUT] K=%d use_static=%s val=%s F1=%.4f precision=%.4f "
+            "recall=%.4f AP=%.4f ROC_AUC=%s threshold=%.6f",
+            cfg["best_k"],
+            use_static_flag,
+            ",".join(str(m) for m in final_holdout_fold["validation_months"]),
+            float(latest["report"]["f1@main_thr"]),
+            float(latest["report"]["precision@main_thr"]),
+            float(latest["report"]["recall@main_thr"]),
+            float(latest["report"]["AP_val"]),
+            f"{latest['report'].get('ROC_AUC_val'):.4f}" if latest["report"].get("ROC_AUC_val") is not None else "n/a",
+            float(latest["report"]["thr_main_opt"]),
+        )
 
     logger.info(
         "[MAIN WALK FORWARD METRICS] K=%d use_static=%s folds=%d F1_mean=%.4f "

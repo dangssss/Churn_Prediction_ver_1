@@ -135,7 +135,7 @@ def preflight_purged_train_val_for_k(
             horizon=int(horizon),
         )
         if has_fallback:
-            source = "mixed_actual_rule" if has_actual else "rule_based"
+            source = "mixed_unified" if has_actual else "rule_based"
             labelable.append((table, int(end), source))
 
     if not labelable:
@@ -268,7 +268,7 @@ def build_labeled_pair(
 
     label_col = f"y_churn_t_plus_{horizon}"
     label_tables = label_tables_for_horizon(engine, end, horizon)
-    actual_matched: pd.Series | None = None
+    actual_labels: pd.DataFrame | None = None
     actual_label_sources = ""
     if label_tables:
         if "cms_code_enc" not in df_t.columns:
@@ -281,11 +281,17 @@ def build_labeled_pair(
             ignore_index=True,
         ).drop_duplicates()
 
-        cms_keys = set(labels["cms_code_enc"].dropna().astype(str))
-        crm_keys = set(labels["crm_code_enc"].dropna().astype(str))
+        actual_label = pd.Series(np.nan, index=d.index, dtype="float64")
+        cms_map = (
+            labels.dropna(subset=["cms_code_enc"])
+            .assign(cms_code_enc=lambda x: x["cms_code_enc"].astype(str).str.strip())
+            .groupby("cms_code_enc")["_actual_label"]
+            .max()
+        )
+        cms_match = d["cms_code_enc"].map(cms_map)
+        actual_label = actual_label.combine_first(cms_match.astype("float64"))
 
-        matched = d["cms_code_enc"].isin(cms_keys)
-        if crm_keys:
+        if labels["crm_code_enc"].notna().any():
             if "crm_code_enc" in d.columns:
                 crm_series = d["crm_code_enc"].astype(str).str.strip()
             else:
@@ -306,20 +312,42 @@ def build_labeled_pair(
                     logger.warning("Could not load public.cas_info for crm_code_enc label matching: %s", exc)
                     crm_series = pd.Series([""] * len(d), index=d.index)
 
-            matched = matched | crm_series.isin(crm_keys).to_numpy()
+            crm_map = (
+                labels.dropna(subset=["crm_code_enc"])
+                .assign(crm_code_enc=lambda x: x["crm_code_enc"].astype(str).str.strip())
+                .groupby("crm_code_enc")["_actual_label"]
+                .max()
+            )
+            crm_match = crm_series.map(crm_map)
+            actual_label = pd.concat(
+                [actual_label, crm_match.astype("float64")],
+                axis=1,
+            ).max(axis=1, skipna=True)
 
-        actual_matched = matched.astype(int)
+        actual_labels = d[["cms_code_enc"]].copy()
+        actual_labels["_actual_label"] = actual_label
+        actual_labels = (
+            actual_labels.dropna(subset=["_actual_label"])
+            .groupby("cms_code_enc", as_index=False)["_actual_label"]
+            .max()
+        )
         actual_label_sources = ",".join(f"{LABEL_SCHEMA}.{label_table}" for label_table in label_tables)
-        n_pos = int(actual_matched.sum())
+        n_actual = int(len(actual_labels))
+        n_pos = int(actual_labels["_actual_label"].astype(int).sum()) if n_actual else 0
+        n_neg = int(n_actual - n_pos)
         logger.info(
-            "Loaded actual positives for %s [%s] on window %s: Churn=%d (%.1f%%) | Non-matched=%d | Total=%d",
+            "Loaded actual labels for %s [%s] on window %s: labeled=%d | "
+            "positive=%d (%.1f%% of labeled, %.1f%% of total) | negative=%d | unlabeled=%d | Total=%d",
             label_col,
             actual_label_sources,
             table_t,
+            n_actual,
             n_pos,
-            100.0 * n_pos / max(len(actual_matched), 1),
-            len(actual_matched) - n_pos,
-            len(actual_matched),
+            100.0 * n_pos / max(n_actual, 1),
+            100.0 * n_pos / max(len(d), 1),
+            n_neg,
+            len(d) - n_actual,
+            len(d),
         )
 
     # Rule fallback uses raw order tables strictly after the prediction origin.
@@ -458,13 +486,16 @@ def build_labeled_pair(
     n_neg = int((y == 0).sum())
     n_uncertain = int(y.isna().sum())
     n_rule_resolved = int(uncertain_mask.sum())
+    n_strict_positive = int((risk_score >= pos_cutoff).sum()) if not scored.empty else 0
+    n_midband_rule_positive = int((uncertain_mask & rule_y.astype(bool)).sum())
     logger.info(
         "Override fallback labels y_churn_t_plus_%d from %s using adaptive risk-score rules: "
-        "Churn=%d (%.1f%% of labeled) | Active=%d | Rule-resolved(mid-band)=%d | Unlabeled(drop)=%d | eligible=%d | total=%d | "
-        "target_rate=%.4f (%s) | positive_cutoff=%.6f | negative_cutoff=%.6f | uncertain_band=%.2f",
+        "Churn=%d (%.1f%% of labeled) | Active=%d | Strict-top-risk-positive=%d | "
+        "Rule-positive(mid-band)=%d | Rule-resolved(mid-band)=%d | Unlabeled(drop)=%d | eligible=%d | total=%d | "
+        "strict_top_risk_target=%.4f (%s) | positive_cutoff=%.6f | negative_cutoff=%.6f | uncertain_band=%.2f",
         horizon, table_tp,
         n_pos, 100.0 * n_pos / max(n_pos + n_neg, 1),
-        n_neg, n_rule_resolved, n_uncertain, int(eligible.sum()), len(y),
+        n_neg, n_strict_positive, n_midband_rule_positive, n_rule_resolved, n_uncertain, int(eligible.sum()), len(y),
         target_rate, target_source, pos_cutoff, neg_cutoff, uncertain_band,
     )
 
@@ -472,6 +503,28 @@ def build_labeled_pair(
     lab[label_col] = y.values
 
     out = df_t.merge(lab, on="cms_code_enc", how="left")
+
+    if actual_labels is not None:
+        out = out.merge(actual_labels, on="cms_code_enc", how="left")
+        actual_known_mask = out["_actual_label"].notna()
+        actual_positive_mask = out["_actual_label"].fillna(0).astype(int).eq(1)
+        actual_negative_mask = actual_known_mask & ~actual_positive_mask
+        rule_positive_before = int((out[label_col] == 1).sum())
+        out.loc[actual_known_mask, label_col] = out.loc[actual_known_mask, "_actual_label"].astype(int)
+        rule_positive_after_actual_override = int((out[label_col] == 1).sum())
+        rule_positive_unlabeled = int(((out[label_col] == 1) & ~actual_known_mask).sum())
+        logger.info(
+            "Mixed labels for %s on %s: actual_known=%d actual_positive=%d actual_negative=%d "
+            "rule_positive_before=%d rule_positive_unlabeled=%d final_churn=%d",
+            label_col,
+            table_t,
+            int(actual_known_mask.sum()),
+            int(actual_positive_mask.sum()),
+            int(actual_negative_mask.sum()),
+            rule_positive_before,
+            rule_positive_unlabeled,
+            rule_positive_after_actual_override,
+        )
 
     # Customers that cannot be matched to post-origin activity are unlabeled.
     # Drop them to avoid noisy fallback labels and inflated churn ratios.
@@ -496,30 +549,13 @@ def build_labeled_pair(
         else table_tp
     )
 
-    actual_positive_mask = pd.Series(False, index=out.index)
-    if actual_matched is not None:
-        actual_lab = df_t[["cms_code_enc"]].copy()
-        actual_lab["cms_code_enc"] = actual_lab["cms_code_enc"].astype(str).str.strip()
-        actual_lab["_actual_label"] = actual_matched.to_numpy()
-        actual_lab = (
-            actual_lab.groupby("cms_code_enc", as_index=False)["_actual_label"]
-            .max()
-        )
-        out = out.merge(actual_lab, on="cms_code_enc", how="left")
-        actual_positive_mask = out["_actual_label"].fillna(0).astype(int).eq(1)
-        rule_positive_before = int((out[label_col] == 1).sum())
-        out.loc[actual_positive_mask, label_col] = 1
-        logger.info(
-            "Mixed labels for %s on %s: rule_churn_before=%d actual_positive_override=%d final_churn=%d",
-            label_col,
-            table_t,
-            rule_positive_before,
-            int(actual_positive_mask.sum()),
-            int((out[label_col] == 1).sum()),
-        )
+    if actual_labels is not None:
+        actual_known_mask = out["_actual_label"].notna()
+        out["label_source"] = "mixed_unified"
         out = out.drop(columns=["_actual_label"])
+    else:
+        out["label_source"] = "rule_based"
 
-    out["label_source"] = "mixed_actual_rule" if actual_label_sources else "rule_based"
     return out
 
 def build_dataset_for_k(engine: Engine, k: int, horizon: int = 1, limit_rows_each: Optional[int] = None) -> pd.DataFrame:

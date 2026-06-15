@@ -239,6 +239,9 @@ def cmd_train_main(args) -> None:
 
     cfg = dict(cfg)
     cfg["use_static"] = bool(best["use_static"])
+    cfg["best_k"] = int(best["report"]["K"])
+    cfg["best_threshold"] = float(best["report"]["thr_main_opt"])
+    cfg["main_threshold_min"] = float(best["report"].get("thr_main_min", cfg.get("main_threshold_min", 0.005)))
 
     bundle_dir = Path(args.bundle_dir)
     bundle_dir.mkdir(parents=True, exist_ok=True)
@@ -293,7 +296,7 @@ def add_tuning_args(parser: argparse.ArgumentParser) -> None:
         dest="tune_hyperparams",
         action="store_true",
         default=None,
-        help="Enable Optuna tuning for the top XGBoost retrain candidate(s).",
+        help="Enable two-stage tuning for the top XGBoost candidate(s): random search, narrowed Optuna/TPE, final holdout.",
     )
     parser.add_argument(
         "--no-tune-hyperparams",
@@ -305,7 +308,7 @@ def add_tuning_args(parser: argparse.ArgumentParser) -> None:
         "--optuna-trials",
         type=int,
         default=None,
-        help="Override MAIN_XGB_OPTUNA_TRIALS for this run.",
+        help="Override MAIN_XGB_OPTUNA_TRIALS for the narrowed Optuna/TPE phase.",
     )
     parser.add_argument(
         "--optuna-timeout-seconds",

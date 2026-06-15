@@ -260,7 +260,7 @@ def eval_one_k_train_val(
             else "mixed"
         )
         logger.info(
-            "[VALIDATION PROVENANCE] fold=%d/%d val_month=%s source=%s lifecycle=%s policy=mixed_actual_rule",
+            "[VALIDATION PROVENANCE] fold=%d/%d val_month=%s source=%s lifecycle=%s policy=final_unified_label",
             fold_idx,
             len(folds),
             val_month,
@@ -379,7 +379,6 @@ def eval_one_k_train_val(
             float(roc_auc),
             100.0 * prevalence,
         )
-
         fold_reports.append({
             "val_month": val_month,
             "validation_label_source": validation_label_source,

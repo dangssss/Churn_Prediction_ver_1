@@ -64,24 +64,63 @@ def list_label_tables(engine: Engine) -> list[str]:
     return [t for t in tables if LABEL_TBL_REGEX.match(t)]
 
 
+def _infer_actual_label(df: pd.DataFrame) -> pd.Series:
+    """Infer optional CSKH label values; default to positive-list semantics."""
+    label_cols = [
+        "actual_label",
+        "label",
+        "label_value",
+        "y",
+        "y_churn",
+        "churn",
+        "is_churn",
+        "is_churned",
+        "churn_label",
+        "target",
+        "status",
+    ]
+    found = next((c for c in label_cols if c in df.columns), None)
+    if found is None:
+        return pd.Series(1, index=df.index, dtype="int64")
+
+    raw = df[found]
+    numeric = pd.to_numeric(raw, errors="coerce")
+    out = pd.Series(pd.NA, index=df.index, dtype="Int64")
+    out.loc[numeric.notna()] = (numeric.loc[numeric.notna()].astype(float) >= 0.5).astype(int)
+
+    text_values = raw.astype(str).str.strip().str.lower()
+    positive = {
+        "1", "true", "t", "yes", "y", "positive", "pos",
+        "churn", "churned", "risk", "high_risk", "high-risk",
+    }
+    negative = {
+        "0", "false", "f", "no", "n", "negative", "neg",
+        "active", "non_churn", "non-churn", "not_churn", "not-churn", "normal",
+    }
+    out.loc[out.isna() & text_values.isin(positive)] = 1
+    out.loc[out.isna() & text_values.isin(negative)] = 0
+
+    # If a label column exists but some rows are malformed, keep positive-list
+    # semantics for those rows so historical label_YYMM tables keep working.
+    return out.fillna(1).astype("int64")
+
+
 def load_label_keys(engine: Engine, table_name: str) -> pd.DataFrame:
     if not LABEL_TBL_REGEX.match(table_name):
         raise ValueError(f"Invalid label table name: {table_name}")
 
-    q = text(f'''
-        SELECT crm_code_enc, cms_code_enc
-        FROM "{LABEL_SCHEMA}"."{table_name}"
-    ''')
+    q = text(f'SELECT * FROM "{LABEL_SCHEMA}"."{table_name}"')
     df = pd.read_sql(q, engine)
     for col in ("crm_code_enc", "cms_code_enc"):
         if col not in df.columns:
             raise KeyError(f'{LABEL_SCHEMA}."{table_name}" missing {col}')
         df[col] = df[col].astype(str).str.strip()
         df.loc[df[col].isin(["", "None", "nan", "NaN"]), col] = pd.NA
+    df["_actual_label"] = _infer_actual_label(df)
     df = df.dropna(how="all", subset=["crm_code_enc", "cms_code_enc"]).drop_duplicates()
     if df.empty:
         raise ValueError(f'{LABEL_SCHEMA}."{table_name}" contains no usable label keys')
-    return df
+    return df[["crm_code_enc", "cms_code_enc", "_actual_label"]]
 
 
 def estimate_observed_label_rate(

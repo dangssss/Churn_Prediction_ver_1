@@ -52,7 +52,7 @@ def retrain_due_reason(
     """Return whether a retrain run is due.
 
     Freshness status is audit context only. The training policy now accepts mixed
-    actual/rule-based labels, so DEGRADED freshness must not block retraining.
+    final unified labels, so DEGRADED freshness must not block retraining.
     """
     from sqlalchemy import text
 
@@ -268,6 +268,8 @@ def _train_main_inline(
     cfg["metric_pr_auc_val"] = float(best["report"]["AP_val"])
     cfg["metric_roc_auc_val"] = best["report"].get("ROC_AUC_val")
     cfg["metric_val_prevalence"] = float(best["report"]["val_prevalence"])
+    cfg["best_threshold"] = float(best["report"]["thr_main_opt"])
+    cfg["main_threshold_min"] = float(best["report"].get("thr_main_min", cfg.get("main_threshold_min", 0.005)))
     cfg["notes"] = (
         f"{cfg.get('notes') or ''}; "
         f"XGBoost selected final K={cfg['best_k']} use_static={cfg['use_static']} "
