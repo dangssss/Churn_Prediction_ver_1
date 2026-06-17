@@ -475,15 +475,25 @@ def build_labeled_pair(
     item_drop_ratio_min = _positive_quantile(item_drop_ratio[has_meaningful_item_base], 0.75)
     revenue_drop_ratio_min = _positive_quantile(rev_drop_ratio[has_meaningful_revenue_base], 0.75)
     aov_drop_ratio_min = _positive_quantile(aov_drop_ratio[has_meaningful_value_base], 0.75)
+    item_drop_confirm_min = _positive_quantile(item_drop_ratio[has_meaningful_item_base], 0.50)
+    revenue_drop_confirm_min = _positive_quantile(rev_drop_ratio[has_meaningful_revenue_base], 0.50)
     if item_drop_ratio_min <= 0:
         item_drop_ratio_min = _positive_quantile(item_drop_ratio, 0.75) or 1.0
     if revenue_drop_ratio_min <= 0:
         revenue_drop_ratio_min = _positive_quantile(rev_drop_ratio, 0.75) or 1.0
     if aov_drop_ratio_min <= 0:
         aov_drop_ratio_min = _positive_quantile(aov_drop_ratio, 0.75) or 1.0
+    if item_drop_confirm_min <= 0:
+        item_drop_confirm_min = _positive_quantile(item_drop_ratio, 0.50) or item_drop_ratio_min
+    if revenue_drop_confirm_min <= 0:
+        revenue_drop_confirm_min = _positive_quantile(rev_drop_ratio, 0.50) or revenue_drop_ratio_min
 
     low_current_item = _quantile_or_default(item_tp[has_meaningful_item_base], 0.25)
     low_current_revenue = _quantile_or_default(rev_tp[has_meaningful_revenue_base], 0.25)
+    low_current_aov = _quantile_or_default(
+        current_aov[has_meaningful_value_base & current_aov.gt(0)],
+        0.25,
+    )
     negative_slope_cutoff = _quantile_or_default(
         rev_slope_tp[has_meaningful_revenue_base & rev_slope_tp.lt(0)],
         0.25,
@@ -496,9 +506,9 @@ def build_labeled_pair(
     origin_active_months = pd.to_numeric(
         df_tp.get("origin_active_months", 0), errors="coerce"
     ).fillna(0).astype(int)
-    expected_future_active_months = np.minimum(
-        origin_active_months.clip(lower=1),
-        max(int(horizon), 1),
+    expected_future_active_months = origin_active_months.clip(
+        lower=1,
+        upper=max(int(horizon), 1),
     )
     persistent_activity_drop = future_active_months.lt(expected_future_active_months)
 
@@ -530,12 +540,44 @@ def build_labeled_pair(
     c4 = (
         has_meaningful_value_base
         & aov_drop_ratio.ge(aov_drop_ratio_min)
-        & c2
+        & (current_aov.le(low_current_aov) | persistent_activity_drop)
     )
 
-    # Business churn should be confirmed by both volume and revenue contraction.
-    # AOV collapse can confirm revenue churn when future activity also deteriorates.
-    business_drop = (c1 & c2) | (c2 & c4 & persistent_activity_drop)
+    # Joint volume/revenue contraction is the strongest business signal.
+    # Severe single-signal drops become churn only when confirmed by continuity,
+    # trend, value, or a moderate companion drop.
+    item_drop_confirmed = (
+        c1
+        & persistent_activity_drop
+        & (
+            rev_drop_ratio.ge(revenue_drop_confirm_min)
+            | c3
+            | c4
+        )
+    )
+    revenue_drop_confirmed = (
+        c2
+        & persistent_activity_drop
+        & (
+            item_drop_ratio.ge(item_drop_confirm_min)
+            | c3
+            | c4
+        )
+    )
+    value_drop_confirmed = (
+        c4
+        & persistent_activity_drop
+        & (
+            item_drop_ratio.ge(item_drop_confirm_min)
+            | rev_drop_ratio.ge(revenue_drop_confirm_min)
+        )
+    )
+    business_drop = (
+        (c1 & c2)
+        | item_drop_confirmed
+        | revenue_drop_confirmed
+        | value_drop_confirmed
+    )
     rule_y = (c0 | business_drop).astype(int)
     label_rule_reason = pd.Series("stable_or_active", index=df_tp.index, dtype="object")
     label_rule_reason.loc[c1 & ~c2 & ~c0] = "item_drop_audit_only"
@@ -543,7 +585,9 @@ def build_labeled_pair(
     label_rule_reason.loc[c3 & ~business_drop & ~c0] = "revenue_slope_audit_only"
     label_rule_reason.loc[c4 & ~business_drop & ~c0] = "aov_drop_audit_only"
     label_rule_reason.loc[business_drop & c1 & c2] = "order_and_revenue_drop"
-    label_rule_reason.loc[business_drop & ~(c1 & c2)] = "revenue_value_activity_drop"
+    label_rule_reason.loc[item_drop_confirmed & ~(c1 & c2)] = "confirmed_item_drop"
+    label_rule_reason.loc[revenue_drop_confirmed & ~(c1 & c2)] = "confirmed_revenue_drop"
+    label_rule_reason.loc[value_drop_confirmed & ~(c1 & c2)] = "confirmed_value_drop"
     label_rule_reason.loc[c0] = "no_future_activity"
 
     y = rule_y.astype(float)
@@ -553,6 +597,9 @@ def build_labeled_pair(
     n_c3 = int(c3.sum())
     n_c4 = int(c4.sum())
     n_c1_c2 = int((c1 & c2).sum())
+    n_item_confirmed = int(item_drop_confirmed.sum())
+    n_revenue_confirmed = int(revenue_drop_confirmed.sum())
+    n_value_confirmed = int(value_drop_confirmed.sum())
     n_c1_only = int((c1 & ~c2 & ~c3 & ~c4 & ~c0).sum())
     n_c2_only = int((c2 & ~c1 & ~c3 & ~c4 & ~c0).sum())
     n_c3_only = int((c3 & ~c1 & ~c2 & ~c0).sum())
@@ -565,11 +612,13 @@ def build_labeled_pair(
         "positive=%d (%.1f%% of labeled) | negative=%d | unlabeled=%d | total=%d | "
         "C0(no activity)=%d | C1(item drop)=%d | C2(revenue drop)=%d | "
         "C3(slope audit)=%d | C4(aov audit)=%d | C1&C2=%d | "
+        "confirmed_item=%d | confirmed_revenue=%d | confirmed_value=%d | "
         "C1_only=%d | C2_only=%d | C3_only=%d | C4_only=%d | "
         "adaptive_min_base_item=%.2f adaptive_min_base_revenue=%.2f "
         "adaptive_item_drop_q75=%.2f adaptive_revenue_drop_q75=%.2f "
-        "adaptive_aov_drop_q75=%.2f low_current_item_q25=%.2f "
-        "low_current_revenue_q25=%.2f negative_slope_q25=%.2f",
+        "adaptive_aov_drop_q75=%.2f item_confirm_q50=%.2f revenue_confirm_q50=%.2f "
+        "low_current_item_q25=%.2f low_current_revenue_q25=%.2f "
+        "low_current_aov_q25=%.2f negative_slope_q25=%.2f",
         horizon,
         table_tp,
         n_pos, 100.0 * n_pos / max(n_pos + n_neg, 1),
@@ -582,6 +631,9 @@ def build_labeled_pair(
         n_c3,
         n_c4,
         n_c1_c2,
+        n_item_confirmed,
+        n_revenue_confirmed,
+        n_value_confirmed,
         n_c1_only,
         n_c2_only,
         n_c3_only,
@@ -591,8 +643,11 @@ def build_labeled_pair(
         item_drop_ratio_min,
         revenue_drop_ratio_min,
         aov_drop_ratio_min,
+        item_drop_confirm_min,
+        revenue_drop_confirm_min,
         low_current_item,
         low_current_revenue,
+        low_current_aov,
         negative_slope_cutoff,
     )
     reason_audit = (

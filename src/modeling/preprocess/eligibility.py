@@ -174,6 +174,7 @@ def add_churn_eligibility_columns(
     )
     eligible = regular_ok | high_value_ok
 
+    default_reasons = np.where(eligible, "eligible", "mixed_eligibility_constraints")
     reasons = np.select(
         [
             high_value_ok & ~regular_ok,
@@ -189,7 +190,7 @@ def add_churn_eligibility_columns(
             "insufficient_revenue_sum",
             "insufficient_avg_revenue_per_item",
         ],
-        default="eligible",
+        default=default_reasons,
     )
 
     out["churn_active_months_in_window"] = active_months.astype(int)
