@@ -391,92 +391,28 @@ def build_labeled_pair(
 
     rule_y = (c0 | c1 | c2 | c3).astype(int)
 
-    n_c0    = int(c0.sum())
-    n_c1    = int(c1.sum())
-    n_c2    = int(c2.sum())
-    n_c3    = int(c3.sum())
-    n_total = len(rule_y)
-    n_pos   = int(rule_y.sum())
-    logger.debug(
-        "Generated raw rule signals y_churn_t_plus_%d from %s: "
-        "Churn=%d (%.1f%%) | C0(no activity)=%d | C1(item drop)=%d | C2(revenue drop)=%d | C3(slope)=%d | Active=%d | Total=%d",
-        horizon, table_tp,
-        n_pos, 100.0 * n_pos / max(n_total, 1),
-        n_c0, n_c1, n_c2, n_c3,
-        n_total - n_pos, n_total,
-    )
-    # -----------------------------------------------------------
-
-
-
-    baseline_item = pd.concat([freq_tp, item_1m], axis=1).max(axis=1)
-    baseline_rev = pd.concat([monetary_tp, rev_1m], axis=1).max(axis=1)
-
-    item_drop = (1.0 - item_tp / baseline_item.replace(0, np.nan)).clip(lower=0, upper=1).fillna(0)
-    rev_drop = (1.0 - rev_tp / baseline_rev.replace(0, np.nan)).clip(lower=0, upper=1).fillna(0)
-    zero_activity = ((item_tp == 0) & (rev_tp == 0)).astype(float)
-
-    neg_slope = (-rev_slope_tp).clip(lower=0)
-    slope_score = pd.Series(0.0, index=df_tp.index)
-    if float(neg_slope.max()) > 0:
-        slope_score = (neg_slope.rank(pct=True) * (neg_slope > 0)).astype(float)
-
-    baseline_strength = (
-        baseline_item.rank(pct=True).fillna(0) * 0.5
-        + baseline_rev.rank(pct=True).fillna(0) * 0.5
-    )
-    eligible = (baseline_item > 0) | (baseline_rev > 0)
-
-    risk_score = (
-        0.35 * item_drop
-        + 0.35 * rev_drop
-        + 0.20 * zero_activity
-        + 0.10 * slope_score
-    ) * baseline_strength
-    risk_score = risk_score.where(eligible, np.nan)
-
-    target_rate_env = os.getenv("RULE_LABEL_TARGET_CHURN_RATE")
-    if target_rate_env:
-        target_rate = float(target_rate_env)
-        target_source = "env_RULE_LABEL_TARGET_CHURN_RATE"
-    else:
-        target_rate = float(os.getenv("RULE_LABEL_FALLBACK_TARGET_CHURN_RATE", "0.15"))
-        target_source = "fallback_RULE_LABEL_FALLBACK_TARGET_CHURN_RATE"
-
-    uncertain_band = float(os.getenv("RULE_LABEL_UNCERTAIN_BAND_RATE", "0.20"))
-    target_rate = max(0.001, min(float(target_rate), 0.50))
-    uncertain_band = max(0.0, min(float(uncertain_band), 0.80))
-
-    scored = risk_score.dropna()
-    uncertain_mask = pd.Series(False, index=df_tp.index)
-    if scored.empty:
-        y = pd.Series(np.nan, index=df_tp.index, dtype="float64")
-        pos_cutoff = np.nan
-        neg_cutoff = np.nan
-    else:
-        pos_cutoff = float(scored.quantile(1.0 - target_rate))
-        neg_quantile = max(0.0, 1.0 - target_rate - uncertain_band)
-        neg_cutoff = float(scored.quantile(neg_quantile))
-
-        y = pd.Series(np.nan, index=df_tp.index, dtype="float64")
-        y.loc[risk_score <= neg_cutoff] = 0.0
-        y.loc[risk_score >= pos_cutoff] = 1.0
-        # Resolve remaining uncertain rows with explicit business rules instead of dropping them.
-        uncertain_mask = y.isna() & risk_score.notna()
-        y.loc[uncertain_mask] = rule_y.loc[uncertain_mask].astype(float)
-
+    y = rule_y.astype(float)
+    n_c0 = int(c0.sum())
+    n_c1 = int(c1.sum())
+    n_c2 = int(c2.sum())
+    n_c3 = int(c3.sum())
     n_pos = int((y == 1).sum())
     n_neg = int((y == 0).sum())
     n_uncertain = int(y.isna().sum())
     logger.info(
-        "Generated final candidate labels y_churn_t_plus_%d from %s: "
-        "positive=%d (%.1f%% of labeled) | negative=%d | unlabeled=%d | eligible=%d | total=%d | "
-        "target_rate=%.4f (%s) | positive_cutoff=%.6f | negative_cutoff=%.6f | uncertain_band=%.2f",
-        horizon, table_tp,
+        "Generated rule-base labels y_churn_t_plus_%d from %s: "
+        "positive=%d (%.1f%% of labeled) | negative=%d | unlabeled=%d | total=%d | "
+        "C0(no activity)=%d | C1(item drop)=%d | C2(revenue drop)=%d | C3(slope)=%d",
+        horizon,
+        table_tp,
         n_pos, 100.0 * n_pos / max(n_pos + n_neg, 1),
-        n_neg, n_uncertain, int(eligible.sum()), len(y),
-        target_rate, target_source,
-        pos_cutoff, neg_cutoff, uncertain_band,
+        n_neg,
+        n_uncertain,
+        len(y),
+        n_c0,
+        n_c1,
+        n_c2,
+        n_c3,
     )
 
     lab = df_tp[["cms_code_enc"]].copy()
