@@ -51,6 +51,10 @@ class ChurnEligibilityConfig:
     min_item_sum: float = 3.0
     min_revenue_sum: float = 0.0
     min_avg_revenue_per_item: float = 0.0
+    high_value_min_active_months: int = 2
+    high_value_min_item_sum: float = 20.0
+    high_value_min_revenue_sum: float = 0.0
+    high_value_min_avg_revenue_per_item: float = 0.0
 
     @classmethod
     def from_env(cls) -> "ChurnEligibilityConfig":
@@ -61,6 +65,13 @@ class ChurnEligibilityConfig:
             min_item_sum=max(_env_float("CHURN_ELIGIBILITY_MIN_ITEM_SUM", 3.0), 0.0),
             min_revenue_sum=max(_env_float("CHURN_ELIGIBILITY_MIN_REVENUE_SUM", 0.0), 0.0),
             min_avg_revenue_per_item=max(_env_float("CHURN_ELIGIBILITY_MIN_AVG_REVENUE_PER_ITEM", 0.0), 0.0),
+            high_value_min_active_months=max(_env_int("CHURN_ELIGIBILITY_HIGH_VALUE_MIN_ACTIVE_MONTHS", 2), 1),
+            high_value_min_item_sum=max(_env_float("CHURN_ELIGIBILITY_HIGH_VALUE_MIN_ITEM_SUM", 20.0), 0.0),
+            high_value_min_revenue_sum=max(_env_float("CHURN_ELIGIBILITY_HIGH_VALUE_MIN_REVENUE_SUM", 0.0), 0.0),
+            high_value_min_avg_revenue_per_item=max(
+                _env_float("CHURN_ELIGIBILITY_HIGH_VALUE_MIN_AVG_REVENUE_PER_ITEM", 0.0),
+                0.0,
+            ),
         )
 
 
@@ -145,20 +156,34 @@ def add_churn_eligibility_columns(
         required_active_months = required_active_months.mask(full_window_mask, window_size)
     required_active_months = required_active_months.clip(lower=1)
 
-    active_ok = active_months.ge(required_active_months)
-    item_ok = item_sum.ge(float(cfg.min_item_sum))
-    revenue_ok = revenue_sum.ge(float(cfg.min_revenue_sum))
-    avg_order_ok = avg_revenue_per_item.ge(float(cfg.min_avg_revenue_per_item))
-    eligible = active_ok & item_ok & revenue_ok & avg_order_ok
+    regular_active_ok = active_months.ge(required_active_months)
+    regular_item_ok = item_sum.ge(float(cfg.min_item_sum))
+    regular_revenue_ok = revenue_sum.ge(float(cfg.min_revenue_sum))
+    regular_avg_order_ok = avg_revenue_per_item.ge(float(cfg.min_avg_revenue_per_item))
+    regular_ok = regular_active_ok & regular_item_ok & regular_revenue_ok & regular_avg_order_ok
+
+    high_value_active_ok = active_months.ge(int(cfg.high_value_min_active_months))
+    high_value_item_ok = item_sum.ge(float(cfg.high_value_min_item_sum))
+    high_value_revenue_ok = revenue_sum.ge(float(cfg.high_value_min_revenue_sum))
+    high_value_avg_order_ok = avg_revenue_per_item.ge(float(cfg.high_value_min_avg_revenue_per_item))
+    high_value_ok = (
+        high_value_active_ok
+        & high_value_item_ok
+        & high_value_revenue_ok
+        & high_value_avg_order_ok
+    )
+    eligible = regular_ok | high_value_ok
 
     reasons = np.select(
         [
-            ~active_ok,
-            active_ok & ~item_ok,
-            active_ok & item_ok & ~revenue_ok,
-            active_ok & item_ok & revenue_ok & ~avg_order_ok,
+            high_value_ok & ~regular_ok,
+            ~regular_active_ok & ~high_value_active_ok,
+            ~regular_item_ok & ~high_value_item_ok,
+            ~regular_revenue_ok & ~high_value_revenue_ok,
+            ~regular_avg_order_ok & ~high_value_avg_order_ok,
         ],
         [
+            "eligible_high_value_exception",
             "insufficient_active_months",
             "insufficient_item_sum",
             "insufficient_revenue_sum",
@@ -202,7 +227,9 @@ def filter_churn_eligible(
         logger.info(
             "[CHURN ELIGIBILITY][%s] kept=%d/%d dropped=%d min_active_months=%d "
             "full_window_for_k<=%d min_item_sum=%.2f min_revenue_sum=%.2f "
-            "min_avg_revenue_per_item=%.2f reasons=%s",
+            "min_avg_revenue_per_item=%.2f high_value_min_active_months=%d "
+            "high_value_min_item_sum=%.2f high_value_min_revenue_sum=%.2f "
+            "high_value_min_avg_revenue_per_item=%.2f high_value_kept=%d reasons=%s",
             context,
             after,
             before,
@@ -212,6 +239,11 @@ def filter_churn_eligible(
             float(cfg.min_item_sum),
             float(cfg.min_revenue_sum),
             float(cfg.min_avg_revenue_per_item),
+            int(cfg.high_value_min_active_months),
+            float(cfg.high_value_min_item_sum),
+            float(cfg.high_value_min_revenue_sum),
+            float(cfg.high_value_min_avg_revenue_per_item),
+            int((out["churn_ineligible_reason"] == "eligible_high_value_exception").sum()),
             reason_counts,
         )
     return out.loc[eligible_mask].copy()

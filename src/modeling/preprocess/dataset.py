@@ -23,6 +23,17 @@ from logging_config import get_logger
 logger = get_logger(__name__)
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid float env %s=%r. Using default %.4f.", name, raw, default)
+        return float(default)
+
+
 def _load_post_origin_activity(
     engine: Engine,
     df_origin: pd.DataFrame,
@@ -365,9 +376,6 @@ def build_labeled_pair(
     item_tp = pd.to_numeric(df_tp[item_tp_col], errors="coerce").fillna(0)
     rev_tp  = pd.to_numeric(df_tp[rev_tp_col],  errors="coerce").fillna(0)
 
-    # C0: no future activity.
-    c0 = (item_tp == 0) & (rev_tp == 0)
-
     # Precomputed feature-engineering columns.
     freq_tp = pd.to_numeric(df_tp.get("frequency", 0), errors="coerce").fillna(0)
     monetary_tp = pd.to_numeric(df_tp.get("monetary", 0), errors="coerce").fillna(0)
@@ -376,33 +384,73 @@ def build_labeled_pair(
     rev_1m = pd.to_numeric(df_tp.get("revenue_1m_ago", 0), errors="coerce").fillna(0)
     item_1m = pd.to_numeric(df_tp.get("item_1m_ago", 0), errors="coerce").fillna(0)
 
-    # C1: item frequency drops by more than 50% versus baseline or previous month.
-    c1_drop_avg = (freq_tp > 0) & (item_tp < 0.50 * freq_tp)
-    c1_drop_1m  = (item_1m > 0) & (item_tp < 0.50 * item_1m)
-    c1 = c1_drop_avg | c1_drop_1m
+    baseline_item = pd.concat([freq_tp, item_1m], axis=1).max(axis=1)
+    baseline_rev = pd.concat([monetary_tp, rev_1m], axis=1).max(axis=1)
+    item_drop_ratio = (
+        1.0 - item_tp / baseline_item.replace(0, np.nan)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0, upper=1)
+    rev_drop_ratio = (
+        1.0 - rev_tp / baseline_rev.replace(0, np.nan)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0, upper=1)
 
-    # C2: revenue drops by more than 50% versus baseline or previous month.
-    c2_drop_avg = (monetary_tp > 0) & (rev_tp < 0.50 * monetary_tp)
-    c2_drop_1m  = (rev_1m > 0) & (rev_tp < 0.50 * rev_1m)
-    c2 = c2_drop_avg | c2_drop_1m
+    min_base_item = _env_float("RULE_LABEL_MIN_BASE_ITEM", 5.0)
+    min_base_revenue = _env_float("RULE_LABEL_MIN_BASE_REVENUE", 500_000.0)
+    item_drop_ratio_min = _env_float("RULE_LABEL_ITEM_DROP_RATIO", 0.70)
+    revenue_drop_ratio_min = _env_float("RULE_LABEL_REVENUE_DROP_RATIO", 0.70)
+    max_current_item = _env_float("RULE_LABEL_MAX_CURRENT_ITEM", 2.0)
+    max_current_revenue_ratio = _env_float("RULE_LABEL_MAX_CURRENT_REVENUE_RATIO", 0.30)
+    slope_drop_ratio_min = _env_float("RULE_LABEL_SLOPE_DROP_RATIO", 0.60)
+    slope_min_abs = _env_float("RULE_LABEL_REVENUE_SLOPE_MIN_ABS", 100_000.0)
 
-    # C3: negative revenue trend plus low current revenue.
-    c3 = (rev_slope_tp < -1000) & (rev_tp < 0.80 * monetary_tp)
+    has_meaningful_item_base = baseline_item.ge(min_base_item)
+    has_meaningful_revenue_base = baseline_rev.ge(min_base_revenue)
 
-    rule_y = (c0 | c1 | c2 | c3).astype(int)
+    # C0: no future activity from a customer that had a meaningful prior base.
+    c0 = (item_tp == 0) & (rev_tp == 0) & (has_meaningful_item_base | has_meaningful_revenue_base)
+
+    # C1: severe order contraction, not just a small relative movement.
+    c1 = (
+        has_meaningful_item_base
+        & item_drop_ratio.ge(item_drop_ratio_min)
+        & item_tp.le(max_current_item)
+    )
+
+    # C2: severe revenue contraction from a meaningful revenue base.
+    c2 = (
+        has_meaningful_revenue_base
+        & rev_drop_ratio.ge(revenue_drop_ratio_min)
+        & rev_tp.le(max_current_revenue_ratio * baseline_rev)
+    )
+
+    # C3: trend deterioration is only a churn signal when both trend and actual drop agree.
+    c3 = (
+        has_meaningful_revenue_base
+        & rev_slope_tp.le(-slope_min_abs)
+        & rev_drop_ratio.ge(slope_drop_ratio_min)
+        & item_drop_ratio.ge(0.50)
+    )
+
+    business_drop = (c1 & c2) | c3
+    rule_y = (c0 | business_drop).astype(int)
 
     y = rule_y.astype(float)
     n_c0 = int(c0.sum())
     n_c1 = int(c1.sum())
     n_c2 = int(c2.sum())
     n_c3 = int(c3.sum())
+    n_c1_c2 = int((c1 & c2).sum())
+    n_c1_only = int((c1 & ~c2 & ~c3 & ~c0).sum())
+    n_c2_only = int((c2 & ~c1 & ~c3 & ~c0).sum())
+    n_c3_only = int((c3 & ~c1 & ~c2 & ~c0).sum())
     n_pos = int((y == 1).sum())
     n_neg = int((y == 0).sum())
     n_uncertain = int(y.isna().sum())
     logger.info(
         "Generated rule-base labels y_churn_t_plus_%d from %s: "
         "positive=%d (%.1f%% of labeled) | negative=%d | unlabeled=%d | total=%d | "
-        "C0(no activity)=%d | C1(item drop)=%d | C2(revenue drop)=%d | C3(slope)=%d",
+        "C0(no activity)=%d | C1(item drop)=%d | C2(revenue drop)=%d | C3(slope)=%d | "
+        "C1&C2=%d | C1_only=%d | C2_only=%d | C3_only=%d | "
+        "min_base_item=%.2f min_base_revenue=%.2f item_drop_ratio=%.2f revenue_drop_ratio=%.2f",
         horizon,
         table_tp,
         n_pos, 100.0 * n_pos / max(n_pos + n_neg, 1),
@@ -413,6 +461,14 @@ def build_labeled_pair(
         n_c1,
         n_c2,
         n_c3,
+        n_c1_c2,
+        n_c1_only,
+        n_c2_only,
+        n_c3_only,
+        min_base_item,
+        min_base_revenue,
+        item_drop_ratio_min,
+        revenue_drop_ratio_min,
     )
 
     lab = df_tp[["cms_code_enc"]].copy()
