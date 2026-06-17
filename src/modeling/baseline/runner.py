@@ -68,8 +68,8 @@ def best_threshold_by_f1(y_true: np.ndarray, y_prob: np.ndarray) -> float:
         # chỉ dùng nếu f1 tại rest_idx không kém quá 5%
         if f1s[rest_idx] >= f1s[0] * 0.95:
             best_idx = rest_idx
-    # Clamp: không cho threshold xuống dưới 5% để tránh predict all-positive
-    return float(max(thr[best_idx], 0.05))
+    # No fixed floor; report degeneracy via dummy/predicted-rate logs.
+    return float(thr[best_idx])
 
 def time_split_train_val_last_month(
     df: pd.DataFrame,
@@ -223,11 +223,14 @@ def eval_one_k_train_val(
 
         n_pos = int((y_tr == 1).sum())
         n_neg = int((y_tr == 0).sum())
+        val_pos = int((y_va == 1).sum())
+        val_neg = int((y_va == 0).sum())
         spw_raw = float(n_neg) / max(float(n_pos), 1.0)
-        max_positive_class_weight = float(os.getenv("BASELINE_MAX_POSITIVE_CLASS_WEIGHT", "100"))
-        spw = min(spw_raw, max_positive_class_weight)
+        max_positive_class_weight = float(os.getenv("BASELINE_MAX_POSITIVE_CLASS_WEIGHT", "20"))
+        spw = min(float(np.sqrt(max(spw_raw, 1.0))), max_positive_class_weight)
 
         churn_ratio = n_pos / max(n_pos + n_neg, 1)
+        val_churn_ratio = val_pos / max(val_pos + val_neg, 1)
         min_positive_rows = int(os.getenv("BASELINE_MIN_POSITIVE_ROWS", "500"))
         min_positive_rate = float(os.getenv("BASELINE_MIN_POSITIVE_RATE", "0.001"))
         if n_pos < min_positive_rows or churn_ratio < min_positive_rate:
@@ -239,23 +242,16 @@ def eval_one_k_train_val(
                 "Check label ingestion and label generation before running modeling."
             )
 
-        class_weight_threshold = float(os.getenv("BASELINE_CLASS_WEIGHT_MAX_RATE", "0.10"))
-        if churn_ratio >= class_weight_threshold:
-            class_weight_used = {0: 1.0, 1: 1.0}
-            class_weight_reason = (
-                f"churn_ratio >= {class_weight_threshold:.1%} -> "
-                "class_weight={1:1.0} (final labels are sufficiently dense)"
-            )
-        else:
-            class_weight_used = {0: 1.0, 1: spw}
-            class_weight_reason = (
-                f"churn_ratio < {class_weight_threshold:.1%} -> weighted class_weight={{1:{spw:.2f}}} "
-                f"(raw={spw_raw:.2f}, cap={max_positive_class_weight:.2f})"
-            )
+        class_weight_used = {0: 1.0, 1: spw}
+        class_weight_reason = (
+            f"continuous sqrt class_weight={{1:{spw:.2f}}} "
+            f"(raw={spw_raw:.2f}, cap={max_positive_class_weight:.2f})"
+        )
 
         logger.info(
             "[BASELINE K=%d FOLD=%d/%d] Train: Churn=%d | Active=%d | Total=%d | "
-            "Churn rate=%.2f%% | Decision: %s",
+            "Churn rate=%.2f%% | Val: Churn=%d | Active=%d | Total=%d | "
+            "Val churn rate=%.2f%% | Decision: %s",
             k,
             fold_idx,
             len(folds),
@@ -263,6 +259,10 @@ def eval_one_k_train_val(
             n_neg,
             n_pos + n_neg,
             churn_ratio * 100,
+            val_pos,
+            val_neg,
+            val_pos + val_neg,
+            val_churn_ratio * 100,
             class_weight_reason,
         )
 
@@ -288,6 +288,7 @@ def eval_one_k_train_val(
         precision_val = float(precision_score(y_va, yhat, zero_division=0))
         recall_val = float(recall_score(y_va, yhat, zero_division=0))
         prevalence = float(y_va.mean())
+        predicted_positive_rate = float(np.mean(yhat == 1))
         dummy_f1 = 2 * prevalence / (prevalence + 1 + 1e-9)
         is_degenerate = abs(f1_val - dummy_f1) < 0.005
         if is_degenerate:
@@ -302,7 +303,8 @@ def eval_one_k_train_val(
 
         logger.info(
             "[CLASSIFICATION METRICS] K=%d use_static=%s fold=%d/%d val=%s "
-            "F1=%.4f precision=%.4f recall=%.4f PR_AUC=%.4f ROC_AUC=%.4f prevalence=%.4f%%",
+            "F1=%.4f precision=%.4f recall=%.4f PR_AUC=%.4f ROC_AUC=%.4f "
+            "prevalence=%.4f%% threshold=%.6f predicted_positive_rate=%.4f%% dummy_all_positive_f1=%.4f",
             k,
             use_static,
             fold_idx,
@@ -314,6 +316,9 @@ def eval_one_k_train_val(
             float(pr_auc),
             float(roc_auc),
             100.0 * prevalence,
+            float(thr),
+            100.0 * predicted_positive_rate,
+            float(dummy_f1),
         )
         fold_reports.append({
             "val_month": val_month,
@@ -324,6 +329,8 @@ def eval_one_k_train_val(
             "ROC_AUC_val": float(roc_auc),
             "val_prevalence": float(prevalence),
             "best_threshold": float(thr),
+            "predicted_positive_rate": predicted_positive_rate,
+            "dummy_all_positive_f1": float(dummy_f1),
             "precision": precision_val,
             "recall": recall_val,
             "f1": f1_val,

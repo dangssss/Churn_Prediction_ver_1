@@ -23,15 +23,20 @@ from logging_config import get_logger
 logger = get_logger(__name__)
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None or str(raw).strip() == "":
+def _positive_quantile(values: pd.Series, q: float) -> float:
+    numeric = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    numeric = numeric[(numeric > 0) & numeric.notna()]
+    if numeric.empty:
+        return 0.0
+    return float(numeric.quantile(float(q)))
+
+
+def _quantile_or_default(values: pd.Series, q: float, default: float = 0.0) -> float:
+    numeric = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    numeric = numeric[numeric.notna()]
+    if numeric.empty:
         return float(default)
-    try:
-        return float(raw)
-    except ValueError:
-        logger.warning("Invalid float env %s=%r. Using default %.4f.", name, raw, default)
-        return float(default)
+    return float(numeric.quantile(float(q)))
 
 
 def _load_post_origin_activity(
@@ -70,10 +75,16 @@ def _load_post_origin_activity(
     origin["origin_revenue"] = pd.to_numeric(
         df_origin[origin_cols["rev_now"]], errors="coerce"
     ).fillna(0)
+    if "active_months" in df_origin.columns:
+        origin["origin_active_months"] = pd.to_numeric(
+            df_origin["active_months"], errors="coerce"
+        ).fillna(0)
+    else:
+        origin["origin_active_months"] = 0
     origin = origin.drop_duplicates("cms_code_enc")
 
     monthly_frames = []
-    for table in future_tables:
+    for offset, table in enumerate(future_tables, start=1):
         query = text(
             f"""
             SELECT cms_code_enc,
@@ -86,15 +97,62 @@ def _load_post_origin_activity(
         )
         frame = pd.read_sql(query, engine)
         frame["cms_code_enc"] = frame["cms_code_enc"].astype(str).str.strip()
+        frame["future_month_offset"] = int(offset)
         monthly_frames.append(frame)
 
-    activity = pd.concat(monthly_frames, ignore_index=True)
+    activity_raw = pd.concat(monthly_frames, ignore_index=True)
+    monthly_totals = (
+        activity_raw.groupby("future_month_offset", as_index=False)
+        .agg(
+            active_customers=("cms_code_enc", "nunique"),
+            item_count=("item_count", "sum"),
+            revenue=("revenue", "sum"),
+        )
+        .sort_values("future_month_offset")
+    )
+    if not monthly_totals.empty:
+        logger.info(
+            "[POST-ORIGIN ACTIVITY AUDIT] origin=%s horizon=%d tables=%s\n%s",
+            origin_yymm,
+            horizon,
+            ",".join(f"public.{table}" for table in future_tables),
+            monthly_totals.to_string(index=False),
+        )
+
     activity = (
-        activity.groupby("cms_code_enc", as_index=False)
+        activity_raw.groupby("cms_code_enc", as_index=False)
         .agg(item_count=("item_count", "sum"), revenue=("revenue", "sum"))
     )
+    if activity_raw.empty:
+        monthly_wide = pd.DataFrame({"cms_code_enc": pd.Series(dtype=str)})
+    else:
+        monthly_wide = activity_raw.pivot_table(
+            index="cms_code_enc",
+            columns="future_month_offset",
+            values=["item_count", "revenue"],
+            aggfunc="sum",
+            fill_value=0,
+        )
+        monthly_wide.columns = [
+            f"{metric}_future_m{int(offset)}"
+            for metric, offset in monthly_wide.columns.to_flat_index()
+        ]
+        monthly_wide = monthly_wide.reset_index()
+
     out = origin.merge(activity, on="cms_code_enc", how="left")
     out[["item_count", "revenue"]] = out[["item_count", "revenue"]].fillna(0)
+    out = out.merge(monthly_wide, on="cms_code_enc", how="left")
+    for offset in range(1, horizon + 1):
+        for prefix in ("item_count", "revenue"):
+            col = f"{prefix}_future_m{offset}"
+            if col not in out.columns:
+                out[col] = 0
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
+    future_item_cols = [f"item_count_future_m{offset}" for offset in range(1, horizon + 1)]
+    future_rev_cols = [f"revenue_future_m{offset}" for offset in range(1, horizon + 1)]
+    out["future_active_months"] = (
+        (out[future_item_cols].gt(0) | out[future_rev_cols].gt(0)).sum(axis=1).astype(int)
+    )
     out["item_last"] = out["item_count"] / max(int(horizon), 1)
     out["revenue_last"] = out["revenue"] / max(int(horizon), 1)
     out["frequency"] = out["origin_item"]
@@ -365,7 +423,7 @@ def build_labeled_pair(
     if "cms_code_enc" not in df_t.columns or "cms_code_enc" not in df_tp.columns:
         raise KeyError("Missing cms_code_enc to join label")
 
-    # ---------- Multi-signal rule labels (C0 OR C1 OR C2 OR C3) ----------
+    # ---------- Adaptive business rule labels ----------
     # All signals are computed from post-origin activity only; no leakage from df_t.
 
     from .gating import resolve_now_cols
@@ -386,24 +444,63 @@ def build_labeled_pair(
 
     baseline_item = pd.concat([freq_tp, item_1m], axis=1).max(axis=1)
     baseline_rev = pd.concat([monetary_tp, rev_1m], axis=1).max(axis=1)
+    baseline_aov = (
+        baseline_rev / baseline_item.replace(0, np.nan)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0)
+    current_aov = (
+        rev_tp / item_tp.replace(0, np.nan)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0)
     item_drop_ratio = (
         1.0 - item_tp / baseline_item.replace(0, np.nan)
     ).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0, upper=1)
     rev_drop_ratio = (
         1.0 - rev_tp / baseline_rev.replace(0, np.nan)
     ).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0, upper=1)
+    aov_drop_ratio = (
+        1.0 - current_aov / baseline_aov.replace(0, np.nan)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0, upper=1)
 
-    min_base_item = _env_float("RULE_LABEL_MIN_BASE_ITEM", 5.0)
-    min_base_revenue = _env_float("RULE_LABEL_MIN_BASE_REVENUE", 500_000.0)
-    item_drop_ratio_min = _env_float("RULE_LABEL_ITEM_DROP_RATIO", 0.70)
-    revenue_drop_ratio_min = _env_float("RULE_LABEL_REVENUE_DROP_RATIO", 0.70)
-    max_current_item = _env_float("RULE_LABEL_MAX_CURRENT_ITEM", 2.0)
-    max_current_revenue_ratio = _env_float("RULE_LABEL_MAX_CURRENT_REVENUE_RATIO", 0.30)
-    slope_drop_ratio_min = _env_float("RULE_LABEL_SLOPE_DROP_RATIO", 0.60)
-    slope_min_abs = _env_float("RULE_LABEL_REVENUE_SLOPE_MIN_ABS", 100_000.0)
+    min_base_item = _positive_quantile(baseline_item, 0.50)
+    min_base_revenue = _positive_quantile(baseline_rev, 0.50)
+    has_meaningful_item_base = (
+        baseline_item.ge(min_base_item) if min_base_item > 0 else baseline_item.gt(0)
+    )
+    has_meaningful_revenue_base = (
+        baseline_rev.ge(min_base_revenue) if min_base_revenue > 0 else baseline_rev.gt(0)
+    )
+    has_meaningful_value_base = (
+        has_meaningful_item_base & has_meaningful_revenue_base & baseline_aov.gt(0)
+    )
 
-    has_meaningful_item_base = baseline_item.ge(min_base_item)
-    has_meaningful_revenue_base = baseline_rev.ge(min_base_revenue)
+    item_drop_ratio_min = _positive_quantile(item_drop_ratio[has_meaningful_item_base], 0.75)
+    revenue_drop_ratio_min = _positive_quantile(rev_drop_ratio[has_meaningful_revenue_base], 0.75)
+    aov_drop_ratio_min = _positive_quantile(aov_drop_ratio[has_meaningful_value_base], 0.75)
+    if item_drop_ratio_min <= 0:
+        item_drop_ratio_min = _positive_quantile(item_drop_ratio, 0.75) or 1.0
+    if revenue_drop_ratio_min <= 0:
+        revenue_drop_ratio_min = _positive_quantile(rev_drop_ratio, 0.75) or 1.0
+    if aov_drop_ratio_min <= 0:
+        aov_drop_ratio_min = _positive_quantile(aov_drop_ratio, 0.75) or 1.0
+
+    low_current_item = _quantile_or_default(item_tp[has_meaningful_item_base], 0.25)
+    low_current_revenue = _quantile_or_default(rev_tp[has_meaningful_revenue_base], 0.25)
+    negative_slope_cutoff = _quantile_or_default(
+        rev_slope_tp[has_meaningful_revenue_base & rev_slope_tp.lt(0)],
+        0.25,
+        default=0.0,
+    )
+
+    future_active_months = pd.to_numeric(
+        df_tp.get("future_active_months", 0), errors="coerce"
+    ).fillna(0).astype(int)
+    origin_active_months = pd.to_numeric(
+        df_tp.get("origin_active_months", 0), errors="coerce"
+    ).fillna(0).astype(int)
+    expected_future_active_months = np.minimum(
+        origin_active_months.clip(lower=1),
+        max(int(horizon), 1),
+    )
+    persistent_activity_drop = future_active_months.lt(expected_future_active_months)
 
     # C0: no future activity from a customer that had a meaningful prior base.
     c0 = (item_tp == 0) & (rev_tp == 0) & (has_meaningful_item_base | has_meaningful_revenue_base)
@@ -412,45 +509,67 @@ def build_labeled_pair(
     c1 = (
         has_meaningful_item_base
         & item_drop_ratio.ge(item_drop_ratio_min)
-        & item_tp.le(max_current_item)
+        & (item_tp.le(low_current_item) | persistent_activity_drop)
     )
 
     # C2: severe revenue contraction from a meaningful revenue base.
     c2 = (
         has_meaningful_revenue_base
         & rev_drop_ratio.ge(revenue_drop_ratio_min)
-        & rev_tp.le(max_current_revenue_ratio * baseline_rev)
+        & (rev_tp.le(low_current_revenue) | persistent_activity_drop)
     )
 
-    # C3: trend deterioration is only a churn signal when both trend and actual drop agree.
+    # C3: trend deterioration is an audit signal, not a standalone churn label.
     c3 = (
         has_meaningful_revenue_base
-        & rev_slope_tp.le(-slope_min_abs)
-        & rev_drop_ratio.ge(slope_drop_ratio_min)
-        & item_drop_ratio.ge(0.50)
+        & rev_slope_tp.le(negative_slope_cutoff)
+        & rev_drop_ratio.ge(revenue_drop_ratio_min)
     )
 
-    business_drop = (c1 & c2) | c3
+    # C4: value collapse catches customers whose average order value falls sharply.
+    c4 = (
+        has_meaningful_value_base
+        & aov_drop_ratio.ge(aov_drop_ratio_min)
+        & c2
+    )
+
+    # Business churn should be confirmed by both volume and revenue contraction.
+    # AOV collapse can confirm revenue churn when future activity also deteriorates.
+    business_drop = (c1 & c2) | (c2 & c4 & persistent_activity_drop)
     rule_y = (c0 | business_drop).astype(int)
+    label_rule_reason = pd.Series("stable_or_active", index=df_tp.index, dtype="object")
+    label_rule_reason.loc[c1 & ~c2 & ~c0] = "item_drop_audit_only"
+    label_rule_reason.loc[c2 & ~c1 & ~c0] = "revenue_drop_audit_only"
+    label_rule_reason.loc[c3 & ~business_drop & ~c0] = "revenue_slope_audit_only"
+    label_rule_reason.loc[c4 & ~business_drop & ~c0] = "aov_drop_audit_only"
+    label_rule_reason.loc[business_drop & c1 & c2] = "order_and_revenue_drop"
+    label_rule_reason.loc[business_drop & ~(c1 & c2)] = "revenue_value_activity_drop"
+    label_rule_reason.loc[c0] = "no_future_activity"
 
     y = rule_y.astype(float)
     n_c0 = int(c0.sum())
     n_c1 = int(c1.sum())
     n_c2 = int(c2.sum())
     n_c3 = int(c3.sum())
+    n_c4 = int(c4.sum())
     n_c1_c2 = int((c1 & c2).sum())
-    n_c1_only = int((c1 & ~c2 & ~c3 & ~c0).sum())
-    n_c2_only = int((c2 & ~c1 & ~c3 & ~c0).sum())
+    n_c1_only = int((c1 & ~c2 & ~c3 & ~c4 & ~c0).sum())
+    n_c2_only = int((c2 & ~c1 & ~c3 & ~c4 & ~c0).sum())
     n_c3_only = int((c3 & ~c1 & ~c2 & ~c0).sum())
+    n_c4_only = int((c4 & ~c1 & ~c2 & ~c0).sum())
     n_pos = int((y == 1).sum())
     n_neg = int((y == 0).sum())
     n_uncertain = int(y.isna().sum())
     logger.info(
         "Generated rule-base labels y_churn_t_plus_%d from %s: "
         "positive=%d (%.1f%% of labeled) | negative=%d | unlabeled=%d | total=%d | "
-        "C0(no activity)=%d | C1(item drop)=%d | C2(revenue drop)=%d | C3(slope)=%d | "
-        "C1&C2=%d | C1_only=%d | C2_only=%d | C3_only=%d | "
-        "min_base_item=%.2f min_base_revenue=%.2f item_drop_ratio=%.2f revenue_drop_ratio=%.2f",
+        "C0(no activity)=%d | C1(item drop)=%d | C2(revenue drop)=%d | "
+        "C3(slope audit)=%d | C4(aov audit)=%d | C1&C2=%d | "
+        "C1_only=%d | C2_only=%d | C3_only=%d | C4_only=%d | "
+        "adaptive_min_base_item=%.2f adaptive_min_base_revenue=%.2f "
+        "adaptive_item_drop_q75=%.2f adaptive_revenue_drop_q75=%.2f "
+        "adaptive_aov_drop_q75=%.2f low_current_item_q25=%.2f "
+        "low_current_revenue_q25=%.2f negative_slope_q25=%.2f",
         horizon,
         table_tp,
         n_pos, 100.0 * n_pos / max(n_pos + n_neg, 1),
@@ -461,18 +580,40 @@ def build_labeled_pair(
         n_c1,
         n_c2,
         n_c3,
+        n_c4,
         n_c1_c2,
         n_c1_only,
         n_c2_only,
         n_c3_only,
+        n_c4_only,
         min_base_item,
         min_base_revenue,
         item_drop_ratio_min,
         revenue_drop_ratio_min,
+        aov_drop_ratio_min,
+        low_current_item,
+        low_current_revenue,
+        negative_slope_cutoff,
+    )
+    reason_audit = (
+        pd.DataFrame({"label_rule_reason": label_rule_reason, "label": y})
+        .groupby("label_rule_reason", dropna=False)["label"]
+        .agg(rows="size", churn_rows="sum")
+        .reset_index()
+    )
+    reason_audit["churn_rate_pct"] = (
+        100.0 * reason_audit["churn_rows"] / reason_audit["rows"].clip(lower=1)
+    )
+    logger.info(
+        "[RULE LABEL REASON AUDIT] y_churn_t_plus_%d from %s\n%s",
+        horizon,
+        table_tp,
+        reason_audit.to_string(index=False),
     )
 
     lab = df_tp[["cms_code_enc"]].copy()
     lab[label_col] = y.values
+    lab["label_rule_reason"] = label_rule_reason.values
 
     out = df_t.merge(lab, on="cms_code_enc", how="left")
 
@@ -538,11 +679,34 @@ def build_dataset_for_k(engine: Engine, k: int, horizon: int = 1, limit_rows_eac
             audit["churn_rate_pct"] = (
                 100.0 * audit["churn_rows"] / audit["total_rows"].clip(lower=1)
             )
+            rates = audit["churn_rate_pct"].astype(float)
+            q1 = float(rates.quantile(0.25))
+            q2 = float(rates.quantile(0.50))
+            q3 = float(rates.quantile(0.75))
+            iqr = q3 - q1
+            max_idx = rates.idxmax()
+            max_row = audit.loc[max_idx]
             logger.info(
                 "[LABEL AUDIT K=%d H=%d]\n%s",
                 k,
                 horizon,
                 audit.to_string(index=False),
+            )
+            logger.info(
+                "[LABEL AUDIT SUMMARY K=%d H=%d] windows=%d churn_rate_pct: "
+                "min=%.2f q1=%.2f median=%.2f q3=%.2f max=%.2f iqr=%.2f "
+                "max_window=%s max_to_median_ratio=%.2f",
+                k,
+                horizon,
+                len(audit),
+                float(rates.min()),
+                q1,
+                q2,
+                q3,
+                float(rates.max()),
+                iqr,
+                str(max_row["source_table_t_plus_h"]),
+                float(rates.max() / max(q2, 1e-9)),
             )
         out = apply_gate(out)
         out = clip_and_log_outliers(out)

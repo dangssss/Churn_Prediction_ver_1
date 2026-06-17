@@ -32,7 +32,16 @@ CHURN_ELIGIBILITY_COLUMNS = frozenset({
     "churn_avg_revenue_per_item_for_eligibility",
 })
 
-NON_FEATURE_COLUMNS = BASE_NON_FEATURE_COLUMNS | LEGACY_LABEL_META_COLUMNS | CHURN_ELIGIBILITY_COLUMNS
+LABEL_AUDIT_COLUMNS = frozenset({
+    "label_rule_reason",
+})
+
+NON_FEATURE_COLUMNS = (
+    BASE_NON_FEATURE_COLUMNS
+    | LEGACY_LABEL_META_COLUMNS
+    | CHURN_ELIGIBILITY_COLUMNS
+    | LABEL_AUDIT_COLUMNS
+)
 
 
 def non_feature_columns(
