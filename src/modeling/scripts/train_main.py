@@ -68,7 +68,6 @@ def main():
         meta = {
             "cfg": cfg,
             "bundle_lifecycle": str(cfg.get("bundle_lifecycle") or "PRODUCTION").upper(),
-            "validation_label_source": cfg.get("validation_label_source"),
             "main_report": main_report,
             "feat_cols": best.get("feat_cols"),
             "cat_cols": best.get("cat_cols"),

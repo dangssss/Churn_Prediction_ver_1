@@ -248,7 +248,6 @@ def cmd_train_main(args) -> None:
     meta = {
         "cfg": cfg,
         "bundle_lifecycle": str(cfg.get("bundle_lifecycle") or "PRODUCTION").upper(),
-        "validation_label_source": cfg.get("validation_label_source"),
         "churn_eligibility": ChurnEligibilityConfig.from_env().__dict__,
         "main_report": best["report"],
         "feat_cols": best.get("feat_cols"),

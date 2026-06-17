@@ -21,6 +21,7 @@ from common.metrics import (
     best_threshold_by_f1_np,
     prf1_at_threshold,
 )
+from preprocess.feature_columns import feature_columns
 
 from monitoring.drift import compute_feature_profile
 
@@ -154,19 +155,89 @@ def _cfg_float(cfg: dict, key: str, env_name: str, default: float) -> float:
         return _env_float(env_name, default)
 
 
-def select_feature_cols_for_model(df: pd.DataFrame, label_col: str):
-    drop_cols = {
-        "cms_code_enc", "window_size", "window_start", "window_end",
-        "source_table_t", "source_table_t_plus_h",
-        "is_active_now", "is_churned_now", "gate_group",
-        "label_source", "label_weight",
-        "is_churn_eligible", "churn_ineligible_reason",
-        "churn_active_months_in_window", "churn_required_active_months",
-        "churn_item_sum_for_eligibility", "churn_revenue_sum_for_eligibility",
-        "churn_avg_revenue_per_item_for_eligibility",
-        label_col
+def _main_threshold_metrics(y_true: np.ndarray, y_prob: np.ndarray, cfg: dict) -> dict[str, Any]:
+    min_threshold = _cfg_float(cfg, "main_threshold_min", "MAIN_XGB_THRESHOLD_MIN", 0.005)
+    max_pred_pos_rate = _cfg_float(
+        cfg,
+        "main_max_predicted_positive_rate",
+        "MAIN_XGB_MAX_PREDICTED_POSITIVE_RATE",
+        0.80,
+    )
+    search_thr, search_precision, search_recall, search_f1 = best_threshold_by_f1_np(
+        y_true,
+        y_prob,
+        n_grid=600,
+        min_threshold=min_threshold,
+        max_predicted_positive_rate=max_pred_pos_rate,
+    )
+
+    fixed_threshold = cfg.get("main_fixed_threshold")
+    if fixed_threshold is not None:
+        threshold = float(fixed_threshold)
+        precision, recall, f1 = prf1_at_threshold(y_true, y_prob, threshold)
+        threshold_source = str(cfg.get("main_fixed_threshold_source") or "fixed")
+    else:
+        threshold = float(search_thr)
+        precision = float(search_precision)
+        recall = float(search_recall)
+        f1 = float(search_f1)
+        threshold_source = "optimized_on_validation_fold"
+
+    return {
+        "threshold": float(threshold),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "threshold_source": threshold_source,
+        "search_threshold": float(search_thr),
+        "search_precision": float(search_precision),
+        "search_recall": float(search_recall),
+        "search_f1": float(search_f1),
+        "min_threshold": float(min_threshold),
+        "max_predicted_positive_rate": float(max_pred_pos_rate),
     }
-    return [c for c in df.columns if c not in drop_cols]
+
+
+def select_feature_cols_for_model(df: pd.DataFrame, label_col: str):
+    return feature_columns(df, label_col=label_col)
+
+
+def _guardrail_warnings(rep: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    main_ap = float(rep["main"]["AP"])
+    const0_ap = float(rep["dummy_const0"]["AP"])
+    random_ap = float(rep["dummy_random_uniform"]["AP"])
+
+    if main_ap + 1e-6 < const0_ap:
+        warnings.append(
+            "MAIN_AP < dummy_const0_AP "
+            f"(main_AP={main_ap:.4f}, const0_AP={const0_ap:.4f}); "
+            "check label/pipeline direction."
+        )
+
+    if random_ap > main_ap - 0.01:
+        warnings.append(
+            "Dummy random is close to MAIN "
+            f"(main_AP={main_ap:.4f}, random_AP={random_ap:.4f}); "
+            "check split/label signal."
+        )
+
+    simple2 = rep.get("dummy_simple2feat_lr")
+    simple2_margin = _env_float("MAIN_XGB_GUARDRAIL_SIMPLE2_AP_MARGIN", 0.02)
+    if simple2:
+        simple2_ap = float(simple2["AP"])
+        simple2_delta = simple2_ap - main_ap
+        if simple2_delta > simple2_margin:
+            simple2_features = ",".join(simple2.get("features") or [])
+            warnings.append(
+                "2-feature LR beats MAIN on AP "
+                f"(delta={simple2_delta:.4f}, main_AP={main_ap:.4f}, "
+                f"simple2_AP={simple2_ap:.4f}, features={simple2_features}, "
+                f"margin={simple2_margin:.4f}); investigate weak trial, feature handling, or noisy features."
+            )
+
+    return warnings
+
 
 def guardrail_sanity(df_tr, df_va, label_col: str, feat_cols: list, main_prob: np.ndarray, seed: int = 42):
     y_va = df_va[label_col].astype(int).to_numpy()
@@ -225,7 +296,7 @@ def guardrail_sanity(df_tr, df_va, label_col: str, feat_cols: list, main_prob: n
         warns.append("Dummy random gần bằng MAIN → nghi leakage/label sai/split sai.")
     if rep["dummy_simple2feat_lr"] and rep["dummy_simple2feat_lr"]["AP"] > main_ap + 0.01:
         warns.append("Model 2-feature vượt MAIN → MAIN training/feature handling có vấn đề.")
-    rep["warnings"] = warns
+    rep["warnings"] = _guardrail_warnings(rep)
 
     return rep
 
@@ -361,49 +432,24 @@ def train_main_xgb_option_B(
 
     p_b, r_b, f1_b = prf1_at_threshold(y_va, va_prob, thr_baseline)
 
-    # optimize threshold on MAIN val unless a final-holdout threshold was fixed
-    # from tuning folds.
-    min_threshold = _cfg_float(cfg, "main_threshold_min", "MAIN_XGB_THRESHOLD_MIN", 0.005)
-    max_pred_pos_rate = _cfg_float(
-        cfg,
-        "main_max_predicted_positive_rate",
-        "MAIN_XGB_MAX_PREDICTED_POSITIVE_RATE",
-        0.80,
-    )
-    thr_search_opt, p_search_opt, r_search_opt, f1_search_opt = best_threshold_by_f1_np(
-        y_va,
-        va_prob,
-        n_grid=600,
-        min_threshold=min_threshold,
-        max_predicted_positive_rate=max_pred_pos_rate,
-    )
-    fixed_threshold = cfg.get("main_fixed_threshold")
-    if fixed_threshold is not None:
-        thr_opt = float(fixed_threshold)
-        p_opt, r_opt, f1_opt = prf1_at_threshold(y_va, va_prob, thr_opt)
-        threshold_source = str(cfg.get("main_fixed_threshold_source") or "fixed")
-    else:
-        thr_opt, p_opt, r_opt, f1_opt = thr_search_opt, p_search_opt, r_search_opt, f1_search_opt
-        threshold_source = "optimized_on_validation_fold"
+    threshold_metrics = _main_threshold_metrics(y_va, va_prob, cfg)
+    thr_opt = threshold_metrics["threshold"]
+    p_opt = threshold_metrics["precision"]
+    r_opt = threshold_metrics["recall"]
+    f1_opt = threshold_metrics["f1"]
+    threshold_source = threshold_metrics["threshold_source"]
+    thr_search_opt = threshold_metrics["search_threshold"]
+    p_search_opt = threshold_metrics["search_precision"]
+    r_search_opt = threshold_metrics["search_recall"]
+    f1_search_opt = threshold_metrics["search_f1"]
+    min_threshold = threshold_metrics["min_threshold"]
+    max_pred_pos_rate = threshold_metrics["max_predicted_positive_rate"]
     ap = average_precision_np(y_va, va_prob)
     roc_auc = float(roc_auc_score(y_va, va_prob)) if len(np.unique(y_va)) == 2 else None
-    primary_sources = (
-        sorted(df_va["label_source"].dropna().astype(str).unique())
-        if "label_source" in df_va.columns
-        else []
-    )
-    primary_label_source = (
-        "unknown"
-        if not primary_sources
-        else primary_sources[0]
-        if len(primary_sources) == 1
-        else "mixed"
-    )
     logger.info(
-        "[MAIN CLASSIFICATION METRICS][%s] F1=%.4f precision=%.4f recall=%.4f "
+        "[MAIN CLASSIFICATION METRICS] F1=%.4f precision=%.4f recall=%.4f "
         "AP=%.4f ROC_AUC=%s prevalence=%.4f%% threshold=%.6f threshold_source=%s "
         "search_opt_threshold=%.6f threshold_min=%.6f max_pred_pos_rate=%.2f%%",
-        primary_label_source.upper(),
         f1_opt,
         p_opt,
         r_opt,
@@ -416,17 +462,19 @@ def train_main_xgb_option_B(
         min_threshold,
         100.0 * max_pred_pos_rate,
     )
-    
+
     # Calculate confusion matrix at optimal threshold
     y_pred_opt = (va_prob >= thr_opt).astype(int)
+    pred_pos_rate = float(y_pred_opt.mean())
     cm = confusion_matrix(y_va, y_pred_opt)
     tn, fp, fn, tp = cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
     logger.info(
         "[MAIN MODEL] Confusion Matrix @ threshold=%.4f: "
         "TN=%d FP=%d FN=%d TP=%d | "
-        "Precision=%.4f Recall=%.4f F1=%.4f",
+        "Precision=%.4f Recall=%.4f F1=%.4f PredictedPositiveRate=%.2f%% ActualPrevalence=%.2f%%",
         thr_opt, tn, fp, fn, tp,
         tp / (tp + fp + 1e-9), tp / (tp + fn + 1e-9), f1_opt,
+        100.0 * pred_pos_rate, 100.0 * float(y_va.mean()),
     )
 
     # Degenerate guard: predict-all-positive → vô dụng cho production
@@ -467,7 +515,20 @@ def train_main_xgb_option_B(
     diagnostic_warning = None
     dummy_simple2 = sanity["dummy_simple2feat_lr"]
     dummy_simple2_ap = float(dummy_simple2["AP"]) if dummy_simple2 else None
+    dummy_simple2_roc = dummy_simple2.get("ROC_AUC") if dummy_simple2 else None
     dummy_simple2_feats = ",".join(dummy_simple2["features"]) if dummy_simple2 else None
+    if guardrail_warning:
+        logger.warning(
+            "[MAIN GUARDRAIL DETAIL] main_AP=%.4f main_ROC=%s const0_AP=%.4f random_AP=%.4f "
+            "simple2_AP=%s simple2_ROC=%s simple2_features=%s",
+            float(sanity["main"]["AP"]),
+            f"{sanity['main']['ROC_AUC']:.4f}" if sanity["main"]["ROC_AUC"] is not None else "n/a",
+            float(sanity["dummy_const0"]["AP"]),
+            float(sanity["dummy_random_uniform"]["AP"]),
+            f"{dummy_simple2_ap:.4f}" if dummy_simple2_ap is not None else "n/a",
+            f"{dummy_simple2_roc:.4f}" if dummy_simple2_roc is not None else "n/a",
+            dummy_simple2_feats or "n/a",
+        )
 
     report = {
         "K": int(cfg["best_k"]),
@@ -496,6 +557,7 @@ def train_main_xgb_option_B(
         "dummy_ap_const0": float(sanity["dummy_const0"]["AP"]),
         "dummy_ap_random": float(sanity["dummy_random_uniform"]["AP"]),
         "dummy_ap_simple2": dummy_simple2_ap,
+        "dummy_roc_simple2": float(dummy_simple2_roc) if dummy_simple2_roc is not None else None,
         "dummy_simple2_features": dummy_simple2_feats,
         "guardrail_warning": guardrail_warning,
         "diagnostic_warning": diagnostic_warning,
@@ -513,6 +575,7 @@ def train_main_xgb_option_B(
         "precision@main_thr": float(p_opt),
         "recall@main_thr": float(r_opt),
         "f1@main_thr": float(f1_opt),
+        "predicted_positive_rate@main_thr": float(pred_pos_rate),
         "precision@search_thr": float(p_search_opt),
         "recall@search_thr": float(r_search_opt),
         "f1@search_thr": float(f1_search_opt),
@@ -948,6 +1011,43 @@ def tune_xgb_hyperparams_for_folds(
     return tuned_cfg, tuning_meta
 
 
+def _split_tuning_and_holdout_folds(folds: list[dict]) -> tuple[list[dict], dict | None, int]:
+    min_tuning_folds = max(_env_int("MAIN_XGB_MIN_TUNING_FOLDS", 5), 1)
+    holdout_enabled = _env_bool("MAIN_XGB_FINAL_HOLDOUT_ENABLED", True)
+    if holdout_enabled and len(folds) >= min_tuning_folds + 1:
+        final_holdout_fold = folds[-1]
+        tuning_folds = folds[:-1]
+        logger.info(
+            "[FINAL HOLDOUT] Reserving latest fold for final evaluation only: "
+            "train<=%s val=%s tuning_folds=%d",
+            final_holdout_fold["train_max_month"],
+            ",".join(str(m) for m in final_holdout_fold["validation_months"]),
+            len(tuning_folds),
+        )
+        return tuning_folds, final_holdout_fold, min_tuning_folds
+
+    if holdout_enabled:
+        logger.warning(
+            "[FINAL HOLDOUT] Not enough folds for %d tuning fold(s) + 1 holdout; "
+            "using all %d fold(s) for training/evaluation.",
+            min_tuning_folds,
+            len(folds),
+        )
+    return folds, None, min_tuning_folds
+
+
+def _fixed_threshold_from_fold_outputs(fold_outputs: list[dict]) -> tuple[float | None, list[float]]:
+    threshold_values = [
+        float(out["report"]["thr_main_opt"])
+        for out in fold_outputs
+        if out["report"].get("threshold_source") != "fixed_from_tuning_folds"
+        and out["report"].get("thr_main_opt") is not None
+    ]
+    if not threshold_values:
+        return None, []
+    return float(np.median(threshold_values)), threshold_values
+
+
 def run_main_variant(
     engine,
     cfg: dict,
@@ -972,24 +1072,7 @@ def run_main_variant(
     tuning_folds = folds
 
     if tune_hyperparams:
-        min_tuning_folds = max(_env_int("MAIN_XGB_MIN_TUNING_FOLDS", 5), 1)
-        if _env_bool("MAIN_XGB_FINAL_HOLDOUT_ENABLED", True) and len(folds) >= min_tuning_folds + 1:
-            final_holdout_fold = folds[-1]
-            tuning_folds = folds[:-1]
-            logger.info(
-                "[FINAL HOLDOUT] Reserving latest fold for final evaluation only: "
-                "train<=%s val=%s tuning_folds=%d",
-                final_holdout_fold["train_max_month"],
-                ",".join(str(m) for m in final_holdout_fold["validation_months"]),
-                len(tuning_folds),
-            )
-        elif _env_bool("MAIN_XGB_FINAL_HOLDOUT_ENABLED", True):
-            logger.warning(
-                "[FINAL HOLDOUT] Not enough folds for %d tuning fold(s) + 1 holdout; "
-                "using all %d fold(s) for training/evaluation.",
-                min_tuning_folds,
-                len(folds),
-            )
+        tuning_folds, final_holdout_fold, min_tuning_folds = _split_tuning_and_holdout_folds(folds)
         if len(tuning_folds) < min_tuning_folds:
             logger.warning(
                 "[HYPERPARAM TUNING] Skipping tuning because tuning_folds=%d < min_tuning_folds=%d. "
@@ -1017,14 +1100,8 @@ def run_main_variant(
         fold_cfg = cfg_tmp
         is_final_holdout = final_holdout_fold is not None and fold is final_holdout_fold
         if is_final_holdout:
-            threshold_values = [
-                float(out["report"]["thr_main_opt"])
-                for out in fold_outputs
-                if out["report"].get("threshold_source") != "fixed_from_tuning_folds"
-                and out["report"].get("thr_main_opt") is not None
-            ]
-            if threshold_values:
-                fixed_threshold = float(np.median(threshold_values))
+            fixed_threshold, threshold_values = _fixed_threshold_from_fold_outputs(fold_outputs)
+            if fixed_threshold is not None:
                 fold_cfg = dict(cfg_tmp)
                 fold_cfg["main_fixed_threshold"] = fixed_threshold
                 fold_cfg["main_fixed_threshold_source"] = "fixed_from_tuning_folds"
@@ -1124,37 +1201,41 @@ def run_main_variant(
     report["val_prevalence"] = val_prevalence_mean
     report["val_month"] = int(latest["report"]["val_month"])
     if final_holdout_fold is not None:
-        holdout_report = holdout_outputs[-1]["report"] if holdout_outputs else latest["report"]
+        holdout_report = holdout_outputs[-1]["report"] if holdout_outputs else None
         report["final_holdout"] = {
             "enabled": True,
+            "status": "completed" if holdout_report is not None else "rejected_or_unavailable",
             "used_for_hyperparameter_search": False,
             "used_for_model_selection": False,
             "train_max_month": final_holdout_fold["train_max_month"],
             "validation_months": list(final_holdout_fold["validation_months"]),
-            "f1": float(holdout_report["f1@main_thr"]),
-            "precision": float(holdout_report["precision@main_thr"]),
-            "recall": float(holdout_report["recall@main_thr"]),
-            "ap": float(holdout_report["AP_val"]),
-            "roc_auc": holdout_report.get("ROC_AUC_val"),
-            "threshold": float(holdout_report["thr_main_opt"]),
-            "search_opt_threshold": float(holdout_report.get("thr_main_search_opt", holdout_report["thr_main_opt"])),
-            "threshold_source": holdout_report.get("threshold_source"),
-            "val_prevalence": float(holdout_report["val_prevalence"]),
         }
-        logger.info(
-            "[FINAL HOLDOUT] K=%d use_static=%s val=%s F1=%.4f precision=%.4f "
-            "recall=%.4f AP=%.4f ROC_AUC=%s threshold=%.6f threshold_source=%s",
-            cfg["best_k"],
-            use_static_flag,
-            ",".join(str(m) for m in final_holdout_fold["validation_months"]),
-            float(holdout_report["f1@main_thr"]),
-            float(holdout_report["precision@main_thr"]),
-            float(holdout_report["recall@main_thr"]),
-            float(holdout_report["AP_val"]),
-            f"{holdout_report.get('ROC_AUC_val'):.4f}" if holdout_report.get("ROC_AUC_val") is not None else "n/a",
-            float(holdout_report["thr_main_opt"]),
-            holdout_report.get("threshold_source"),
-        )
+        if holdout_report is not None:
+            report["final_holdout"].update({
+                "f1": float(holdout_report["f1@main_thr"]),
+                "precision": float(holdout_report["precision@main_thr"]),
+                "recall": float(holdout_report["recall@main_thr"]),
+                "ap": float(holdout_report["AP_val"]),
+                "roc_auc": holdout_report.get("ROC_AUC_val"),
+                "threshold": float(holdout_report["thr_main_opt"]),
+                "search_opt_threshold": float(holdout_report.get("thr_main_search_opt", holdout_report["thr_main_opt"])),
+                "threshold_source": holdout_report.get("threshold_source"),
+                "val_prevalence": float(holdout_report["val_prevalence"]),
+            })
+            logger.info(
+                "[FINAL HOLDOUT] K=%d use_static=%s val=%s F1=%.4f precision=%.4f "
+                "recall=%.4f AP=%.4f ROC_AUC=%s threshold=%.6f threshold_source=%s",
+                cfg["best_k"],
+                use_static_flag,
+                ",".join(str(m) for m in final_holdout_fold["validation_months"]),
+                float(holdout_report["f1@main_thr"]),
+                float(holdout_report["precision@main_thr"]),
+                float(holdout_report["recall@main_thr"]),
+                float(holdout_report["AP_val"]),
+                f"{holdout_report.get('ROC_AUC_val'):.4f}" if holdout_report.get("ROC_AUC_val") is not None else "n/a",
+                float(holdout_report["thr_main_opt"]),
+                holdout_report.get("threshold_source"),
+            )
 
     logger.info(
         "[MAIN WALK FORWARD METRICS] K=%d use_static=%s selection_folds=%d total_folds=%d "

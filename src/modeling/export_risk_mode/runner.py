@@ -7,6 +7,7 @@ from sqlalchemy.engine import Engine
 
 from preprocess.dataset import load_scoring_table_for_k
 from preprocess.eligibility import filter_churn_eligible
+from preprocess.feature_columns import feature_columns
 from preprocess.static_features import load_cus_lifetime, attach_static, LIFETIME_RATIO_REQUIRED_COLS
 from common.artifacts import load_bundle
 from config_store.best_config import load_latest_accepted_best_config as load_latest_best_config
@@ -66,7 +67,7 @@ def run_export_risk(
     # [3/6] Load scoring feature table...
     print("\n[3/6] Load scoring feature table...")
     k = int(cfg["best_k"])
-    
+
     # CRITICAL: If model was trained with a different K than config,
     # use the model's K to avoid feature_names mismatch
     model_k = None
@@ -76,7 +77,7 @@ def run_export_risk(
         print(f"   ? Config DB has K={k} but Model bundle was trained with K={model_k}")
         print(f"   ? Using K={model_k} from Model bundle to match feature columns")
         k = int(model_k)
-    
+
     df_raw, table_t, month_used = load_scoring_table_for_k(engine, k, window_end=t_current, limit_rows=limit_rows)
 
     # Filter active customers (item_last > 0 OR revenue_last > 0)
@@ -117,16 +118,8 @@ def run_export_risk(
         _feat_cols_meta = metadata.get("feat_cols") or []
         _feat_cols = [c for c in _feat_cols_meta if c in df_engineered.columns]
         if not _feat_cols:
-            drop_cols = {
-                "cms_code_enc", "window_size", "window_start", "window_end",
-                "source_table_t", "source_table_t_plus_h",
-                "is_active_now", "is_churned_now", "gate_group",
-                "is_churn_eligible", "churn_ineligible_reason",
-                "churn_active_months_in_window", "churn_required_active_months",
-                "churn_item_sum_for_eligibility", "churn_revenue_sum_for_eligibility",
-                "churn_avg_revenue_per_item_for_eligibility",
-            }
-            _feat_cols = [c for c in df_engineered.columns if c not in drop_cols]
+            label_col = f"y_churn_t_plus_{int(cfg.get('horizon', horizon))}"
+            _feat_cols = feature_columns(df_engineered, label_col=label_col)
 
         X_scored = df_engineered[_feat_cols].copy()
         _cat_cols  = list(metadata.get("cat_cols")  or [])
@@ -157,7 +150,7 @@ def run_export_risk(
             X_scored = X_scored[list(_model_feats)]
 
         df_pred, df_shap_raw = compute_shap_reasons(model, X_scored, df_pred, df_static)
-        
+
         # In kết quả chuẩn của SHAP (lúc chưa map) ra 1 folder riêng
         if df_shap_raw is not None:
             output_dir_env = os.environ.get("OUTPUT_DIR", "/churn_data/output_prediction")
@@ -166,7 +159,7 @@ def run_export_risk(
             shap_csv_path = shap_dir / f"shap_raw_{month_used}.csv"
             df_shap_raw.to_csv(shap_csv_path, index=False, encoding='utf-8-sig')
             print(f"   ? Saved raw SHAP values to {shap_csv_path}")
-            
+
     except Exception as _shap_err:
         print(f"   ? SHAP reasons gặp lỗi: {_shap_err}. Fallback sang rule-based.")
         df_pred = compute_simple_reasons(df_pred, df_static)
@@ -228,22 +221,22 @@ def run_export_risk(
         output_dir_env = os.environ.get("OUTPUT_DIR", "/churn_data/output_prediction")
         csv_dir = Path(output_dir_env)
         csv_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Calculate predict_period
         dt_window = pd.to_datetime(str(month_used), format='%y%m')
         dt_predict = dt_window + pd.DateOffset(months=horizon - 1)
         predict_period_str = dt_predict.strftime('%y%m')
-        
+
         df_csv = df_ins.copy()
         df_csv['window_end'] = str(month_used)
         df_csv['predict_period'] = predict_period_str
         df_csv['updated_at'] = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
-        
+
         # Ensure target columns exist safely
         required_csv_cols = [
-            'cms_code_enc', 'window_end', 'predict_period', 
-            'item_last', 'revenue_last', 'complaint_last', 'delay_last', 
-            'nodone_last', 'order_score_last', 'satisfaction_last', 
+            'cms_code_enc', 'window_end', 'predict_period',
+            'item_last', 'revenue_last', 'complaint_last', 'delay_last',
+            'nodone_last', 'order_score_last', 'satisfaction_last',
             'churn_rate', 'model_probability_pct', 'reason_1', 'reason_2', 'reason_3',
             'reason_1_code', 'reason_1_metric', 'reason_1_baseline',
             'reason_1_delta', 'reason_1_delta_pct', 'reason_1_severity',
@@ -253,17 +246,17 @@ def run_export_risk(
             'reason_3_delta', 'reason_3_delta_pct', 'reason_3_severity',
             'updated_at'
         ]
-        
+
         for col in required_csv_cols:
             if col not in df_csv.columns:
                 df_csv[col] = None
-                
+
         df_csv = df_csv[required_csv_cols]
-        
+
         today_str = pd.Timestamp.today().strftime('%y%m%d')
         csv_filename = f"churn_predict_update_{today_str}.csv"
         csv_path = csv_dir / csv_filename
-        
+
         df_csv.to_csv(csv_path, index=False, encoding='utf-8-sig')
         print(f"? Saved {len(df_csv)} predicted churn profiles directly to {csv_path}")
     except Exception as e:

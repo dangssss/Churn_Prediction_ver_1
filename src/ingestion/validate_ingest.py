@@ -201,7 +201,7 @@ def _validate_labels(cur, details: dict) -> list[str]:
         {"table": table, "rows": count} for table, count in usable
     ]
     if not usable:
-        return ["No non-empty actual label table is available; rule-based fallback required"]
+        return ["No non-empty supplemental label table is available; final labels will rely on generated rule signals"]
 
     latest_label_table, latest_label_rows = usable[-1]
     latest_label_yymm = LABEL_TABLE_RE.fullmatch(latest_label_table).group(1)
@@ -209,7 +209,7 @@ def _validate_labels(cur, details: dict) -> list[str]:
     horizon_months = _env_int("LABEL_EXPECTED_HORIZON_MONTHS", 2)
     details["latest_label_table"] = latest_label_table
     details["latest_label_rows"] = latest_label_rows
-    details["latest_complete_actual_origin_yymm"] = _shift_yymm(
+    details["latest_complete_label_origin_yymm"] = _shift_yymm(
         latest_label_yymm,
         -horizon_months,
     )
@@ -218,11 +218,11 @@ def _validate_labels(cur, details: dict) -> list[str]:
             latest_order_yymm,
             -horizon_months,
         )
-        details["expected_actual_label_yymm"] = expected_label_yymm
+        details["expected_label_yymm"] = expected_label_yymm
         if _month_index(latest_label_yymm) < _month_index(expected_label_yymm):
             warnings.append(
-                f"Latest actual label {latest_label_table} is older than expected "
-                f"label_{expected_label_yymm}; rule-based fallback may be used"
+                f"Latest supplemental label {latest_label_table} is older than expected "
+                f"label_{expected_label_yymm}; final labels may rely more on generated rule signals"
             )
     return warnings
 

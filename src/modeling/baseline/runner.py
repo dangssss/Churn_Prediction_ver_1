@@ -20,6 +20,7 @@ from sklearn.metrics import (
 
 from preprocess.dataset import build_dataset_for_k, preflight_purged_train_val_for_k
 from preprocess.eligibility import filter_churn_eligible
+from preprocess.feature_columns import split_numeric_categorical_features
 from preprocess.static_features import attach_static
 from infra.yymm import shift_yymm
 from logging_config import get_logger
@@ -32,32 +33,7 @@ class SparseChurnLabelsError(ValueError):
 
 
 def select_feature_cols_mixed(df: pd.DataFrame, label_col: str):
-    drop_cols = {
-        "cms_code_enc", "window_size", "window_start", "window_end",
-        "source_table_t", "source_table_t_plus_h",
-        "is_active_now", "is_churned_now", "gate_group",
-        "label_source", "label_weight",
-        "is_churn_eligible", "churn_ineligible_reason",
-        "churn_active_months_in_window", "churn_required_active_months",
-        "churn_item_sum_for_eligibility", "churn_revenue_sum_for_eligibility",
-        "churn_avg_revenue_per_item_for_eligibility",
-        label_col
-    }
-    num_cols, cat_cols = [], []
-    for c in df.columns:
-        if c in drop_cols:
-            continue
-        if pd.api.types.is_numeric_dtype(df[c]):
-            num_cols.append(c)
-        elif df[c].dtype == "object":
-            cat_cols.append(c)
-        elif "datetime" in str(df[c].dtype).lower():
-            # drop datetime columns
-            continue
-        else:
-            # treat others as categorical
-            cat_cols.append(c)
-    return num_cols, cat_cols
+    return split_numeric_categorical_features(df, label_col=label_col)
 
 def make_preprocess(num_cols, cat_cols):
     num_pipe = Pipeline(steps=[
@@ -114,22 +90,15 @@ def time_split_train_val_last_month(
     val_month = validation_months[-1]
     train_max_month = int(shift_yymm(str(validation_months[0]), -int(horizon)))
     historical_train = df2[time_col] <= train_max_month
-    future_rule_holdout = pd.Series(False, index=df2.index)
-    if "label_source" in df2.columns:
-        future_rule_holdout = (
-            (df2["label_source"] == "rule_based")
-            & (df2[time_col] > val_month)
-        )
     df_tr = df2[historical_train].copy()
     df_va = df2[df2[time_col].isin(validation_months)].copy()
     logger.info(
         "[PURGED SPLIT] val_months=%s horizon=%s train_origin_max=%s "
-        "historical_train_rows=%d future_rule_holdout_rows=%d train_rows=%d val_rows=%d",
+        "historical_train_rows=%d train_rows=%d val_rows=%d",
         ",".join(str(m) for m in validation_months),
         horizon,
         train_max_month,
         int(historical_train.sum()),
-        int(future_rule_holdout.sum()),
         len(df_tr),
         len(df_va),
     )
@@ -241,32 +210,11 @@ def eval_one_k_train_val(
     last_spw_raw = 1.0
     last_churn_ratio = 0.0
     last_threshold = 0.5
-    last_validation_label_source = "unknown"
 
     for fold_idx, fold in enumerate(folds, start=1):
         df_tr = fold["train"]
         df_va = fold["val"]
         val_month = int(fold["val_month"])
-        val_label_sources = (
-            sorted(df_va["label_source"].dropna().astype(str).unique())
-            if "label_source" in df_va.columns
-            else []
-        )
-        validation_label_source = (
-            "unknown"
-            if not val_label_sources
-            else val_label_sources[0]
-            if len(val_label_sources) == 1
-            else "mixed"
-        )
-        logger.info(
-            "[VALIDATION PROVENANCE] fold=%d/%d val_month=%s source=%s lifecycle=%s policy=final_unified_label",
-            fold_idx,
-            len(folds),
-            val_month,
-            validation_label_source,
-            bundle_lifecycle,
-        )
 
         X_tr = df_tr[num_cols + cat_cols]
         y_tr = df_tr[label_col].astype(int)
@@ -294,13 +242,13 @@ def eval_one_k_train_val(
         class_weight_threshold = float(os.getenv("BASELINE_CLASS_WEIGHT_MAX_RATE", "0.10"))
         if churn_ratio >= class_weight_threshold:
             class_weight_used = {0: 1.0, 1: 1.0}
-            spw_rule = (
+            class_weight_reason = (
                 f"churn_ratio >= {class_weight_threshold:.1%} -> "
-                "class_weight={1:1.0} (mixed labels are sufficiently dense)"
+                "class_weight={1:1.0} (final labels are sufficiently dense)"
             )
         else:
             class_weight_used = {0: 1.0, 1: spw}
-            spw_rule = (
+            class_weight_reason = (
                 f"churn_ratio < {class_weight_threshold:.1%} -> weighted class_weight={{1:{spw:.2f}}} "
                 f"(raw={spw_raw:.2f}, cap={max_positive_class_weight:.2f})"
             )
@@ -315,19 +263,8 @@ def eval_one_k_train_val(
             n_neg,
             n_pos + n_neg,
             churn_ratio * 100,
-            spw_rule,
+            class_weight_reason,
         )
-
-        if "label_source" in df_tr.columns:
-            provenance = (
-                df_tr.groupby("label_source", dropna=False)
-                .agg(
-                    rows=(label_col, "size"),
-                    positives=(label_col, "sum"),
-                )
-                .reset_index()
-            )
-            logger.info("[BASELINE K=%d FOLD=%d] Label provenance:\n%s", k, fold_idx, provenance.to_string(index=False))
 
         pre = make_preprocess(num_cols, cat_cols)
         clf = LogisticRegression(
@@ -364,14 +301,13 @@ def eval_one_k_train_val(
             )
 
         logger.info(
-            "[CLASSIFICATION METRICS] K=%d use_static=%s fold=%d/%d val=%s source=%s "
+            "[CLASSIFICATION METRICS] K=%d use_static=%s fold=%d/%d val=%s "
             "F1=%.4f precision=%.4f recall=%.4f PR_AUC=%.4f ROC_AUC=%.4f prevalence=%.4f%%",
             k,
             use_static,
             fold_idx,
             len(folds),
             val_month,
-            validation_label_source,
             f1_val,
             precision_val,
             recall_val,
@@ -381,7 +317,6 @@ def eval_one_k_train_val(
         )
         fold_reports.append({
             "val_month": val_month,
-            "validation_label_source": validation_label_source,
             "spw_used": float(class_weight_used.get(1, 1.0)),
             "spw_raw": float(spw_raw),
             "churn_ratio_train": float(churn_ratio),
@@ -398,7 +333,6 @@ def eval_one_k_train_val(
         last_spw_raw = spw_raw
         last_churn_ratio = churn_ratio
         last_threshold = thr
-        last_validation_label_source = validation_label_source
 
     if not fold_reports:
         return None
@@ -432,7 +366,6 @@ def eval_one_k_train_val(
         "H": int(horizon),
         "use_static": bool(use_static),
         "val_month": int(latest["val_month"]),
-        "validation_label_source": last_validation_label_source,
         "bundle_lifecycle": bundle_lifecycle,
         "n_rows": int(len(df_k)),
         "n_months": int(df_k["window_end"].nunique()),

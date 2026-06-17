@@ -43,7 +43,6 @@ def _config_from_ablation_row(engine: Engine, row: pd.Series, horizon: int) -> d
         "metric_roc_auc_val": float(row.get("ROC_AUC_val", 0.0)),
         "metric_val_prevalence": float(row["val_prevalence"]),
         "val_month": int(row["val_month"]),
-        "validation_label_source": str(row["validation_label_source"]),
         "bundle_lifecycle": str(row["bundle_lifecycle"]),
         "notes": "LR shortlisted by F1, PR_AUC, ROC_AUC; XGBoost selects final K",
     }

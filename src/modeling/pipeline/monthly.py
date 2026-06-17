@@ -277,6 +277,11 @@ def _train_main_inline(
     ).strip("; ")
     cfg.pop("xgb_candidate_configs", None)
     cfg.pop("xgb_candidate_ks", None)
+    final_holdout = best["report"].get("final_holdout") or {}
+    final_holdout_status = str(final_holdout.get("status") or "disabled_or_unavailable")
+    final_holdout_f1 = final_holdout.get("f1")
+    final_holdout_ap = final_holdout.get("ap")
+    final_holdout_roc = final_holdout.get("roc_auc")
     logger.info(
         "[XGB SELECTED] K=%d use_static=%s F1=%.4f precision=%.4f recall=%.4f "
         "AP=%.4f ROC_AUC=%s threshold=%.6f latest_F1=%.4f",
@@ -290,10 +295,27 @@ def _train_main_inline(
         float(best["report"]["thr_main_opt"]),
         float(best["report"].get("f1@main_thr_latest", best["report"]["f1@main_thr"])),
     )
+    logger.info(
+        "[XGB SELECTED DETAIL] selection_folds=%d total_folds=%d holdout_excluded_from_selection=%s "
+        "latest_F1=%.4f latest_AP=%.4f latest_ROC_AUC=%s predicted_positive_rate=%.2f%% final_holdout_status=%s "
+        "final_holdout_F1=%s final_holdout_AP=%s final_holdout_ROC_AUC=%s threshold_source=%s",
+        int(best["report"].get("walk_forward_folds", 0)),
+        int(best["report"].get("walk_forward_total_folds", 0)),
+        bool(best["report"].get("walk_forward_holdout_excluded_from_selection", False)),
+        float(best["report"].get("f1@main_thr_latest", best["report"]["f1@main_thr"])),
+        float(best["report"].get("AP_val_latest", best["report"]["AP_val"])),
+        f"{best['report'].get('ROC_AUC_val_latest'):.4f}"
+        if best["report"].get("ROC_AUC_val_latest") is not None else "n/a",
+        100.0 * float(best["report"].get("predicted_positive_rate@main_thr", 0.0)),
+        final_holdout_status,
+        f"{float(final_holdout_f1):.4f}" if final_holdout_f1 is not None else "n/a",
+        f"{float(final_holdout_ap):.4f}" if final_holdout_ap is not None else "n/a",
+        f"{float(final_holdout_roc):.4f}" if final_holdout_roc is not None else "n/a",
+        best["report"].get("threshold_source"),
+    )
     meta = {
         "cfg": cfg,
         "bundle_lifecycle": _bundle_lifecycle(cfg),
-        "validation_label_source": cfg.get("validation_label_source"),
         "churn_eligibility": ChurnEligibilityConfig.from_env().__dict__,
         "main_report": best["report"],
         "feat_cols": best.get("feat_cols"),

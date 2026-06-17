@@ -33,7 +33,6 @@ def ensure_best_config_table(engine: Engine) -> None:
         prev_accepted_f1  DOUBLE PRECISION,
         accept_rule       TEXT,
         accepted_at       TIMESTAMP,
-        validation_label_source TEXT,
         bundle_lifecycle  TEXT NOT NULL DEFAULT 'PRODUCTION',
 
         PRIMARY KEY (as_of_month, horizon)
@@ -66,9 +65,6 @@ def ensure_best_config_table(engine: Engine) -> None:
     ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMP;
 
     ALTER TABLE data_static.model_best_config
-    ADD COLUMN IF NOT EXISTS validation_label_source TEXT;
-
-    ALTER TABLE data_static.model_best_config
     ADD COLUMN IF NOT EXISTS bundle_lifecycle TEXT NOT NULL DEFAULT 'PRODUCTION';
     """
     with engine.begin() as conn:
@@ -80,7 +76,6 @@ def ensure_best_config_table(engine: Engine) -> None:
 def upsert_best_config(engine: Engine, best_config: dict) -> None:
     ensure_best_config_table(engine)
     best_config = dict(best_config)
-    best_config.setdefault("validation_label_source", "unknown")
     best_config.setdefault("bundle_lifecycle", "PRODUCTION")
     best_config.setdefault("metric_roc_auc_val", None)
     best_config.setdefault("metric_val_prevalence", None)
@@ -98,7 +93,7 @@ def upsert_best_config(engine: Engine, best_config: dict) -> None:
         val_month, target_month,
         notes,
         is_accepted, prev_accepted_f1, accept_rule, accepted_at,
-        validation_label_source, bundle_lifecycle
+        bundle_lifecycle
     )
     VALUES (
         :as_of_month, :horizon,
@@ -109,7 +104,7 @@ def upsert_best_config(engine: Engine, best_config: dict) -> None:
         :val_month, :target_month,
         :notes,
         :is_accepted, :prev_accepted_f1, :accept_rule, :accepted_at,
-        :validation_label_source, :bundle_lifecycle
+        :bundle_lifecycle
     )
     ON CONFLICT (as_of_month, horizon) DO UPDATE SET
         best_k=EXCLUDED.best_k,
@@ -128,7 +123,6 @@ def upsert_best_config(engine: Engine, best_config: dict) -> None:
         prev_accepted_f1=EXCLUDED.prev_accepted_f1,
         accept_rule=EXCLUDED.accept_rule,
         accepted_at=EXCLUDED.accepted_at,
-        validation_label_source=EXCLUDED.validation_label_source,
         bundle_lifecycle=EXCLUDED.bundle_lifecycle;
     """
     with engine.begin() as conn:

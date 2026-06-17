@@ -16,7 +16,8 @@ from .feature_tables import (
     list_tables_for_k,
 )
 from .gating import apply_gate
-from .label_tables import LABEL_SCHEMA, estimate_observed_label_rate, label_tables_for_horizon, load_label_keys
+from .feature_columns import non_feature_columns
+from .label_tables import LABEL_SCHEMA, label_tables_for_horizon, load_label_keys
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -128,32 +129,30 @@ def preflight_purged_train_val_for_k(
     labelable = []
     for table in tables:
         _, _, end = parse_feature_table_name(table)
-        has_actual = bool(label_tables_for_horizon(engine, end, int(horizon)))
         has_fallback = _has_post_origin_activity_tables(
             engine,
             origin_yymm=end,
             horizon=int(horizon),
         )
         if has_fallback:
-            source = "mixed_unified" if has_actual else "rule_based"
-            labelable.append((table, int(end), source))
+            labelable.append((table, int(end)))
 
     if not labelable:
         raise ValueError(f"No labelable feature tables for K={k}, H={horizon}")
 
     validation_origin_count = max(1, int(os.getenv("VALIDATION_ORIGIN_COUNT", "2")))
-    validation_months = sorted({end for _, end, _ in labelable})[-validation_origin_count:]
+    validation_months = sorted({end for _, end in labelable})[-validation_origin_count:]
     val_month = max(validation_months)
     train_max_month = int(shift_yymm(str(min(validation_months)), -int(horizon)))
     train_tables = [
         table
-        for table, end, source in labelable
+        for table, end in labelable
         if end <= train_max_month
     ]
     min_train_origins = int(os.getenv("BASELINE_MIN_PURGED_TRAIN_ORIGINS", "2"))
     train_origins = {
         end
-        for _, end, source in labelable
+        for _, end in labelable
         if end <= train_max_month
     }
     if len(train_origins) < min_train_origins:
@@ -166,7 +165,7 @@ def preflight_purged_train_val_for_k(
     logger.info(
         "[PURGED PREFLIGHT] K=%d H=%d val_month=%d train_origin_max=%d "
         "validation_months=%s available_tables=%d train_tables=%d train_origins=%d "
-        "required_origins=%d validation_source=%s",
+        "required_origins=%d",
         k,
         horizon,
         val_month,
@@ -176,7 +175,6 @@ def preflight_purged_train_val_for_k(
         len(train_tables),
         len(train_origins),
         min_train_origins,
-        "mixed",
     )
     return val_month, train_max_month
 
@@ -186,54 +184,51 @@ def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 0.1, perce
     outlier_summary = []
 
     # Skip metadata and label columns.
-    skip_cols = {"cms_code_enc", "window_size", "window_start", "window_end",
-                 "source_table_t", "source_table_t_plus_h",
-                 "is_active_now", "is_churned_now", "gate_group",
-                 "label_source", "label_weight"}
-    
+    skip_cols = non_feature_columns()
+
     num_cols = []
     for c in df_clipped.columns:
         if c in skip_cols or c.startswith("y_churn_"):
             continue
         if pd.api.types.is_numeric_dtype(df_clipped[c]):
             num_cols.append(c)
-            
+
     for col in num_cols:
         vals = pd.to_numeric(df_clipped[col], errors='coerce')
         if vals.isna().all():
             continue
-            
+
         lower_bound = np.nanpercentile(vals, percentile_lower)
         upper_bound = np.nanpercentile(vals, percentile_upper)
-        
+
         if lower_bound == upper_bound:
             continue
-            
+
         v_max = vals.max()
         v_min = vals.min()
-        
+
         should_clip_high = False
         should_clip_low = False
 
         # Clip only extreme outliers to avoid flattening sparse or binary columns.
         if upper_bound > 0 and v_max > 5 * upper_bound:
             should_clip_high = True
-            
+
         if lower_bound < 0 and v_min < 5 * lower_bound:
             should_clip_low = True
-            
+
         clip_low = lower_bound if should_clip_low else v_min
         clip_high = upper_bound if should_clip_high else v_max
-        
+
         if clip_low == clip_high:
             continue
-            
+
         low_mask = vals < clip_low
         high_mask = vals > clip_high
-        
+
         low_count = low_mask.sum()
         high_count = high_mask.sum()
-        
+
         if low_count > 0 or high_count > 0:
             df_clipped[col] = vals.clip(clip_low, clip_high)
             outlier_summary.append({
@@ -243,14 +238,14 @@ def clip_and_log_outliers(df: pd.DataFrame, percentile_lower: float = 0.1, perce
                 "clip_low": clip_low,
                 "clip_high": clip_high
             })
-            
+
     if outlier_summary:
         logger.info(
             "[OUTLIER DETECTION] Clipped extreme outliers for %d columns. Examples: %s",
             len(outlier_summary),
             ", ".join(f"{x['column']} (high_clip={x['clip_high']:.2f}, count={x['high_count']})" for x in outlier_summary[:5])
         )
-        
+
     return df_clipped
 
 def build_labeled_pair(
@@ -268,8 +263,7 @@ def build_labeled_pair(
 
     label_col = f"y_churn_t_plus_{horizon}"
     label_tables = label_tables_for_horizon(engine, end, horizon)
-    actual_labels: pd.DataFrame | None = None
-    actual_label_sources = ""
+    supplemental_labels: pd.DataFrame | None = None
     if label_tables:
         if "cms_code_enc" not in df_t.columns:
             raise KeyError("Missing cms_code_enc to join label")
@@ -281,15 +275,15 @@ def build_labeled_pair(
             ignore_index=True,
         ).drop_duplicates()
 
-        actual_label = pd.Series(np.nan, index=d.index, dtype="float64")
+        label_value = pd.Series(np.nan, index=d.index, dtype="float64")
         cms_map = (
             labels.dropna(subset=["cms_code_enc"])
             .assign(cms_code_enc=lambda x: x["cms_code_enc"].astype(str).str.strip())
-            .groupby("cms_code_enc")["_actual_label"]
+            .groupby("cms_code_enc")["_label_value"]
             .max()
         )
         cms_match = d["cms_code_enc"].map(cms_map)
-        actual_label = actual_label.combine_first(cms_match.astype("float64"))
+        label_value = label_value.combine_first(cms_match.astype("float64"))
 
         if labels["crm_code_enc"].notna().any():
             if "crm_code_enc" in d.columns:
@@ -315,38 +309,34 @@ def build_labeled_pair(
             crm_map = (
                 labels.dropna(subset=["crm_code_enc"])
                 .assign(crm_code_enc=lambda x: x["crm_code_enc"].astype(str).str.strip())
-                .groupby("crm_code_enc")["_actual_label"]
+                .groupby("crm_code_enc")["_label_value"]
                 .max()
             )
             crm_match = crm_series.map(crm_map)
-            actual_label = pd.concat(
-                [actual_label, crm_match.astype("float64")],
+            label_value = pd.concat(
+                [label_value, crm_match.astype("float64")],
                 axis=1,
             ).max(axis=1, skipna=True)
 
-        actual_labels = d[["cms_code_enc"]].copy()
-        actual_labels["_actual_label"] = actual_label
-        actual_labels = (
-            actual_labels.dropna(subset=["_actual_label"])
-            .groupby("cms_code_enc", as_index=False)["_actual_label"]
+        supplemental_labels = d[["cms_code_enc"]].copy()
+        supplemental_labels["_label_value"] = label_value
+        supplemental_labels = (
+            supplemental_labels.dropna(subset=["_label_value"])
+            .groupby("cms_code_enc", as_index=False)["_label_value"]
             .max()
         )
-        actual_label_sources = ",".join(f"{LABEL_SCHEMA}.{label_table}" for label_table in label_tables)
-        n_actual = int(len(actual_labels))
-        n_pos = int(actual_labels["_actual_label"].astype(int).sum()) if n_actual else 0
-        n_neg = int(n_actual - n_pos)
+        n_matched = int(len(supplemental_labels))
+        n_pos = int(supplemental_labels["_label_value"].astype(int).sum()) if n_matched else 0
         logger.info(
-            "Loaded actual labels for %s [%s] on window %s: labeled=%d | "
-            "positive=%d (%.1f%% of labeled, %.1f%% of total) | negative=%d | unlabeled=%d | Total=%d",
+            "Loaded supplemental label keys for %s on window %s: matched_rows=%d | "
+            "positive_rows=%d (%.1f%% of matched, %.1f%% of total) | unmatched_rows=%d | total_rows=%d",
             label_col,
-            actual_label_sources,
             table_t,
-            n_actual,
+            n_matched,
             n_pos,
-            100.0 * n_pos / max(n_actual, 1),
+            100.0 * n_pos / max(n_matched, 1),
             100.0 * n_pos / max(len(d), 1),
-            n_neg,
-            len(d) - n_actual,
+            len(d) - n_matched,
             len(d),
         )
 
@@ -357,7 +347,7 @@ def build_labeled_pair(
         origin_yymm=end,
         horizon=horizon,
     )
-            
+
     if df_tp.empty:
         return pd.DataFrame()  # censor this window: no future labels/signals
 
@@ -382,7 +372,7 @@ def build_labeled_pair(
     freq_tp = pd.to_numeric(df_tp.get("frequency", 0), errors="coerce").fillna(0)
     monetary_tp = pd.to_numeric(df_tp.get("monetary", 0), errors="coerce").fillna(0)
     rev_slope_tp = pd.to_numeric(df_tp.get("revenue_slope", 0), errors="coerce").fillna(0)
-    
+
     rev_1m = pd.to_numeric(df_tp.get("revenue_1m_ago", 0), errors="coerce").fillna(0)
     item_1m = pd.to_numeric(df_tp.get("item_1m_ago", 0), errors="coerce").fillna(0)
 
@@ -446,19 +436,12 @@ def build_labeled_pair(
     risk_score = risk_score.where(eligible, np.nan)
 
     target_rate_env = os.getenv("RULE_LABEL_TARGET_CHURN_RATE")
-    target_source = "observed_label_rate"
     if target_rate_env:
         target_rate = float(target_rate_env)
         target_source = "env_RULE_LABEL_TARGET_CHURN_RATE"
     else:
-        target_rate = estimate_observed_label_rate(
-            engine,
-            horizon=horizon,
-            feature_schema=FEATURE_SCHEMA,
-        )
-        if target_rate is None:
-            target_rate = float(os.getenv("RULE_LABEL_FALLBACK_TARGET_CHURN_RATE", "0.15"))
-            target_source = "fallback_RULE_LABEL_FALLBACK_TARGET_CHURN_RATE"
+        target_rate = float(os.getenv("RULE_LABEL_FALLBACK_TARGET_CHURN_RATE", "0.15"))
+        target_source = "fallback_RULE_LABEL_FALLBACK_TARGET_CHURN_RATE"
 
     uncertain_band = float(os.getenv("RULE_LABEL_UNCERTAIN_BAND_RATE", "0.20"))
     target_rate = max(0.001, min(float(target_rate), 0.50))
@@ -478,25 +461,22 @@ def build_labeled_pair(
         y = pd.Series(np.nan, index=df_tp.index, dtype="float64")
         y.loc[risk_score <= neg_cutoff] = 0.0
         y.loc[risk_score >= pos_cutoff] = 1.0
-        # Resolve the mid-band with explicit business rules instead of dropping it.
+        # Resolve remaining uncertain rows with explicit business rules instead of dropping them.
         uncertain_mask = y.isna() & risk_score.notna()
         y.loc[uncertain_mask] = rule_y.loc[uncertain_mask].astype(float)
 
     n_pos = int((y == 1).sum())
     n_neg = int((y == 0).sum())
     n_uncertain = int(y.isna().sum())
-    n_rule_resolved = int(uncertain_mask.sum())
-    n_strict_positive = int((risk_score >= pos_cutoff).sum()) if not scored.empty else 0
-    n_midband_rule_positive = int((uncertain_mask & rule_y.astype(bool)).sum())
     logger.info(
-        "Override fallback labels y_churn_t_plus_%d from %s using adaptive risk-score rules: "
-        "Churn=%d (%.1f%% of labeled) | Active=%d | Strict-top-risk-positive=%d | "
-        "Rule-positive(mid-band)=%d | Rule-resolved(mid-band)=%d | Unlabeled(drop)=%d | eligible=%d | total=%d | "
-        "strict_top_risk_target=%.4f (%s) | positive_cutoff=%.6f | negative_cutoff=%.6f | uncertain_band=%.2f",
+        "Generated final candidate labels y_churn_t_plus_%d from %s: "
+        "positive=%d (%.1f%% of labeled) | negative=%d | unlabeled=%d | eligible=%d | total=%d | "
+        "target_rate=%.4f (%s) | positive_cutoff=%.6f | negative_cutoff=%.6f | uncertain_band=%.2f",
         horizon, table_tp,
         n_pos, 100.0 * n_pos / max(n_pos + n_neg, 1),
-        n_neg, n_strict_positive, n_midband_rule_positive, n_rule_resolved, n_uncertain, int(eligible.sum()), len(y),
-        target_rate, target_source, pos_cutoff, neg_cutoff, uncertain_band,
+        n_neg, n_uncertain, int(eligible.sum()), len(y),
+        target_rate, target_source,
+        pos_cutoff, neg_cutoff, uncertain_band,
     )
 
     lab = df_tp[["cms_code_enc"]].copy()
@@ -504,26 +484,22 @@ def build_labeled_pair(
 
     out = df_t.merge(lab, on="cms_code_enc", how="left")
 
-    if actual_labels is not None:
-        out = out.merge(actual_labels, on="cms_code_enc", how="left")
-        actual_known_mask = out["_actual_label"].notna()
-        actual_positive_mask = out["_actual_label"].fillna(0).astype(int).eq(1)
-        actual_negative_mask = actual_known_mask & ~actual_positive_mask
-        rule_positive_before = int((out[label_col] == 1).sum())
-        out.loc[actual_known_mask, label_col] = out.loc[actual_known_mask, "_actual_label"].astype(int)
-        rule_positive_after_actual_override = int((out[label_col] == 1).sum())
-        rule_positive_unlabeled = int(((out[label_col] == 1) & ~actual_known_mask).sum())
+    if supplemental_labels is not None:
+        out = out.merge(supplemental_labels, on="cms_code_enc", how="left")
+        label_known_mask = out["_label_value"].notna()
+        out.loc[label_known_mask, label_col] = out.loc[label_known_mask, "_label_value"].astype(int)
+        final_labeled = int(out[label_col].notna().sum())
+        final_positive = int((out[label_col] == 1).sum())
+        final_negative = int((out[label_col] == 0).sum())
+        final_churn_rate = final_positive / max(final_labeled, 1)
         logger.info(
-            "Mixed labels for %s on %s: actual_known=%d actual_positive=%d actual_negative=%d "
-            "rule_positive_before=%d rule_positive_unlabeled=%d final_churn=%d",
+            "Final unified labels for %s on %s: labeled=%d positive=%d negative=%d churn_rate=%.2f%%",
             label_col,
             table_t,
-            int(actual_known_mask.sum()),
-            int(actual_positive_mask.sum()),
-            int(actual_negative_mask.sum()),
-            rule_positive_before,
-            rule_positive_unlabeled,
-            rule_positive_after_actual_override,
+            final_labeled,
+            final_positive,
+            final_negative,
+            100.0 * final_churn_rate,
         )
 
     # Customers that cannot be matched to post-origin activity are unlabeled.
@@ -543,18 +519,10 @@ def build_labeled_pair(
         out["window_end"] = end
 
     out["source_table_t"] = table_t
-    out["source_table_t_plus_h"] = (
-        f"{table_tp};actual={actual_label_sources}"
-        if actual_label_sources
-        else table_tp
-    )
+    out["source_table_t_plus_h"] = table_tp
 
-    if actual_labels is not None:
-        actual_known_mask = out["_actual_label"].notna()
-        out["label_source"] = "mixed_unified"
-        out = out.drop(columns=["_actual_label"])
-    else:
-        out["label_source"] = "rule_based"
+    if supplemental_labels is not None:
+        out = out.drop(columns=["_label_value"])
 
     return out
 
@@ -570,8 +538,6 @@ def build_dataset_for_k(engine: Engine, k: int, horizon: int = 1, limit_rows_eac
         label_col = f"y_churn_t_plus_{horizon}"
         if label_col in out.columns and "source_table_t_plus_h" in out.columns:
             group_cols = ["source_table_t_plus_h"]
-            if "label_source" in out.columns:
-                group_cols.append("label_source")
             audit = (
                 out.groupby(group_cols, dropna=False)[label_col]
                 .agg(total_rows="size", churn_rows="sum")
