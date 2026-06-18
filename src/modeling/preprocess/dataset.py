@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 import numpy as np
@@ -22,6 +23,15 @@ from logging_config import get_logger
 
 logger = get_logger(__name__)
 
+_LAGGED_SIGNAL_RE = re.compile(r"^(?P<base>item|revenue|complaint|delay|nodone|order_score|satisfaction)_(?P<lag>\d+)m_ago$")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
 
 def _positive_quantile(values: pd.Series, q: float) -> float:
     numeric = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan)
@@ -37,6 +47,62 @@ def _quantile_or_default(values: pd.Series, q: float, default: float = 0.0) -> f
     if numeric.empty:
         return float(default)
     return float(numeric.quantile(float(q)))
+
+
+def _safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    num = pd.to_numeric(numerator, errors="coerce").fillna(0.0)
+    den = pd.to_numeric(denominator, errors="coerce").replace(0, np.nan)
+    return (num / den).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def _add_temporal_signal_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add model-side trend/ratio features from observed pre-origin windows only."""
+    if df.empty:
+        return df
+    out = df.copy()
+    lagged: dict[str, list[tuple[int, str]]] = {}
+    for col in out.columns:
+        matched = _LAGGED_SIGNAL_RE.match(str(col))
+        if matched:
+            lagged.setdefault(matched.group("base"), []).append((int(matched.group("lag")), col))
+
+    for base, pairs in lagged.items():
+        pairs.sort()
+        lag_cols = [col for _lag, col in pairs]
+        mat = out[lag_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        if mat.empty:
+            continue
+        hist_mean = mat.mean(axis=1)
+        hist_std = mat.std(axis=1).fillna(0.0)
+        hist_max = mat.max(axis=1)
+        hist_min = mat.min(axis=1)
+        first_col = lag_cols[-1]
+        recent_col = lag_cols[0]
+        recent = pd.to_numeric(out[recent_col], errors="coerce").fillna(0.0)
+        oldest = pd.to_numeric(out[first_col], errors="coerce").fillna(0.0)
+
+        out[f"{base}_hist_mean"] = hist_mean
+        out[f"{base}_hist_std"] = hist_std
+        out[f"{base}_hist_range"] = hist_max - hist_min
+        out[f"{base}_recent_vs_hist_mean"] = _safe_ratio(recent, hist_mean)
+        out[f"{base}_recent_drop_from_hist_mean"] = (1.0 - _safe_ratio(recent, hist_mean)).clip(lower=0.0, upper=1.0)
+        out[f"{base}_trend_recent_minus_oldest"] = recent - oldest
+
+        last_col = f"{base}_last"
+        if last_col in out.columns:
+            last = pd.to_numeric(out[last_col], errors="coerce").fillna(0.0)
+            out[f"{base}_last_vs_hist_mean"] = _safe_ratio(last, hist_mean)
+            out[f"{base}_last_drop_from_hist_mean"] = (1.0 - _safe_ratio(last, hist_mean)).clip(lower=0.0, upper=1.0)
+
+    if {"revenue_last", "item_last"}.issubset(out.columns):
+        out["aov_last"] = _safe_ratio(out["revenue_last"], out["item_last"])
+    if {"revenue_hist_mean", "item_hist_mean"}.issubset(out.columns):
+        out["aov_hist_mean"] = _safe_ratio(out["revenue_hist_mean"], out["item_hist_mean"])
+    if {"aov_last", "aov_hist_mean"}.issubset(out.columns):
+        out["aov_last_vs_hist_mean"] = _safe_ratio(out["aov_last"], out["aov_hist_mean"])
+        out["aov_last_drop_from_hist_mean"] = (1.0 - out["aov_last_vs_hist_mean"]).clip(lower=0.0, upper=1.0)
+
+    return out
 
 
 def _load_post_origin_activity(
@@ -591,6 +657,24 @@ def build_labeled_pair(
     label_rule_reason.loc[c0] = "no_future_activity"
 
     y = rule_y.astype(float)
+    audit_only_mask = label_rule_reason.isin(
+        {
+            "item_drop_audit_only",
+            "revenue_drop_audit_only",
+            "revenue_slope_audit_only",
+            "aov_drop_audit_only",
+        }
+    )
+    if _env_bool("CHURN_LABEL_DROP_AUDIT_ONLY", True):
+        y.loc[audit_only_mask] = np.nan
+
+    churn_label_type = pd.Series("active_or_stable", index=df_tp.index, dtype="object")
+    churn_label_type.loc[audit_only_mask] = "uncertain_audit_only"
+    churn_label_type.loc[business_drop] = "business_drop"
+    churn_label_type.loc[item_drop_confirmed | revenue_drop_confirmed | value_drop_confirmed] = "confirmed_single_signal_drop"
+    churn_label_type.loc[business_drop & c1 & c2] = "joint_item_revenue_drop"
+    churn_label_type.loc[c0] = "no_future_activity"
+
     n_c0 = int(c0.sum())
     n_c1 = int(c1.sum())
     n_c2 = int(c2.sum())
@@ -669,6 +753,8 @@ def build_labeled_pair(
     lab = df_tp[["cms_code_enc"]].copy()
     lab[label_col] = y.values
     lab["label_rule_reason"] = label_rule_reason.values
+    lab["churn_label_type"] = churn_label_type.values
+    lab["churn_label_is_uncertain"] = audit_only_mask.astype(int).values
 
     out = df_t.merge(lab, on="cms_code_enc", how="left")
 
@@ -676,6 +762,8 @@ def build_labeled_pair(
         out = out.merge(supplemental_labels, on="cms_code_enc", how="left")
         label_known_mask = out["_label_value"].notna()
         out.loc[label_known_mask, label_col] = out.loc[label_known_mask, "_label_value"].astype(int)
+        out.loc[label_known_mask, "churn_label_type"] = "supplemental_actual"
+        out.loc[label_known_mask, "churn_label_is_uncertain"] = 0
         final_labeled = int(out[label_col].notna().sum())
         final_positive = int((out[label_col] == 1).sum())
         final_negative = int((out[label_col] == 0).sum())
@@ -763,6 +851,7 @@ def build_dataset_for_k(engine: Engine, k: int, horizon: int = 1, limit_rows_eac
                 str(max_row["source_table_t_plus_h"]),
                 float(rates.max() / max(q2, 1e-9)),
             )
+        out = _add_temporal_signal_features(out)
         out = apply_gate(out)
         out = clip_and_log_outliers(out)
     return out
@@ -816,6 +905,8 @@ def load_scoring_table_for_k(
         df["window_end"] = int(end)
 
     df["source_table_t"] = table_t
+
+    df = _add_temporal_signal_features(df)
 
     # gate now (active_now vs churned_now)
     df = apply_gate(df)

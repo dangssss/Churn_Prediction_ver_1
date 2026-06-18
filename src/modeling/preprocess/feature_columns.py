@@ -34,6 +34,8 @@ CHURN_ELIGIBILITY_COLUMNS = frozenset({
 
 LABEL_AUDIT_COLUMNS = frozenset({
     "label_rule_reason",
+    "churn_label_type",
+    "churn_label_is_uncertain",
 })
 
 NON_FEATURE_COLUMNS = (

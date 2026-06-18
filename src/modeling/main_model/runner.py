@@ -82,6 +82,112 @@ def _score_stats(prob: np.ndarray) -> dict:
     }
 
 
+def _top_percentile_metrics(y_true: np.ndarray, y_prob: np.ndarray, pct: float) -> dict[str, float]:
+    pct = min(max(float(pct), 0.0), 1.0)
+    if len(y_prob) == 0 or pct <= 0:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "predicted_positive_rate": 0.0, "threshold": 1.0}
+    cutoff = float(np.quantile(y_prob, max(0.0, 1.0 - pct)))
+    precision, recall, f1 = prf1_at_threshold(y_true.astype(int), y_prob, cutoff)
+    pred_rate = float(np.mean(y_prob >= cutoff))
+    return {
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "predicted_positive_rate": pred_rate,
+        "threshold": cutoff,
+    }
+
+
+def _prepare_bundle_features(
+    df: pd.DataFrame,
+    *,
+    cfg: dict,
+    metadata: dict,
+    model: Any,
+) -> pd.DataFrame:
+    h = int(cfg.get("horizon") or metadata.get("cfg", {}).get("horizon") or 2)
+    label_col = f"y_churn_t_plus_{h}"
+    meta_feat_cols = metadata.get("feat_cols")
+    if isinstance(meta_feat_cols, list) and meta_feat_cols:
+        feat_cols = [c for c in meta_feat_cols if c in df.columns]
+    else:
+        feat_cols = feature_columns(df, label_col=label_col)
+
+    X = df[feat_cols].copy()
+    cat_cols = list(metadata.get("cat_cols") or [])
+    date_cols = list(metadata.get("date_cols") or [])
+    feature_name_map = metadata.get("feature_name_map") or {}
+
+    extra_date_cols = [
+        c for c in cat_cols
+        if c in X.columns and c not in date_cols and is_date_like_col(X[c])
+    ]
+    if extra_date_cols:
+        date_cols = date_cols + extra_date_cols
+        cat_cols = [c for c in cat_cols if c not in extra_date_cols]
+
+    for c in date_cols:
+        if c in X.columns:
+            X[c] = date_col_to_ordinal(X[c])
+    for c in cat_cols:
+        if c in X.columns:
+            X[c] = safe_to_category(X[c])
+    for c in feat_cols:
+        if c not in cat_cols and c not in date_cols:
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+
+    if feature_name_map:
+        X = X.rename(columns=feature_name_map)
+
+    model_features = getattr(model, "feature_names_in_", None)
+    if model_features is not None:
+        model_features = list(model_features)
+    elif feature_name_map and isinstance(meta_feat_cols, list):
+        model_features = [feature_name_map.get(c, c) for c in meta_feat_cols]
+    else:
+        model_features = None
+
+    if model_features is not None:
+        for c in model_features:
+            if c not in X.columns:
+                X[c] = 0
+        X = X[list(model_features)]
+    return X
+
+
+def _evaluate_probabilities(y_true: np.ndarray, y_prob: np.ndarray, cfg: dict) -> dict[str, Any]:
+    threshold_cfg = dict(cfg)
+    if threshold_cfg.get("main_fixed_threshold") is None:
+        threshold_cfg["main_fixed_threshold"] = float(threshold_cfg.get("best_threshold", 0.5))
+        threshold_cfg["main_fixed_threshold_source"] = "fixed_from_config"
+    threshold_metrics = _main_threshold_metrics(y_true, y_prob, threshold_cfg)
+    ap = average_precision_np(y_true, y_prob)
+    roc_auc = float(roc_auc_score(y_true, y_prob)) if len(np.unique(y_true)) == 2 else None
+    top5 = _top_percentile_metrics(y_true, y_prob, 0.05)
+    top10 = _top_percentile_metrics(y_true, y_prob, 0.10)
+    score_stats = _score_stats(y_prob)
+    return {
+        "AP_val": float(ap),
+        "ROC_AUC_val": roc_auc,
+        **score_stats,
+        "thr_main_opt": float(threshold_metrics["threshold"]),
+        "threshold_source": threshold_metrics["threshold_source"],
+        "precision@main_thr": float(threshold_metrics["precision"]),
+        "recall@main_thr": float(threshold_metrics["recall"]),
+        "f1@main_thr": float(threshold_metrics["f1"]),
+        "predicted_positive_rate@main_thr": float(np.mean(y_prob >= float(threshold_metrics["threshold"]))),
+        "precision@top_5pct": float(top5["precision"]),
+        "recall@top_5pct": float(top5["recall"]),
+        "f1@top_5pct": float(top5["f1"]),
+        "threshold@top_5pct": float(top5["threshold"]),
+        "precision@top_10pct": float(top10["precision"]),
+        "recall@top_10pct": float(top10["recall"]),
+        "f1@top_10pct": float(top10["f1"]),
+        "threshold@top_10pct": float(top10["threshold"]),
+        "val_prevalence": float(np.mean(y_true == 1)),
+    }
+
+
 def _xgb_scale_pos_weight(
     y: np.ndarray,
     baseline_spw: float,
@@ -161,7 +267,19 @@ def _main_threshold_metrics(y_true: np.ndarray, y_prob: np.ndarray, cfg: dict) -
         cfg,
         "main_max_predicted_positive_rate",
         "MAIN_XGB_MAX_PREDICTED_POSITIVE_RATE",
-        0.80,
+        0.25,
+    )
+    min_precision = _cfg_float(
+        cfg,
+        "main_min_precision",
+        "MAIN_XGB_MIN_PRECISION",
+        0.0,
+    )
+    min_recall = _cfg_float(
+        cfg,
+        "main_min_recall",
+        "MAIN_XGB_MIN_RECALL",
+        0.0,
     )
     search_thr, search_precision, search_recall, search_f1 = best_threshold_by_f1_np(
         y_true,
@@ -169,6 +287,8 @@ def _main_threshold_metrics(y_true: np.ndarray, y_prob: np.ndarray, cfg: dict) -
         n_grid=600,
         min_threshold=min_threshold,
         max_predicted_positive_rate=max_pred_pos_rate,
+        min_precision=min_precision if min_precision > 0 else None,
+        min_recall=min_recall if min_recall > 0 else None,
     )
 
     fixed_threshold = cfg.get("main_fixed_threshold")
@@ -195,6 +315,8 @@ def _main_threshold_metrics(y_true: np.ndarray, y_prob: np.ndarray, cfg: dict) -
         "search_f1": float(search_f1),
         "min_threshold": float(min_threshold),
         "max_predicted_positive_rate": float(max_pred_pos_rate),
+        "min_precision": float(min_precision),
+        "min_recall": float(min_recall),
     }
 
 
@@ -444,12 +566,17 @@ def train_main_xgb_option_B(
     f1_search_opt = threshold_metrics["search_f1"]
     min_threshold = threshold_metrics["min_threshold"]
     max_pred_pos_rate = threshold_metrics["max_predicted_positive_rate"]
+    min_precision = threshold_metrics["min_precision"]
+    min_recall = threshold_metrics["min_recall"]
+    top5 = _top_percentile_metrics(y_va, va_prob, 0.05)
+    top10 = _top_percentile_metrics(y_va, va_prob, 0.10)
     ap = average_precision_np(y_va, va_prob)
     roc_auc = float(roc_auc_score(y_va, va_prob)) if len(np.unique(y_va)) == 2 else None
     logger.info(
         "[MAIN CLASSIFICATION METRICS] F1=%.4f precision=%.4f recall=%.4f "
         "AP=%.4f ROC_AUC=%s prevalence=%.4f%% threshold=%.6f threshold_source=%s "
-        "search_opt_threshold=%.6f threshold_min=%.6f max_pred_pos_rate=%.2f%%",
+        "search_opt_threshold=%.6f threshold_min=%.6f max_pred_pos_rate=%.2f%% "
+        "min_precision=%.4f min_recall=%.4f top5_precision=%.4f top10_precision=%.4f",
         f1_opt,
         p_opt,
         r_opt,
@@ -461,6 +588,10 @@ def train_main_xgb_option_B(
         thr_search_opt,
         min_threshold,
         100.0 * max_pred_pos_rate,
+        min_precision,
+        min_recall,
+        float(top5["precision"]),
+        float(top10["precision"]),
     )
 
     # Calculate confusion matrix at optimal threshold
@@ -572,6 +703,8 @@ def train_main_xgb_option_B(
         "threshold_source": threshold_source,
         "thr_main_min": float(min_threshold),
         "max_predicted_positive_rate": float(max_pred_pos_rate),
+        "min_precision": float(min_precision),
+        "min_recall": float(min_recall),
         "precision@main_thr": float(p_opt),
         "recall@main_thr": float(r_opt),
         "f1@main_thr": float(f1_opt),
@@ -579,6 +712,14 @@ def train_main_xgb_option_B(
         "precision@search_thr": float(p_search_opt),
         "recall@search_thr": float(r_search_opt),
         "f1@search_thr": float(f1_search_opt),
+        "precision@top_5pct": float(top5["precision"]),
+        "recall@top_5pct": float(top5["recall"]),
+        "f1@top_5pct": float(top5["f1"]),
+        "threshold@top_5pct": float(top5["threshold"]),
+        "precision@top_10pct": float(top10["precision"]),
+        "recall@top_10pct": float(top10["recall"]),
+        "f1@top_10pct": float(top10["f1"]),
+        "threshold@top_10pct": float(top10["threshold"]),
     }
 
     return model, report, feat_cols, cat_cols, feature_name_map, date_cols
@@ -1048,6 +1189,94 @@ def _fixed_threshold_from_fold_outputs(fold_outputs: list[dict]) -> tuple[float 
     return float(np.median(threshold_values)), threshold_values
 
 
+def evaluate_existing_bundle_on_current_folds(
+    engine,
+    cfg: dict,
+    df_static: pd.DataFrame,
+    model: Any,
+    metadata: dict,
+) -> dict[str, Any]:
+    """Evaluate an already accepted bundle on the same current walk-forward policy."""
+    from preprocess.trainval import build_walk_forward_for_main
+
+    bundle_cfg = dict((metadata or {}).get("cfg") or cfg)
+    eval_cfg = dict(cfg)
+    eval_cfg.update({k: v for k, v in bundle_cfg.items() if v is not None})
+    eval_cfg["horizon"] = int(cfg.get("horizon") or eval_cfg.get("horizon", 2))
+    eval_cfg["best_k"] = int(eval_cfg.get("best_k") or cfg["best_k"])
+    use_static = bool(eval_cfg.get("use_static", False))
+
+    _df_all, folds = build_walk_forward_for_main(
+        engine,
+        eval_cfg,
+        df_static,
+        use_static_override=use_static,
+    )
+    label_col = f"y_churn_t_plus_{int(eval_cfg['horizon'])}"
+    fold_reports: list[dict[str, Any]] = []
+    for fold_idx, fold in enumerate(folds, start=1):
+        df_va = fold["val"]
+        if label_col not in df_va.columns or df_va[label_col].nunique() < 2:
+            logger.warning(
+                "[PREV BUNDLE RE-EVAL] fold=%d/%d skipped: missing or single-class labels",
+                fold_idx,
+                len(folds),
+            )
+            continue
+        X_va = _prepare_bundle_features(df_va, cfg=eval_cfg, metadata=metadata or {}, model=model)
+        y_va = df_va[label_col].astype(int).to_numpy()
+        prob = predict_proba_best_iteration(model, X_va)[:, 1]
+        report = _evaluate_probabilities(y_va, prob, eval_cfg)
+        report["val_month"] = int(df_va["window_end"].astype(int).max())
+        report["train_max_month"] = int(fold["train_max_month"])
+        report["validation_months"] = list(fold["validation_months"])
+        fold_reports.append(report)
+        logger.info(
+            "[PREV BUNDLE RE-EVAL] fold=%d/%d train<=%s val=%s F1=%.4f "
+            "precision=%.4f recall=%.4f AP=%.4f ROC_AUC=%s threshold=%.6f",
+            fold_idx,
+            len(folds),
+            fold["train_max_month"],
+            ",".join(str(m) for m in fold["validation_months"]),
+            float(report["f1@main_thr"]),
+            float(report["precision@main_thr"]),
+            float(report["recall@main_thr"]),
+            float(report["AP_val"]),
+            f"{report.get('ROC_AUC_val'):.4f}" if report.get("ROC_AUC_val") is not None else "n/a",
+            float(report["thr_main_opt"]),
+        )
+
+    if not fold_reports:
+        raise ValueError("Previous bundle re-evaluation produced no valid folds")
+
+    roc_values = [r.get("ROC_AUC_val") for r in fold_reports if r.get("ROC_AUC_val") is not None]
+    out = {
+        "folds": len(fold_reports),
+        "total_folds": len(folds),
+        "F1_val": float(np.mean([r["f1@main_thr"] for r in fold_reports])),
+        "precision": float(np.mean([r["precision@main_thr"] for r in fold_reports])),
+        "recall": float(np.mean([r["recall@main_thr"] for r in fold_reports])),
+        "AP_val": float(np.mean([r["AP_val"] for r in fold_reports])),
+        "ROC_AUC_val": float(np.mean(roc_values)) if roc_values else 0.0,
+        "latest_F1": float(fold_reports[-1]["f1@main_thr"]),
+        "latest_AP": float(fold_reports[-1]["AP_val"]),
+        "latest_ROC_AUC": fold_reports[-1].get("ROC_AUC_val"),
+        "fold_reports": fold_reports,
+    }
+    logger.info(
+        "[PREV BUNDLE RE-EVAL] folds=%d/%d F1=%.4f precision=%.4f recall=%.4f AP=%.4f ROC_AUC=%.4f latest_F1=%.4f",
+        int(out["folds"]),
+        int(out["total_folds"]),
+        float(out["F1_val"]),
+        float(out["precision"]),
+        float(out["recall"]),
+        float(out["AP_val"]),
+        float(out["ROC_AUC_val"]),
+        float(out["latest_F1"]),
+    )
+    return out
+
+
 def run_main_variant(
     engine,
     cfg: dict,
@@ -1096,6 +1325,7 @@ def run_main_variant(
             cfg_tmp["use_static"] = bool(use_static_flag)
 
     fold_outputs = []
+    rejected_folds = []
     for fold_idx, fold in enumerate(folds, start=1):
         fold_cfg = cfg_tmp
         is_final_holdout = final_holdout_fold is not None and fold is final_holdout_fold
@@ -1122,6 +1352,14 @@ def run_main_variant(
                 fold_cfg,
             )
         except ValueError as e:
+            rejected_folds.append({
+                "fold_idx": int(fold_idx),
+                "train_max_month": int(fold["train_max_month"]),
+                "validation_months": list(fold["validation_months"]),
+                "reason": str(e),
+                "is_latest": bool(fold is folds[-1]),
+                "is_final_holdout": bool(is_final_holdout),
+            })
             logger.warning(
                 "Variant K=%d use_static=%s fold=%d/%d rejected: %s",
                 cfg["best_k"],
@@ -1156,7 +1394,68 @@ def run_main_variant(
 
     if not fold_outputs:
         return {"use_static": bool(use_static_flag), "guardrail_warning": "all walk-forward folds rejected",
-                "F1_val": 0.0, "AP_val": 0.0, "ROC_AUC_val": 0.0}
+                "F1_val": 0.0, "AP_val": 0.0, "ROC_AUC_val": 0.0,
+                "report": {
+                    "K": int(cfg["best_k"]),
+                    "H": int(cfg["horizon"]),
+                    "use_static": bool(use_static_flag),
+                    "rejected_folds": rejected_folds,
+                    "walk_forward_total_folds_requested": len(folds),
+                    "guardrail_warning": "all walk-forward folds rejected",
+                }}
+
+    rejection_rate = len(rejected_folds) / max(len(folds), 1)
+    max_rejection_rate = max(_env_float("MAIN_XGB_MAX_REJECTED_FOLD_RATE", 0.25), 0.0)
+    latest_rejected = any(bool(r.get("is_latest")) for r in rejected_folds)
+    require_latest_valid = _env_bool("MAIN_XGB_REQUIRE_LATEST_FOLD_VALID", True)
+    if latest_rejected and require_latest_valid:
+        warning = "latest walk-forward fold rejected"
+        logger.warning(
+            "[MAIN WALK FORWARD REJECT] K=%d use_static=%s rejected variant: %s",
+            cfg["best_k"],
+            use_static_flag,
+            warning,
+        )
+        return {
+            "use_static": bool(use_static_flag),
+            "guardrail_warning": warning,
+            "F1_val": 0.0,
+            "AP_val": 0.0,
+            "ROC_AUC_val": 0.0,
+            "report": {
+                "K": int(cfg["best_k"]),
+                "H": int(cfg["horizon"]),
+                "use_static": bool(use_static_flag),
+                "rejected_folds": rejected_folds,
+                "walk_forward_total_folds_requested": len(folds),
+                "walk_forward_rejected_fold_rate": float(rejection_rate),
+                "guardrail_warning": warning,
+            },
+        }
+    if rejection_rate > max_rejection_rate:
+        warning = f"too many rejected walk-forward folds ({rejection_rate:.2%} > {max_rejection_rate:.2%})"
+        logger.warning(
+            "[MAIN WALK FORWARD REJECT] K=%d use_static=%s rejected variant: %s",
+            cfg["best_k"],
+            use_static_flag,
+            warning,
+        )
+        return {
+            "use_static": bool(use_static_flag),
+            "guardrail_warning": warning,
+            "F1_val": 0.0,
+            "AP_val": 0.0,
+            "ROC_AUC_val": 0.0,
+            "report": {
+                "K": int(cfg["best_k"]),
+                "H": int(cfg["horizon"]),
+                "use_static": bool(use_static_flag),
+                "rejected_folds": rejected_folds,
+                "walk_forward_total_folds_requested": len(folds),
+                "walk_forward_rejected_fold_rate": float(rejection_rate),
+                "guardrail_warning": warning,
+            },
+        }
 
     latest = fold_outputs[-1]
     holdout_outputs = [
@@ -1182,6 +1481,9 @@ def run_main_variant(
     report = dict(latest["report"])
     report["walk_forward_folds"] = len(selection_outputs)
     report["walk_forward_total_folds"] = len(fold_outputs)
+    report["walk_forward_total_folds_requested"] = len(folds)
+    report["walk_forward_rejected_folds"] = rejected_folds
+    report["walk_forward_rejected_fold_rate"] = float(rejection_rate)
     report["walk_forward_holdout_excluded_from_selection"] = bool(holdout_outputs)
     report["walk_forward_reports"] = fold_reports
     report["walk_forward_all_reports"] = all_fold_reports

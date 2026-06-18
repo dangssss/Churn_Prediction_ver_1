@@ -45,6 +45,8 @@ def best_threshold_by_f1_np(
     *,
     min_threshold: float = 0.05,
     max_predicted_positive_rate: float | None = None,
+    min_precision: float | None = None,
+    min_recall: float | None = None,
 ):
     lo = max(float(np.min(y_prob)), float(min_threshold))
     hi = float(np.max(y_prob))
@@ -63,6 +65,10 @@ def best_threshold_by_f1_np(
             pred_pos_rate = float(np.mean(y_prob >= thr))
             if pred_pos_rate > float(max_predicted_positive_rate):
                 continue
+        if min_precision is not None and p < float(min_precision):
+            continue
+        if min_recall is not None and r < float(min_recall):
+            continue
 
         if f1 > best[3]:
             best = (float(thr), float(p), float(r), float(f1))

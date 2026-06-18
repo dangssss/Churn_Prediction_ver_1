@@ -19,7 +19,7 @@ from config_store.best_config import (
     load_latest_accepted_best_config,
     upsert_best_config,
 )
-from main_model.runner import run_main_variant
+from main_model.runner import evaluate_existing_bundle_on_current_folds, run_main_variant
 from common.artifacts import save_bundle, load_bundle
 
 from export_risk_mode.runner import run_export_risk_mode
@@ -156,6 +156,95 @@ def get_active_count_for_month(engine: Engine, k: int, window_end: int) -> int:
 
 
 
+def get_activity_profile_for_month(engine: Engine, k: int, window_end: int) -> dict:
+    """Fast month-completeness profile for a scoring feature table."""
+    from sqlalchemy import text
+    from preprocess.dataset import load_scoring_table_for_k
+
+    try:
+        _, table_name, month_used = load_scoring_table_for_k(engine, int(k), int(window_end), limit_rows=1)
+        schema = "data_window"
+        q = text(
+            f"""
+            SELECT
+                COUNT(*)::bigint AS row_count,
+                SUM(CASE WHEN COALESCE(item_last, 0) <> 0 OR COALESCE(revenue_last, 0) <> 0 THEN 1 ELSE 0 END)::bigint AS active_count,
+                COALESCE(SUM(COALESCE(item_last, 0)), 0)::numeric AS item_sum,
+                COALESCE(SUM(COALESCE(revenue_last, 0)), 0)::numeric AS revenue_sum
+            FROM "{schema}"."{table_name}"
+            """
+        )
+        with engine.connect() as conn:
+            row = conn.execute(q).mappings().first()
+        if row is None:
+            raise ValueError(f"No aggregate row for {schema}.{table_name}")
+        return {
+            "window_end": int(month_used),
+            "table_name": str(table_name),
+            "row_count": int(row["row_count"] or 0),
+            "active_count": int(row["active_count"] or 0),
+            "item_sum": float(row["item_sum"] or 0.0),
+            "revenue_sum": float(row["revenue_sum"] or 0.0),
+        }
+    except Exception as e:
+        logger.warning(
+            "[GUARD-RAIL] Cannot compute activity profile for K=%d, month=%d: %s",
+            int(k),
+            int(window_end),
+            e,
+        )
+        return {
+            "window_end": int(window_end),
+            "table_name": None,
+            "row_count": 0,
+            "active_count": 0,
+            "item_sum": 0.0,
+            "revenue_sum": 0.0,
+            "error": str(e),
+        }
+
+
+def _ratio(cur: float, prev: float) -> float:
+    return float(cur) / max(float(prev), 1e-9)
+
+
+def _passes_month_completeness_guard(cur: dict, prev: dict) -> tuple[bool, dict]:
+    min_active_ratio = float(os.getenv("MODEL_RETRAIN_MIN_ACTIVE_RATIO", "0.50"))
+    min_row_ratio = float(os.getenv("MODEL_RETRAIN_MIN_ROW_RATIO", "0.80"))
+    min_item_ratio = float(os.getenv("MODEL_RETRAIN_MIN_ITEM_RATIO", "0.70"))
+    min_revenue_ratio = float(os.getenv("MODEL_RETRAIN_MIN_REVENUE_RATIO", "0.70"))
+
+    ratios = {
+        "row_ratio": _ratio(cur.get("row_count", 0), prev.get("row_count", 0)),
+        "active_ratio": _ratio(cur.get("active_count", 0), prev.get("active_count", 0)),
+        "item_ratio": _ratio(cur.get("item_sum", 0.0), prev.get("item_sum", 0.0)),
+        "revenue_ratio": _ratio(cur.get("revenue_sum", 0.0), prev.get("revenue_sum", 0.0)),
+    }
+    thresholds = {
+        "min_row_ratio": min_row_ratio,
+        "min_active_ratio": min_active_ratio,
+        "min_item_ratio": min_item_ratio,
+        "min_revenue_ratio": min_revenue_ratio,
+    }
+    failures = []
+    if ratios["row_ratio"] < min_row_ratio:
+        failures.append("row_ratio")
+    if ratios["active_ratio"] < min_active_ratio:
+        failures.append("active_ratio")
+    if ratios["item_ratio"] < min_item_ratio:
+        failures.append("item_ratio")
+    if ratios["revenue_ratio"] < min_revenue_ratio:
+        failures.append("revenue_ratio")
+    meta = {
+        **ratios,
+        **thresholds,
+        "failures": failures,
+        "current_profile": cur,
+        "previous_profile": prev,
+    }
+    return len(failures) == 0, meta
+
+
 def _train_main_inline(
     engine: Engine,
     *,
@@ -199,8 +288,47 @@ def _train_main_inline(
             variant["candidate_cfg"] = dict(variant.get("cfg") or cand)
             variants.append(variant)
 
-    ok = [v for v in variants if "F1_val" in v]
+    ok = [
+        v for v in variants
+        if "F1_val" in v
+        and float(v.get("F1_val") or 0.0) > 0.0
+        and "f1@main_thr" in (v.get("report") or {})
+    ]
     if not ok:
+        rejected = [v for v in variants if "F1_val" in v]
+        if rejected:
+            best_rejected = rejected[0]
+            rejected_cfg = dict(best_rejected.get("candidate_cfg") or cfg)
+            rejected_report = dict(best_rejected.get("report") or {})
+            rejected_cfg["use_static"] = bool(best_rejected.get("use_static", rejected_cfg.get("use_static", False)))
+            rejected_cfg["best_k"] = int(rejected_report.get("K", rejected_cfg.get("best_k")))
+            rejected_cfg["as_of_month"] = int(max_window_end_for_k(engine, int(rejected_cfg["best_k"])))
+            rejected_cfg["target_month"] = int(shift_yymm(str(rejected_cfg["as_of_month"]), int(horizon)))
+            rejected_cfg["metric_f1_val"] = 0.0
+            rejected_cfg["metric_pr_auc_val"] = 0.0
+            rejected_cfg["metric_roc_auc_val"] = 0.0
+            rejected_cfg["metric_val_prevalence"] = float(rejected_report.get("val_prevalence", 0.0) or 0.0)
+            rejected_cfg["best_threshold"] = float(rejected_cfg.get("best_threshold", 0.5))
+            rejected_cfg["notes"] = (
+                f"{rejected_cfg.get('notes') or ''}; "
+                "XGBoost candidate rejected by walk-forward guard"
+            ).strip("; ")
+            logger.warning(
+                "[XGB SELECTED] No usable XGBoost variant; returning rejected candidate K=%d use_static=%s reason=%s",
+                int(rejected_cfg["best_k"]),
+                bool(rejected_cfg["use_static"]),
+                rejected_report.get("guardrail_warning") or best_rejected.get("guardrail_warning") or "unknown",
+            )
+            return {
+                "cfg": rejected_cfg,
+                "main_report": rejected_report,
+                "model": None,
+                "metadata": {
+                    "cfg": rejected_cfg,
+                    "bundle_lifecycle": _bundle_lifecycle(rejected_cfg),
+                    "main_report": rejected_report,
+                },
+            }
         raise RuntimeError("No trainable XGBoost variants produced validation metrics.")
     for variant in ok:
         if variant.get("guardrail_warning"):
@@ -244,7 +372,12 @@ def _train_main_inline(
             tuned["is_optuna_tuned"] = True
             tuned_variants.append(tuned)
 
-        tuned_ok = [v for v in tuned_variants if "F1_val" in v]
+        tuned_ok = [
+            v for v in tuned_variants
+            if "F1_val" in v
+            and float(v.get("F1_val") or 0.0) > 0.0
+            and "f1@main_thr" in (v.get("report") or {})
+        ]
         ok.extend(tuned_ok)
         if tuned_ok:
             logger.info(
@@ -450,6 +583,9 @@ def run_monthly_pipeline(
         active_ratio = 1.0
         active_cnt_cur = 0
         active_cnt_prev = 0
+        month_guard_meta = {}
+        prev_current_eval = None
+        acceptance_prev_f1 = prev_f1
         t_prev = None
         candidate_train_out = None
 
@@ -480,8 +616,37 @@ def run_monthly_pipeline(
                 cand_f1,
                 f"{prev_f1:.4f}" if prev_f1 is not None else "None",
             )
+            if prev_cfg is not None and os.getenv("MODEL_ACCEPT_COMPARE_CURRENT_REEVAL", "1").strip().lower() in {"1", "true", "yes", "y", "on"}:
+                try:
+                    prev_model, prev_meta = load_bundle(bundle_dir)
+                    prev_df_static = load_cus_lifetime_snapshots(engine)
+                    prev_current_eval = evaluate_existing_bundle_on_current_folds(
+                        engine,
+                        dict(prev_cfg),
+                        prev_df_static,
+                        prev_model,
+                        prev_meta or {},
+                    )
+                    acceptance_prev_f1 = float(prev_current_eval["F1_val"])
+                    logger.info(
+                        "[ACCEPTANCE BASELINE] historical_prev_F1=%s current_re_eval_F1=%.4f",
+                        f"{prev_f1:.4f}" if prev_f1 is not None else "None",
+                        acceptance_prev_f1,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[ACCEPTANCE BASELINE] Could not re-evaluate previous bundle on current folds; "
+                        "falling back to historical prev_F1=%s: %s",
+                        f"{prev_f1:.4f}" if prev_f1 is not None else "None",
+                        e,
+                    )
 
-        if is_first_run:
+        candidate_model_ready = candidate_train_out is None or candidate_train_out.get("model") is not None
+
+        if not candidate_model_ready:
+            accepted = False
+            rule = "rejected_no_trainable_xgb_candidate"
+        elif is_first_run:
             # Lần đầu tiên → chạy mới hoàn toàn, không áp dụng bất kỳ guard nào
             accepted = True
             rule = "accepted_first_run"
@@ -502,16 +667,24 @@ def run_monthly_pipeline(
             from infra.yymm import shift_yymm
             try:
                 t_prev = int(shift_yymm(str(t_current), -1))
-                active_cnt_cur = get_active_count_for_month(engine, cand_k, t_current)
-                active_cnt_prev = get_active_count_for_month(engine, cand_k, t_prev)
-                min_active_ratio = float(os.getenv("MODEL_RETRAIN_MIN_ACTIVE_RATIO", "0.50"))
-                if active_cnt_prev > 0:
-                    active_ratio = active_cnt_cur / active_cnt_prev
-                    if active_ratio < min_active_ratio:
-                        pass_guardrail = False
-                else:
-                    logger.warning("[GUARD-RAIL] Không có active customers ở tháng trước %s. Tự động kích hoạt guardrail.", t_prev)
-                    pass_guardrail = False
+                cur_profile = get_activity_profile_for_month(engine, cand_k, t_current)
+                prev_profile = get_activity_profile_for_month(engine, cand_k, t_prev)
+                pass_guardrail, month_guard_meta = _passes_month_completeness_guard(cur_profile, prev_profile)
+                active_cnt_cur = int(cur_profile.get("active_count") or 0)
+                active_cnt_prev = int(prev_profile.get("active_count") or 0)
+                active_ratio = float(month_guard_meta.get("active_ratio", 0.0))
+                logger.info(
+                    "[GUARD-RAIL] month completeness K=%d current=%s previous=%s "
+                    "row_ratio=%.3f active_ratio=%.3f item_ratio=%.3f revenue_ratio=%.3f failures=%s",
+                    cand_k,
+                    t_current,
+                    t_prev,
+                    float(month_guard_meta.get("row_ratio", 0.0)),
+                    float(month_guard_meta.get("active_ratio", 0.0)),
+                    float(month_guard_meta.get("item_ratio", 0.0)),
+                    float(month_guard_meta.get("revenue_ratio", 0.0)),
+                    ",".join(month_guard_meta.get("failures") or []) or "none",
+                )
             except Exception as e:
                 logger.warning("[GUARD-RAIL] Gặp lỗi khi tính toán guardrail active customers: %s. Chặn retrain để an toàn.", e)
                 pass_guardrail = False
@@ -520,19 +693,21 @@ def run_monthly_pipeline(
                 accepted = False
                 rule = "rejected_by_guardrail_incomplete_data"
                 logger.warning(
-                    "[GUARD] Tháng %d chưa hoàn thành dữ liệu (Active: %d vs tháng trước %s: %d, Tỷ lệ: %.2f < %.2f). "
+                    "[GUARD] Tháng %d chưa hoàn thành dữ liệu (Active: %d vs tháng trước %s: %d, Tỷ lệ: %.2f). "
                     "HỦY RETRAIN, giữ nguyên model cũ và chỉ chạy scoring.",
-                    t_current, active_cnt_cur, t_prev, active_cnt_prev, active_ratio, min_active_ratio
+                    t_current, active_cnt_cur, t_prev, active_cnt_prev, active_ratio
                 )
-            elif prev_f1 is None:
+            elif acceptance_prev_f1 is None:
                 accepted = True
                 rule = "accepted_missing_prev_f1"
             else:
-                accepted = bool(cand_f1 > (prev_f1 + f1_improve_eps))
-                rule = "accepted_f1_improved" if accepted else "rejected_f1_not_improved"
+                accepted = bool(cand_f1 > (acceptance_prev_f1 + f1_improve_eps))
+                rule = "accepted_f1_improved_current_re_eval" if accepted else "rejected_f1_not_improved"
 
         cand_cfg["is_accepted"] = bool(accepted)
         cand_cfg["prev_accepted_f1"] = prev_f1
+        cand_cfg["prev_current_re_eval_f1"] = acceptance_prev_f1
+        cand_cfg["prev_current_re_eval"] = prev_current_eval
         cand_cfg["accept_rule"] = rule
         cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime() if accepted else None
 
@@ -567,6 +742,8 @@ def run_monthly_pipeline(
             cand_cfg = dict(train_out["cfg"])
             cand_cfg["is_accepted"] = True
             cand_cfg["prev_accepted_f1"] = prev_f1
+            cand_cfg["prev_current_re_eval_f1"] = acceptance_prev_f1
+            cand_cfg["prev_current_re_eval"] = prev_current_eval
             cand_cfg["accept_rule"] = rule
             cand_cfg["accepted_at"] = pd.Timestamp.utcnow().to_pydatetime()
             upsert_best_config(engine, cand_cfg)
@@ -658,6 +835,7 @@ def run_monthly_pipeline(
             "active_ratio": round(float(active_ratio), 4),
             "active_cnt_cur": int(active_cnt_cur),
             "active_cnt_prev": int(active_cnt_prev),
+            "month_completeness": month_guard_meta,
         }
         finish_run(
             engine,
