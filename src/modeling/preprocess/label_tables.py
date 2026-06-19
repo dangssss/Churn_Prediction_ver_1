@@ -36,13 +36,26 @@ def label_tables_for_horizon(
     engine: Engine,
     origin_yymm: str | int,
     horizon: int,
+    *,
+    require_all: bool = False,
 ) -> list[str] | None:
-    """Return all label tables for t+1..t+h, or None if coverage is partial."""
-    tables = [
-        label_table_for_yymm(engine, shift_yymm(origin_yymm, offset))
-        for offset in range(1, int(horizon) + 1)
-    ]
-    return None if any(table is None for table in tables) else tables
+    """Return available positive-list label tables for t+1..t+h.
+
+    Label.YYMM files are supplemental positive labels. Missing months should
+    not disable labels from months that are present; callers can still combine
+    available actual positives with rule-based positives.
+    """
+    tables: list[str] = []
+    missing = False
+    for offset in range(1, int(horizon) + 1):
+        table = label_table_for_yymm(engine, shift_yymm(origin_yymm, offset))
+        if table is None:
+            missing = True
+        else:
+            tables.append(table)
+    if require_all and missing:
+        return None
+    return tables
 
 
 def list_label_tables(engine: Engine) -> list[str]:

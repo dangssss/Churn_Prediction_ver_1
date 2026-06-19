@@ -19,6 +19,7 @@ from .feature_tables import (
 from .gating import apply_gate
 from .feature_columns import non_feature_columns
 from .label_tables import LABEL_SCHEMA, label_tables_for_horizon, load_label_keys
+from .eligibility import filter_churn_eligible
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -53,6 +54,45 @@ def _safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     num = pd.to_numeric(numerator, errors="coerce").fillna(0.0)
     den = pd.to_numeric(denominator, errors="coerce").replace(0, np.nan)
     return (num / den).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def _month_index_yymm(yymm: str | int) -> int:
+    yymm_str = str(yymm).zfill(4)
+    yy = int(yymm_str[:2])
+    mm = int(yymm_str[2:])
+    if mm < 1 or mm > 12:
+        raise ValueError(f"Invalid YYMM: {yymm}")
+    return yy * 12 + (mm - 1)
+
+
+def _latest_complete_rule_label_yymm() -> int | None:
+    """Return latest closed month allowed for rule-based outcome labels."""
+    override = (
+        os.getenv("CHURN_RULE_LABEL_MAX_FUTURE_YYMM")
+        or os.getenv("CHURN_MAX_LABEL_YYMM")
+    )
+    if override is not None and str(override).strip():
+        return int(str(override).strip())
+    if _env_bool("CHURN_RULE_LABEL_ALLOW_CURRENT_MONTH", False):
+        return None
+
+    tz = os.getenv("CHURN_BUSINESS_TZ", "Asia/Ho_Chi_Minh")
+    try:
+        now = pd.Timestamp.now(tz=tz)
+    except Exception:
+        now = pd.Timestamp.utcnow()
+    current_yymm = f"{now.year % 100:02d}{now.month:02d}"
+    return int(shift_yymm(current_yymm, -1))
+
+
+def _future_yymms_labelable(future_yymms: list[str]) -> tuple[bool, str]:
+    latest_complete = _latest_complete_rule_label_yymm()
+    if latest_complete is None:
+        return True, "current_month_allowed"
+    max_future = max(int(yymm) for yymm in future_yymms)
+    if _month_index_yymm(max_future) <= _month_index_yymm(latest_complete):
+        return True, f"latest_complete={latest_complete:04d}"
+    return False, f"max_future={max_future:04d} latest_complete={latest_complete:04d}"
 
 
 def _add_temporal_signal_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -117,6 +157,15 @@ def _load_post_origin_activity(
     from .gating import resolve_now_cols
 
     future_yymms = [shift_yymm(origin_yymm, offset) for offset in range(1, horizon + 1)]
+    labelable, reason = _future_yymms_labelable(future_yymms)
+    if not labelable:
+        logger.info(
+            "Censor fallback origin=%s horizon=%d: future months are not closed for rule labels (%s)",
+            origin_yymm,
+            horizon,
+            reason,
+        )
+        return pd.DataFrame(), ""
     future_tables = [f"bccp_orderitem_{yymm}" for yymm in future_yymms]
     with engine.connect() as conn:
         for table in future_tables:
@@ -239,6 +288,15 @@ def _has_post_origin_activity_tables(
     from sqlalchemy import text
 
     future_yymms = [shift_yymm(origin_yymm, offset) for offset in range(1, int(horizon) + 1)]
+    labelable, reason = _future_yymms_labelable(future_yymms)
+    if not labelable:
+        logger.info(
+            "[PURGED PREFLIGHT] origin=%s H=%d is not labelable yet (%s)",
+            origin_yymm,
+            horizon,
+            reason,
+        )
+        return False
     with engine.connect() as conn:
         return all(
             conn.execute(
@@ -395,6 +453,20 @@ def build_labeled_pair(
         raise ValueError("table_t does not belong to K")
 
     df_t = load_feature_table(engine, table_t, limit=limit)
+    before_scope = len(df_t)
+    df_t = apply_gate(df_t)
+    df_t = df_t[df_t["is_active_now"].astype(int).eq(1)].copy()
+    after_active = len(df_t)
+    df_t = filter_churn_eligible(df_t, k=k, context=f"label_build_k{k}_{end}")
+    if df_t.empty:
+        logger.info(
+            "[LABEL BUILD] %s kept no active eligible rows after active/eligibility filtering "
+            "(before=%d after_active=%d)",
+            table_t,
+            before_scope,
+            after_active,
+        )
+        return pd.DataFrame()
 
     label_col = f"y_churn_t_plus_{horizon}"
     label_tables = label_tables_for_horizon(engine, end, horizon)
@@ -473,6 +545,15 @@ def build_labeled_pair(
             100.0 * n_pos / max(len(d), 1),
             len(d) - n_matched,
             len(d),
+        )
+    else:
+        future_yymms = [shift_yymm(end, offset) for offset in range(1, int(horizon) + 1)]
+        logger.info(
+            "No supplemental %s label tables available for %s on future months=%s; "
+            "using rule-base labels for positives and negatives.",
+            LABEL_SCHEMA,
+            table_t,
+            ",".join(str(yymm) for yymm in future_yymms),
         )
 
     # Rule fallback uses raw order tables strictly after the prediction origin.
@@ -665,7 +746,7 @@ def build_labeled_pair(
             "aov_drop_audit_only",
         }
     )
-    if _env_bool("CHURN_LABEL_DROP_AUDIT_ONLY", True):
+    if _env_bool("CHURN_LABEL_DROP_AUDIT_ONLY", False):
         y.loc[audit_only_mask] = np.nan
 
     churn_label_type = pd.Series("active_or_stable", index=df_tp.index, dtype="object")
@@ -674,6 +755,9 @@ def build_labeled_pair(
     churn_label_type.loc[item_drop_confirmed | revenue_drop_confirmed | value_drop_confirmed] = "confirmed_single_signal_drop"
     churn_label_type.loc[business_drop & c1 & c2] = "joint_item_revenue_drop"
     churn_label_type.loc[c0] = "no_future_activity"
+    label_source = pd.Series("rule_negative", index=df_tp.index, dtype="object")
+    label_source.loc[rule_y.eq(1)] = "rule_positive"
+    label_source.loc[y.isna()] = "excluded_uncertain"
 
     n_c0 = int(c0.sum())
     n_c1 = int(c1.sum())
@@ -755,37 +839,75 @@ def build_labeled_pair(
     lab["label_rule_reason"] = label_rule_reason.values
     lab["churn_label_type"] = churn_label_type.values
     lab["churn_label_is_uncertain"] = audit_only_mask.astype(int).values
+    lab["label_source"] = label_source.values
 
     out = df_t.merge(lab, on="cms_code_enc", how="left")
 
+    actual_positive_count = 0
+    rule_positive_count = int((out[label_col] == 1).sum())
+    both_positive_count = 0
+    actual_only_count = 0
+    rule_only_count = rule_positive_count
     if supplemental_labels is not None:
         out = out.merge(supplemental_labels, on="cms_code_enc", how="left")
-        label_known_mask = out["_label_value"].notna()
-        out.loc[label_known_mask, label_col] = out.loc[label_known_mask, "_label_value"].astype(int)
-        out.loc[label_known_mask, "churn_label_type"] = "supplemental_actual"
-        out.loc[label_known_mask, "churn_label_is_uncertain"] = 0
-        final_labeled = int(out[label_col].notna().sum())
-        final_positive = int((out[label_col] == 1).sum())
-        final_negative = int((out[label_col] == 0).sum())
-        final_churn_rate = final_positive / max(final_labeled, 1)
-        logger.info(
-            "Final unified labels for %s on %s: labeled=%d positive=%d negative=%d churn_rate=%.2f%%",
-            label_col,
-            table_t,
-            final_labeled,
-            final_positive,
-            final_negative,
-            100.0 * final_churn_rate,
-        )
+        rule_label = pd.to_numeric(out[label_col], errors="coerce")
+        actual_label = pd.to_numeric(out["_label_value"], errors="coerce")
+        rule_positive_mask = rule_label.eq(1)
+        actual_positive_mask = actual_label.eq(1)
+        actual_known_mask = actual_label.notna()
+        final_positive_mask = rule_positive_mask | actual_positive_mask
 
-    # Customers that cannot be matched to post-origin activity are unlabeled.
-    # Drop them to avoid noisy fallback labels and inflated churn ratios.
+        out.loc[final_positive_mask, label_col] = 1
+        out.loc[
+            actual_known_mask & actual_label.eq(0) & ~rule_positive_mask & out[label_col].isna(),
+            label_col,
+        ] = 0
+
+        both_mask = actual_positive_mask & rule_positive_mask
+        actual_only_mask = actual_positive_mask & ~rule_positive_mask
+        rule_only_mask = rule_positive_mask & ~actual_positive_mask
+
+        out.loc[actual_only_mask, "label_source"] = "actual_positive"
+        out.loc[rule_only_mask, "label_source"] = "rule_positive"
+        out.loc[both_mask, "label_source"] = "actual_and_rule_positive"
+        out.loc[actual_only_mask, "churn_label_type"] = "actual_positive"
+        out.loc[both_mask, "churn_label_type"] = "actual_and_rule_positive"
+        out.loc[actual_positive_mask, "churn_label_is_uncertain"] = 0
+
+        actual_positive_count = int(actual_positive_mask.sum())
+        rule_positive_count = int(rule_positive_mask.sum())
+        both_positive_count = int(both_mask.sum())
+        actual_only_count = int(actual_only_mask.sum())
+        rule_only_count = int(rule_only_mask.sum())
+
+    final_labeled = int(out[label_col].notna().sum())
+    final_positive = int((out[label_col] == 1).sum())
+    final_negative = int((out[label_col] == 0).sum())
+    final_churn_rate = final_positive / max(final_labeled, 1)
+    logger.info(
+        "Final unified labels for %s on %s: labeled=%d positive=%d negative=%d "
+        "churn_rate=%.2f%% | actual_positive=%d rule_positive=%d both=%d "
+        "actual_only=%d rule_only=%d",
+        label_col,
+        table_t,
+        final_labeled,
+        final_positive,
+        final_negative,
+        100.0 * final_churn_rate,
+        actual_positive_count,
+        rule_positive_count,
+        both_positive_count,
+        actual_only_count,
+        rule_only_count,
+    )
+
+    # Customers still without a final label are outside the usable supervised set.
     missing_mask = out[label_col].isna()
     if missing_mask.any():
         n_dropped = int(missing_mask.sum())
         logger.info(
-            "Dropped %d/%d customers without post-origin labels from %s "
-            "(cannot determine churn/active without inflating churn_ratio).",
+            "Dropped %d/%d customers without final labels from %s "
+            "(typically excluded uncertain rows or censored post-origin activity).",
             n_dropped, len(out), table_tp,
         )
         out = out[~missing_mask].copy()
