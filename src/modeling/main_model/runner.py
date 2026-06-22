@@ -98,6 +98,98 @@ def _top_percentile_metrics(y_true: np.ndarray, y_prob: np.ndarray, pct: float) 
     }
 
 
+def _env_first(*names: str) -> str | None:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None and str(raw).strip() != "":
+            return str(raw).strip()
+    return None
+
+
+def _operating_mode(cfg: dict) -> str:
+    raw = (
+        _env_first("CHURN_OPERATING_MODE", "MODEL_OPERATING_MODE")
+        or cfg.get("operating_mode")
+        or "percentile"
+    )
+    value = str(raw).strip().lower().replace("-", "_")
+    if value in {"probability", "probability_threshold", "proba", "proba_threshold"}:
+        return "probability"
+    if value in {"percentile", "top_percentile", "rank", "top_tail"}:
+        return "percentile"
+    logger.warning("Invalid operating mode %r. Falling back to percentile.", raw)
+    return "percentile"
+
+
+def _operating_percentile_cutoff(cfg: dict) -> float:
+    raw = (
+        _env_first("CHURN_OPERATING_RISK_THRESHOLD_PCT", "MODEL_OPERATING_RISK_THRESHOLD_PCT")
+        or cfg.get("operating_risk_threshold_pct")
+        or cfg.get("risk_threshold_pct")
+        or 90.0
+    )
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid operating percentile cutoff %r. Using 90.", raw)
+        value = 90.0
+    return min(max(value, 0.0), 100.0)
+
+
+def _operating_probability_threshold(cfg: dict, default: float | None = None) -> float:
+    raw = (
+        _env_first("CHURN_OPERATING_PROBABILITY_THRESHOLD", "MODEL_OPERATING_PROBABILITY_THRESHOLD")
+        or cfg.get("operating_probability_threshold")
+    )
+    if raw is None:
+        raw = cfg.get("best_threshold", cfg.get("main_threshold", default if default is not None else 0.5))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid operating probability threshold %r. Using %.4f.", raw, default or 0.5)
+        value = float(default if default is not None else 0.5)
+    if value > 1.0 and value <= 100.0:
+        value = value / 100.0
+    return min(max(value, 0.0), 1.0)
+
+
+def _operating_metrics(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    cfg: dict,
+    *,
+    default_probability_threshold: float | None = None,
+) -> dict[str, Any]:
+    mode = _operating_mode(cfg)
+    if mode == "probability":
+        threshold = _operating_probability_threshold(cfg, default=default_probability_threshold)
+        precision, recall, f1 = prf1_at_threshold(y_true.astype(int), y_prob, threshold)
+        return {
+            "mode": "probability",
+            "threshold": float(threshold),
+            "threshold_type": "probability",
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+            "predicted_positive_rate": float(np.mean(y_prob >= threshold)),
+            "percentile_cutoff": None,
+        }
+
+    percentile_cutoff = _operating_percentile_cutoff(cfg)
+    top_pct = max(0.0, min(1.0, (100.0 - percentile_cutoff) / 100.0))
+    metrics = _top_percentile_metrics(y_true.astype(int), y_prob, top_pct)
+    return {
+        "mode": "percentile",
+        "threshold": float(metrics["threshold"]),
+        "threshold_type": "score_at_percentile",
+        "precision": float(metrics["precision"]),
+        "recall": float(metrics["recall"]),
+        "f1": float(metrics["f1"]),
+        "predicted_positive_rate": float(metrics["predicted_positive_rate"]),
+        "percentile_cutoff": float(percentile_cutoff),
+    }
+
+
 def _prepare_bundle_features(
     df: pd.DataFrame,
     *,
@@ -165,6 +257,12 @@ def _evaluate_probabilities(y_true: np.ndarray, y_prob: np.ndarray, cfg: dict) -
     roc_auc = float(roc_auc_score(y_true, y_prob)) if len(np.unique(y_true)) == 2 else None
     top5 = _top_percentile_metrics(y_true, y_prob, 0.05)
     top10 = _top_percentile_metrics(y_true, y_prob, 0.10)
+    operating = _operating_metrics(
+        y_true,
+        y_prob,
+        threshold_cfg,
+        default_probability_threshold=float(threshold_metrics["threshold"]),
+    )
     score_stats = _score_stats(y_prob)
     return {
         "AP_val": float(ap),
@@ -184,6 +282,14 @@ def _evaluate_probabilities(y_true: np.ndarray, y_prob: np.ndarray, cfg: dict) -
         "recall@top_10pct": float(top10["recall"]),
         "f1@top_10pct": float(top10["f1"]),
         "threshold@top_10pct": float(top10["threshold"]),
+        "operating_mode": operating["mode"],
+        "operating_threshold_type": operating["threshold_type"],
+        "operating_threshold": float(operating["threshold"]),
+        "operating_percentile_cutoff": operating["percentile_cutoff"],
+        "precision@operating": float(operating["precision"]),
+        "recall@operating": float(operating["recall"]),
+        "f1@operating": float(operating["f1"]),
+        "predicted_positive_rate@operating": float(operating["predicted_positive_rate"]),
         "val_prevalence": float(np.mean(y_true == 1)),
     }
 
@@ -570,13 +676,21 @@ def train_main_xgb_option_B(
     min_recall = threshold_metrics["min_recall"]
     top5 = _top_percentile_metrics(y_va, va_prob, 0.05)
     top10 = _top_percentile_metrics(y_va, va_prob, 0.10)
+    operating = _operating_metrics(
+        y_va,
+        va_prob,
+        cfg,
+        default_probability_threshold=float(thr_opt),
+    )
     ap = average_precision_np(y_va, va_prob)
     roc_auc = float(roc_auc_score(y_va, va_prob)) if len(np.unique(y_va)) == 2 else None
     logger.info(
         "[MAIN CLASSIFICATION METRICS] F1=%.4f precision=%.4f recall=%.4f "
         "AP=%.4f ROC_AUC=%s prevalence=%.4f%% threshold=%.6f threshold_source=%s "
         "search_opt_threshold=%.6f threshold_min=%.6f max_pred_pos_rate=%.2f%% "
-        "min_precision=%.4f min_recall=%.4f top5_precision=%.4f top10_precision=%.4f",
+        "min_precision=%.4f min_recall=%.4f top5_precision=%.4f top10_precision=%.4f "
+        "operating_mode=%s operating_F1=%.4f operating_precision=%.4f "
+        "operating_recall=%.4f operating_predicted_positive_rate=%.2f%%",
         f1_opt,
         p_opt,
         r_opt,
@@ -592,6 +706,11 @@ def train_main_xgb_option_B(
         min_recall,
         float(top5["precision"]),
         float(top10["precision"]),
+        operating["mode"],
+        float(operating["f1"]),
+        float(operating["precision"]),
+        float(operating["recall"]),
+        100.0 * float(operating["predicted_positive_rate"]),
     )
 
     # Calculate confusion matrix at optimal threshold
@@ -720,6 +839,14 @@ def train_main_xgb_option_B(
         "recall@top_10pct": float(top10["recall"]),
         "f1@top_10pct": float(top10["f1"]),
         "threshold@top_10pct": float(top10["threshold"]),
+        "operating_mode": operating["mode"],
+        "operating_threshold_type": operating["threshold_type"],
+        "operating_threshold": float(operating["threshold"]),
+        "operating_percentile_cutoff": operating["percentile_cutoff"],
+        "precision@operating": float(operating["precision"]),
+        "recall@operating": float(operating["recall"]),
+        "f1@operating": float(operating["f1"]),
+        "predicted_positive_rate@operating": float(operating["predicted_positive_rate"]),
     }
 
     return model, report, feat_cols, cat_cols, feature_name_map, date_cols
@@ -1233,17 +1360,20 @@ def evaluate_existing_bundle_on_current_folds(
         fold_reports.append(report)
         logger.info(
             "[PREV BUNDLE RE-EVAL] fold=%d/%d train<=%s val=%s F1=%.4f "
-            "precision=%.4f recall=%.4f AP=%.4f ROC_AUC=%s threshold=%.6f",
+            "precision=%.4f recall=%.4f AP=%.4f ROC_AUC=%s threshold=%.6f "
+            "operating_mode=%s operating_F1=%.4f",
             fold_idx,
             len(folds),
             fold["train_max_month"],
             ",".join(str(m) for m in fold["validation_months"]),
-            float(report["f1@main_thr"]),
-            float(report["precision@main_thr"]),
-            float(report["recall@main_thr"]),
+            float(report.get("f1@operating", report["f1@main_thr"])),
+            float(report.get("precision@operating", report["precision@main_thr"])),
+            float(report.get("recall@operating", report["recall@main_thr"])),
             float(report["AP_val"]),
             f"{report.get('ROC_AUC_val'):.4f}" if report.get("ROC_AUC_val") is not None else "n/a",
             float(report["thr_main_opt"]),
+            report.get("operating_mode"),
+            float(report.get("f1@operating", report["f1@main_thr"])),
         )
 
     if not fold_reports:
@@ -1253,12 +1383,12 @@ def evaluate_existing_bundle_on_current_folds(
     out = {
         "folds": len(fold_reports),
         "total_folds": len(folds),
-        "F1_val": float(np.mean([r["f1@main_thr"] for r in fold_reports])),
-        "precision": float(np.mean([r["precision@main_thr"] for r in fold_reports])),
-        "recall": float(np.mean([r["recall@main_thr"] for r in fold_reports])),
+        "F1_val": float(np.mean([r.get("f1@operating", r["f1@main_thr"]) for r in fold_reports])),
+        "precision": float(np.mean([r.get("precision@operating", r["precision@main_thr"]) for r in fold_reports])),
+        "recall": float(np.mean([r.get("recall@operating", r["recall@main_thr"]) for r in fold_reports])),
         "AP_val": float(np.mean([r["AP_val"] for r in fold_reports])),
         "ROC_AUC_val": float(np.mean(roc_values)) if roc_values else 0.0,
-        "latest_F1": float(fold_reports[-1]["f1@main_thr"]),
+        "latest_F1": float(fold_reports[-1].get("f1@operating", fold_reports[-1]["f1@main_thr"])),
         "latest_AP": float(fold_reports[-1]["AP_val"]),
         "latest_ROC_AUC": fold_reports[-1].get("ROC_AUC_val"),
         "fold_reports": fold_reports,
@@ -1470,12 +1600,19 @@ def run_main_variant(
         selection_outputs = fold_outputs
     fold_reports = [out["report"] for out in selection_outputs]
     all_fold_reports = [out["report"] for out in fold_outputs]
-    f1_mean = float(np.mean([r["f1@main_thr"] for r in fold_reports]))
+    main_f1_mean = float(np.mean([r["f1@main_thr"] for r in fold_reports]))
+    main_precision_mean = float(np.mean([r["precision@main_thr"] for r in fold_reports]))
+    main_recall_mean = float(np.mean([r["recall@main_thr"] for r in fold_reports]))
+    f1_mean = float(np.mean([r.get("f1@operating", r["f1@main_thr"]) for r in fold_reports]))
     ap_mean = float(np.mean([r["AP_val"] for r in fold_reports]))
     roc_values = [r.get("ROC_AUC_val") for r in fold_reports if r.get("ROC_AUC_val") is not None]
     roc_mean = float(np.mean(roc_values)) if roc_values else 0.0
-    precision_mean = float(np.mean([r["precision@main_thr"] for r in fold_reports]))
-    recall_mean = float(np.mean([r["recall@main_thr"] for r in fold_reports]))
+    precision_mean = float(np.mean([r.get("precision@operating", r["precision@main_thr"]) for r in fold_reports]))
+    recall_mean = float(np.mean([r.get("recall@operating", r["recall@main_thr"]) for r in fold_reports]))
+    pred_pos_rate_mean = float(np.mean([
+        r.get("predicted_positive_rate@operating", r.get("predicted_positive_rate@main_thr", 0.0))
+        for r in fold_reports
+    ]))
     val_prevalence_mean = float(np.mean([r["val_prevalence"] for r in fold_reports]))
 
     report = dict(latest["report"])
@@ -1488,18 +1625,31 @@ def run_main_variant(
     report["walk_forward_reports"] = fold_reports
     report["walk_forward_all_reports"] = all_fold_reports
     report["f1@main_thr_latest"] = float(latest["report"]["f1@main_thr"])
+    report["f1@operating_latest"] = float(latest["report"].get("f1@operating", latest["report"]["f1@main_thr"]))
     report["AP_val_latest"] = float(latest["report"]["AP_val"])
     report["ROC_AUC_val_latest"] = latest["report"].get("ROC_AUC_val")
     report["precision@main_thr_latest"] = float(latest["report"]["precision@main_thr"])
     report["recall@main_thr_latest"] = float(latest["report"]["recall@main_thr"])
+    report["precision@operating_latest"] = float(latest["report"].get("precision@operating", latest["report"]["precision@main_thr"]))
+    report["recall@operating_latest"] = float(latest["report"].get("recall@operating", latest["report"]["recall@main_thr"]))
+    report["predicted_positive_rate@operating_latest"] = float(
+        latest["report"].get(
+            "predicted_positive_rate@operating",
+            latest["report"].get("predicted_positive_rate@main_thr", 0.0),
+        )
+    )
     report["val_prevalence_latest"] = float(latest["report"]["val_prevalence"])
     if tuning_meta is not None:
         report["optuna_tuning"] = tuning_meta
-    report["f1@main_thr"] = f1_mean
     report["AP_val"] = ap_mean
     report["ROC_AUC_val"] = roc_mean
-    report["precision@main_thr"] = precision_mean
-    report["recall@main_thr"] = recall_mean
+    report["precision@main_thr"] = main_precision_mean
+    report["recall@main_thr"] = main_recall_mean
+    report["f1@main_thr"] = main_f1_mean
+    report["precision@operating"] = precision_mean
+    report["recall@operating"] = recall_mean
+    report["f1@operating"] = f1_mean
+    report["predicted_positive_rate@operating"] = pred_pos_rate_mean
     report["val_prevalence"] = val_prevalence_mean
     report["val_month"] = int(latest["report"]["val_month"])
     if final_holdout_fold is not None:
@@ -1523,10 +1673,23 @@ def run_main_variant(
                 "search_opt_threshold": float(holdout_report.get("thr_main_search_opt", holdout_report["thr_main_opt"])),
                 "threshold_source": holdout_report.get("threshold_source"),
                 "val_prevalence": float(holdout_report["val_prevalence"]),
+                "predicted_positive_rate": float(holdout_report["predicted_positive_rate@main_thr"]),
+                "operating_mode": holdout_report.get("operating_mode"),
+                "operating_f1": float(holdout_report.get("f1@operating", holdout_report["f1@main_thr"])),
+                "operating_precision": float(holdout_report.get("precision@operating", holdout_report["precision@main_thr"])),
+                "operating_recall": float(holdout_report.get("recall@operating", holdout_report["recall@main_thr"])),
+                "operating_threshold": float(holdout_report.get("operating_threshold", holdout_report["thr_main_opt"])),
+                "operating_predicted_positive_rate": float(
+                    holdout_report.get(
+                        "predicted_positive_rate@operating",
+                        holdout_report["predicted_positive_rate@main_thr"],
+                    )
+                ),
             })
             logger.info(
                 "[FINAL HOLDOUT] K=%d use_static=%s val=%s F1=%.4f precision=%.4f "
-                "recall=%.4f AP=%.4f ROC_AUC=%s threshold=%.6f threshold_source=%s",
+                "recall=%.4f AP=%.4f ROC_AUC=%s threshold=%.6f predicted_positive_rate=%.2f%% "
+                "threshold_source=%s operating_mode=%s operating_F1=%.4f operating_predicted_positive_rate=%.2f%%",
                 cfg["best_k"],
                 use_static_flag,
                 ",".join(str(m) for m in final_holdout_fold["validation_months"]),
@@ -1536,22 +1699,74 @@ def run_main_variant(
                 float(holdout_report["AP_val"]),
                 f"{holdout_report.get('ROC_AUC_val'):.4f}" if holdout_report.get("ROC_AUC_val") is not None else "n/a",
                 float(holdout_report["thr_main_opt"]),
+                100.0 * float(holdout_report["predicted_positive_rate@main_thr"]),
                 holdout_report.get("threshold_source"),
+                holdout_report.get("operating_mode"),
+                float(holdout_report.get("f1@operating", holdout_report["f1@main_thr"])),
+                100.0 * float(
+                    holdout_report.get(
+                        "predicted_positive_rate@operating",
+                        holdout_report["predicted_positive_rate@main_thr"],
+                    )
+                ),
             )
+
+            if _env_bool("MAIN_XGB_REQUIRE_FINAL_HOLDOUT_QUALITY", True):
+                min_holdout_f1 = _env_float("MAIN_XGB_MIN_FINAL_HOLDOUT_F1", 0.01)
+                min_holdout_pred_pos_rate = _env_float(
+                    "MAIN_XGB_MIN_FINAL_HOLDOUT_PRED_POSITIVE_RATE",
+                    0.001,
+                )
+                holdout_f1 = float(holdout_report.get("f1@operating", holdout_report["f1@main_thr"]))
+                holdout_pred_pos_rate = float(
+                    holdout_report.get(
+                        "predicted_positive_rate@operating",
+                        holdout_report["predicted_positive_rate@main_thr"],
+                    )
+                )
+                holdout_failures = []
+                if holdout_f1 < min_holdout_f1:
+                    holdout_failures.append(
+                        f"final_holdout_F1={holdout_f1:.4f} < {min_holdout_f1:.4f}"
+                    )
+                if holdout_pred_pos_rate < min_holdout_pred_pos_rate:
+                    holdout_failures.append(
+                        "final_holdout_predicted_positive_rate="
+                        f"{holdout_pred_pos_rate:.4%} < {min_holdout_pred_pos_rate:.4%}"
+                    )
+                if holdout_failures:
+                    warning = "; ".join(holdout_failures)
+                    report["guardrail_warning"] = warning
+                    logger.warning(
+                        "[MAIN WALK FORWARD REJECT] K=%d use_static=%s rejected variant: %s",
+                        cfg["best_k"],
+                        use_static_flag,
+                        warning,
+                    )
+                    return {
+                        "use_static": bool(use_static_flag),
+                        "guardrail_warning": warning,
+                        "F1_val": 0.0,
+                        "AP_val": 0.0,
+                        "ROC_AUC_val": 0.0,
+                        "report": report,
+                    }
 
     logger.info(
         "[MAIN WALK FORWARD METRICS] K=%d use_static=%s selection_folds=%d total_folds=%d "
-        "F1_mean=%.4f precision_mean=%.4f recall_mean=%.4f AP_mean=%.4f ROC_AUC_mean=%.4f latest_F1=%.4f",
+        "operating_mode=%s operating_F1_mean=%.4f operating_precision_mean=%.4f "
+        "operating_recall_mean=%.4f AP_mean=%.4f ROC_AUC_mean=%.4f latest_operating_F1=%.4f",
         cfg["best_k"],
         use_static_flag,
         len(selection_outputs),
         len(fold_outputs),
+        report.get("operating_mode"),
         f1_mean,
         precision_mean,
         recall_mean,
         ap_mean,
         roc_mean,
-        float(latest["report"]["f1@main_thr"]),
+        float(latest["report"].get("f1@operating", latest["report"]["f1@main_thr"])),
     )
 
     # baseline profile for monitoring drift (built on all historical labeled rows)

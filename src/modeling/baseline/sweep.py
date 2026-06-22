@@ -5,7 +5,7 @@ import os
 import pandas as pd
 from sqlalchemy.engine import Engine
 
-from preprocess.feature_tables import list_k_available, max_window_end_for_k
+from preprocess.feature_tables import list_k_available
 from infra.yymm import shift_yymm
 from preprocess.static_features import load_cus_lifetime_snapshots
 from preprocess.dataset import build_dataset_for_k, preflight_purged_train_val_for_k
@@ -28,7 +28,10 @@ def _env_int(name: str, default: int) -> int:
 
 def _config_from_ablation_row(engine: Engine, row: pd.Series, horizon: int) -> dict:
     best_k = int(row["K"])
-    as_of_month = int(max_window_end_for_k(engine, best_k))
+    # Candidate metadata must describe the supervised evaluation window, not the
+    # newest scoring-only feature table. The latest feature table can be the
+    # current month and may not be labelable yet.
+    as_of_month = int(row["val_month"])
     target_month = int(shift_yymm(str(as_of_month), int(horizon)))
     return {
         "as_of_month": as_of_month,

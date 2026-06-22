@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import os
 
 import pandas as pd
 import numpy as np
@@ -15,6 +16,65 @@ from main_model.xgb_utils import (
     date_col_to_ordinal,
     is_date_like_col,
 )
+
+
+def _env_first(*names: str) -> str | None:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None and str(raw).strip() != "":
+            return str(raw).strip()
+    return None
+
+
+def _operating_mode(cfg: dict) -> str:
+    raw = (
+        _env_first("CHURN_OPERATING_MODE", "MODEL_OPERATING_MODE")
+        or cfg.get("operating_mode")
+        or "percentile"
+    )
+    value = str(raw).strip().lower().replace("-", "_")
+    if value in {"probability", "probability_threshold", "proba", "proba_threshold"}:
+        return "probability"
+    if value in {"percentile", "top_percentile", "rank", "top_tail"}:
+        return "percentile"
+    print(f"WARNING: Invalid operating mode {raw!r}. Falling back to percentile.")
+    return "percentile"
+
+
+def _percentile_cutoff(cfg: dict, risk_threshold: float | None) -> float:
+    raw = (
+        _env_first("CHURN_OPERATING_RISK_THRESHOLD_PCT", "MODEL_OPERATING_RISK_THRESHOLD_PCT")
+        or cfg.get("operating_risk_threshold_pct")
+        or risk_threshold
+        or 90.0
+    )
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        print(f"WARNING: Invalid operating percentile cutoff {raw!r}. Using 90.")
+        value = 90.0
+    if value <= 1.0:
+        value *= 100.0
+    return min(max(value, 0.0), 100.0)
+
+
+def _probability_threshold(cfg: dict, risk_threshold: float | None) -> float:
+    raw = (
+        _env_first("CHURN_OPERATING_PROBABILITY_THRESHOLD", "MODEL_OPERATING_PROBABILITY_THRESHOLD")
+        or cfg.get("operating_probability_threshold")
+    )
+    if raw is None and risk_threshold is not None and float(risk_threshold) <= 1.0:
+        raw = risk_threshold
+    if raw is None:
+        raw = cfg.get("best_threshold", cfg.get("main_threshold", 0.5))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        print(f"WARNING: Invalid operating probability threshold {raw!r}. Using 0.5.")
+        value = 0.5
+    if value > 1.0 and value <= 100.0:
+        value = value / 100.0
+    return min(max(value, 0.0), 1.0)
 
 
 def make_predictions(
@@ -104,14 +164,21 @@ def make_predictions(
     df_out["model_probability_pct"] = (prob * 100).round(6)
     df_out["churn_rate"] = df_out["model_probability_pct"].round(2)
 
-    # `risk_percentile_pct` is the rank of the model probability within the
-    # scored active population. It drives operational top-tail selection, while
-    # `churn_rate` remains the raw model probability percentage for CRM output.
-    thr = float(risk_threshold) if risk_threshold is not None else cfg.get("main_threshold", cfg.get("best_threshold", 0.5))
+    # Keep both raw probability and population percentile. The operating mode
+    # decides which one turns into the CRM risk flag.
     df_out["risk_score"] = df_out["churn_rate"]
-    thr_pct = float(thr) * 100.0 if float(thr) <= 1.0 else float(thr)
     df_out["risk_percentile_pct"] = _score_percentile_pct(df_out["churn_probability"])
-    df_out["risk_flag"] = (df_out["risk_percentile_pct"] >= thr_pct).astype(int)
+    operating_mode = _operating_mode(cfg)
+    if operating_mode == "probability":
+        proba_threshold = _probability_threshold(cfg, risk_threshold)
+        df_out["risk_flag"] = (df_out["churn_probability"] >= proba_threshold).astype(int)
+        df_out["operating_decision_mode"] = "probability"
+        df_out["operating_threshold_value"] = proba_threshold
+    else:
+        percentile_cutoff = _percentile_cutoff(cfg, risk_threshold)
+        df_out["risk_flag"] = (df_out["risk_percentile_pct"] >= percentile_cutoff).astype(int)
+        df_out["operating_decision_mode"] = "percentile"
+        df_out["operating_threshold_value"] = percentile_cutoff
 
     return df_out
 
@@ -133,6 +200,10 @@ def filter_risk_predictions(
     """
     if df_predictions.empty:
         return df_predictions.copy()
+
+    if "risk_flag" in df_predictions.columns:
+        flags = pd.to_numeric(df_predictions["risk_flag"], errors="coerce").fillna(0)
+        return df_predictions[flags.astype(int) == 1].copy()
 
     threshold = float(risk_threshold)
     if "risk_percentile_pct" not in df_predictions.columns:

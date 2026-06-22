@@ -42,6 +42,94 @@ def _bundle_lifecycle(cfg: dict | None) -> str:
     return str(value).upper()
 
 
+def _supervised_as_of_from_report(report: dict | None) -> int | None:
+    """Return the latest labeled/evaluated origin represented in a model report."""
+    if not report:
+        return None
+
+    candidates: list[int] = []
+
+    def add_yymm(value) -> None:
+        if value is None or pd.isna(value):
+            return
+        try:
+            candidates.append(int(value))
+        except (TypeError, ValueError):
+            return
+
+    add_yymm(report.get("val_month"))
+
+    final_holdout = report.get("final_holdout") or {}
+    for month in final_holdout.get("validation_months") or []:
+        add_yymm(month)
+
+    for key in ("walk_forward_all_reports", "walk_forward_reports"):
+        for fold_report in report.get(key) or []:
+            add_yymm((fold_report or {}).get("val_month"))
+
+    for rejected in report.get("rejected_folds") or report.get("walk_forward_rejected_folds") or []:
+        for month in (rejected or {}).get("validation_months") or []:
+            add_yymm(month)
+
+    return max(candidates) if candidates else None
+
+
+def _env_first(*names: str) -> str | None:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None and str(raw).strip() != "":
+            return str(raw).strip()
+    return None
+
+
+def _normalize_operating_mode(value) -> str:
+    raw = str(value or "percentile").strip().lower().replace("-", "_")
+    if raw in {"probability", "probability_threshold", "proba", "proba_threshold"}:
+        return "probability"
+    if raw in {"percentile", "top_percentile", "rank", "top_tail"}:
+        return "percentile"
+    logger.warning("Invalid operating mode %r. Falling back to percentile.", value)
+    return "percentile"
+
+
+def _apply_operating_policy(cfg: dict, *, risk_threshold_pct: float) -> dict:
+    """Persist the same decision policy used by production scoring into model cfg."""
+    out = dict(cfg)
+    mode = _normalize_operating_mode(
+        _env_first("CHURN_OPERATING_MODE", "MODEL_OPERATING_MODE")
+        or out.get("operating_mode")
+        or "percentile"
+    )
+    out["operating_mode"] = mode
+
+    risk_cutoff_raw = (
+        _env_first("CHURN_OPERATING_RISK_THRESHOLD_PCT", "MODEL_OPERATING_RISK_THRESHOLD_PCT")
+        or risk_threshold_pct
+    )
+    try:
+        out["operating_risk_threshold_pct"] = float(risk_cutoff_raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid operating risk threshold %r. Using %.2f.", risk_cutoff_raw, risk_threshold_pct)
+        out["operating_risk_threshold_pct"] = float(risk_threshold_pct)
+
+    proba_raw = _env_first("CHURN_OPERATING_PROBABILITY_THRESHOLD", "MODEL_OPERATING_PROBABILITY_THRESHOLD")
+    if proba_raw is not None:
+        try:
+            proba = float(proba_raw)
+            if proba > 1.0 and proba <= 100.0:
+                proba = proba / 100.0
+            out["operating_probability_threshold"] = min(max(proba, 0.0), 1.0)
+        except ValueError:
+            logger.warning("Invalid operating probability threshold %r. Ignoring.", proba_raw)
+
+    if "xgb_candidate_configs" in out:
+        out["xgb_candidate_configs"] = [
+            _apply_operating_policy(dict(candidate), risk_threshold_pct=float(risk_threshold_pct))
+            for candidate in out.get("xgb_candidate_configs") or []
+        ]
+    return out
+
+
 def retrain_due_reason(
     engine: Engine,
     *,
@@ -302,7 +390,10 @@ def _train_main_inline(
             rejected_report = dict(best_rejected.get("report") or {})
             rejected_cfg["use_static"] = bool(best_rejected.get("use_static", rejected_cfg.get("use_static", False)))
             rejected_cfg["best_k"] = int(rejected_report.get("K", rejected_cfg.get("best_k")))
-            rejected_cfg["as_of_month"] = int(max_window_end_for_k(engine, int(rejected_cfg["best_k"])))
+            rejected_as_of = _supervised_as_of_from_report(rejected_report)
+            if rejected_as_of is None:
+                rejected_as_of = int(max_window_end_for_k(engine, int(rejected_cfg["best_k"])))
+            rejected_cfg["as_of_month"] = int(rejected_as_of)
             rejected_cfg["target_month"] = int(shift_yymm(str(rejected_cfg["as_of_month"]), int(horizon)))
             rejected_cfg["metric_f1_val"] = 0.0
             rejected_cfg["metric_pr_auc_val"] = 0.0
@@ -395,13 +486,21 @@ def _train_main_inline(
     cfg = dict(best.get("candidate_cfg") or cfg)
     cfg["use_static"] = bool(best["use_static"])
     cfg["best_k"] = int(best["report"]["K"])
-    cfg["as_of_month"] = int(max_window_end_for_k(engine, int(cfg["best_k"])))
+    supervised_as_of = _supervised_as_of_from_report(best["report"])
+    if supervised_as_of is None:
+        supervised_as_of = int(max_window_end_for_k(engine, int(cfg["best_k"])))
+    cfg["as_of_month"] = int(supervised_as_of)
     cfg["target_month"] = int(shift_yymm(str(cfg["as_of_month"]), int(horizon)))
-    cfg["metric_f1_val"] = float(best["report"]["f1@main_thr"])
+    cfg["metric_f1_val"] = float(best["report"].get("f1@operating", best["report"]["f1@main_thr"]))
     cfg["metric_pr_auc_val"] = float(best["report"]["AP_val"])
     cfg["metric_roc_auc_val"] = best["report"].get("ROC_AUC_val")
     cfg["metric_val_prevalence"] = float(best["report"]["val_prevalence"])
     cfg["best_threshold"] = float(best["report"]["thr_main_opt"])
+    cfg["operating_mode"] = best["report"].get("operating_mode", cfg.get("operating_mode", "percentile"))
+    if best["report"].get("operating_percentile_cutoff") is not None:
+        cfg["operating_risk_threshold_pct"] = float(best["report"]["operating_percentile_cutoff"])
+    if best["report"].get("operating_mode") == "probability":
+        cfg["operating_probability_threshold"] = float(best["report"]["operating_threshold"])
     cfg["main_threshold_min"] = float(best["report"].get("thr_main_min", cfg.get("main_threshold_min", 0.005)))
     cfg["notes"] = (
         f"{cfg.get('notes') or ''}; "
@@ -416,30 +515,32 @@ def _train_main_inline(
     final_holdout_ap = final_holdout.get("ap")
     final_holdout_roc = final_holdout.get("roc_auc")
     logger.info(
-        "[XGB SELECTED] K=%d use_static=%s F1=%.4f precision=%.4f recall=%.4f "
-        "AP=%.4f ROC_AUC=%s threshold=%.6f latest_F1=%.4f",
+        "[XGB SELECTED] K=%d use_static=%s operating_mode=%s operating_F1=%.4f "
+        "operating_precision=%.4f operating_recall=%.4f AP=%.4f ROC_AUC=%s "
+        "threshold=%.6f latest_operating_F1=%.4f",
         int(cfg["best_k"]),
         bool(cfg["use_static"]),
-        float(best["report"]["f1@main_thr"]),
-        float(best["report"]["precision@main_thr"]),
-        float(best["report"]["recall@main_thr"]),
+        best["report"].get("operating_mode"),
+        float(best["report"].get("f1@operating", best["report"]["f1@main_thr"])),
+        float(best["report"].get("precision@operating", best["report"]["precision@main_thr"])),
+        float(best["report"].get("recall@operating", best["report"]["recall@main_thr"])),
         float(best["report"]["AP_val"]),
         f"{best['report'].get('ROC_AUC_val'):.4f}" if best["report"].get("ROC_AUC_val") is not None else "n/a",
         float(best["report"]["thr_main_opt"]),
-        float(best["report"].get("f1@main_thr_latest", best["report"]["f1@main_thr"])),
+        float(best["report"].get("f1@operating_latest", best["report"].get("f1@main_thr_latest", best["report"]["f1@main_thr"]))),
     )
     logger.info(
         "[XGB SELECTED DETAIL] selection_folds=%d total_folds=%d holdout_excluded_from_selection=%s "
-        "latest_F1=%.4f latest_AP=%.4f latest_ROC_AUC=%s predicted_positive_rate=%.2f%% final_holdout_status=%s "
+        "latest_operating_F1=%.4f latest_AP=%.4f latest_ROC_AUC=%s operating_predicted_positive_rate=%.2f%% final_holdout_status=%s "
         "final_holdout_F1=%s final_holdout_AP=%s final_holdout_ROC_AUC=%s threshold_source=%s",
         int(best["report"].get("walk_forward_folds", 0)),
         int(best["report"].get("walk_forward_total_folds", 0)),
         bool(best["report"].get("walk_forward_holdout_excluded_from_selection", False)),
-        float(best["report"].get("f1@main_thr_latest", best["report"]["f1@main_thr"])),
+        float(best["report"].get("f1@operating_latest", best["report"].get("f1@main_thr_latest", best["report"]["f1@main_thr"]))),
         float(best["report"].get("AP_val_latest", best["report"]["AP_val"])),
         f"{best['report'].get('ROC_AUC_val_latest'):.4f}"
         if best["report"].get("ROC_AUC_val_latest") is not None else "n/a",
-        100.0 * float(best["report"].get("predicted_positive_rate@main_thr", 0.0)),
+        100.0 * float(best["report"].get("predicted_positive_rate@operating", best["report"].get("predicted_positive_rate@main_thr", 0.0))),
         final_holdout_status,
         f"{float(final_holdout_f1):.4f}" if final_holdout_f1 is not None else "n/a",
         f"{float(final_holdout_ap):.4f}" if final_holdout_ap is not None else "n/a",
@@ -540,6 +641,7 @@ def run_monthly_pipeline(
     did_retrain = False
     did_score = False
     t_current = None
+    t_scoring = None
     cand_cfg = None
     accepted = None
 
@@ -551,9 +653,26 @@ def run_monthly_pipeline(
             limit_rows_each=limit_rows_each,
             k_min=int(k_min),
         )
+        cand_cfg = _apply_operating_policy(cand_cfg, risk_threshold_pct=float(risk_threshold_pct))
         cand_f1 = float(cand_cfg["metric_f1_val"])
         cand_k = int(cand_cfg["best_k"])
         t_current = int(cand_cfg["as_of_month"])
+        try:
+            latest_scoring_month = int(max_window_end_for_k(engine, cand_k))
+            logger.info(
+                "[WINDOW POLICY] supervised_as_of=%s latest_scoring_window=%s K=%d "
+                "(current scoring month is excluded from train/valid/test)",
+                t_current,
+                latest_scoring_month,
+                cand_k,
+            )
+        except Exception:
+            logger.info(
+                "[WINDOW POLICY] supervised_as_of=%s K=%d "
+                "(current scoring month is excluded from train/valid/test)",
+                t_current,
+                cand_k,
+            )
 
         # Phát hiện lần chạy đầu tiên (chưa có bất kỳ accepted config nào trong DB)
         is_first_run = (prev_cfg is None)
@@ -620,9 +739,13 @@ def run_monthly_pipeline(
                 try:
                     prev_model, prev_meta = load_bundle(bundle_dir)
                     prev_df_static = load_cus_lifetime_snapshots(engine)
+                    prev_eval_cfg = _apply_operating_policy(
+                        dict(prev_cfg),
+                        risk_threshold_pct=float(risk_threshold_pct),
+                    )
                     prev_current_eval = evaluate_existing_bundle_on_current_folds(
                         engine,
-                        dict(prev_cfg),
+                        prev_eval_cfg,
                         prev_df_static,
                         prev_model,
                         prev_meta or {},
@@ -718,7 +841,14 @@ def run_monthly_pipeline(
 
         # Choose K/month for serving (updated again after accepted XGBoost training)
         best_k_for_scoring = int(cand_k) if accepted or prev_k is None else int(prev_k)
-        t_current = int(max_window_end_for_k(engine, best_k_for_scoring))
+        t_scoring = int(max_window_end_for_k(engine, best_k_for_scoring))
+        logger.info(
+            "[WINDOW POLICY] supervised_window=%s scoring_window=%s scoring_k=%d do_scoring=%s",
+            t_current,
+            t_scoring,
+            best_k_for_scoring,
+            bool(do_scoring),
+        )
 
         # 3) Promote only if accepted
         bundle_dir = Path(bundle_dir)
@@ -750,6 +880,7 @@ def run_monthly_pipeline(
             cand_k = int(cand_cfg["best_k"])
             t_current = int(cand_cfg["as_of_month"])
             did_retrain = True
+            t_scoring = int(max_window_end_for_k(engine, cand_k))
 
         # 4) Monthly scoring — chỉ chạy nếu có accepted config trong DB
         # (trường hợp bị block ngay lần đầu tiên: chưa có model nào được accepted)
@@ -771,7 +902,7 @@ def run_monthly_pipeline(
                 horizon=int(horizon),
                 bundle_dir=bundle_dir,
                 risk_threshold=float(risk_threshold_pct),
-                t_current=int(t_current),
+                t_current=int(t_scoring),
                 limit_rows=None,
                 make_dossier=True,
             )
@@ -787,7 +918,7 @@ def run_monthly_pipeline(
             risk_cnt = int(res.get("risk_cnt") or 0)
             upsert_score_drift(
                 engine,
-                window_end=int(t_current),
+                window_end=int(t_scoring),
                 horizon=int(horizon),
                 best_k=int(load_latest_accepted_best_config(engine, horizon=int(horizon)).get("best_k", cand_k)),
                 active_cnt=active_cnt,
@@ -810,7 +941,7 @@ def run_monthly_pipeline(
                         "p50": score_stats.get("p50"),
                         "p90": score_stats.get("p90"),
                         "p99": score_stats.get("p99"),
-                        "w": int(t_current),
+                        "w": int(t_scoring),
                         "h": int(horizon),
                     })
 
@@ -822,9 +953,9 @@ def run_monthly_pipeline(
                     if prof:
                         best_k_used = int(load_latest_accepted_best_config(engine, horizon=int(horizon)).get("best_k", cand_k))
                         from preprocess.dataset import load_scoring_table_for_k
-                        df_cur, _, _ = load_scoring_table_for_k(engine, k=best_k_used, window_end=int(t_current))
+                        df_cur, _, _ = load_scoring_table_for_k(engine, k=best_k_used, window_end=int(t_scoring))
                         drift_df = compute_feature_drift(df_cur, prof)
-                        upsert_feature_drift(engine, window_end=int(t_current), horizon=int(horizon), best_k=best_k_used, drift_df=drift_df)
+                        upsert_feature_drift(engine, window_end=int(t_scoring), horizon=int(horizon), best_k=best_k_used, drift_df=drift_df)
                 except Exception:
                     # do not fail whole pipeline
                     pass
@@ -841,7 +972,7 @@ def run_monthly_pipeline(
             engine,
             run_id=run_id,
             status="SUCCESS",
-            window_end=int(t_current),
+            window_end=int(t_scoring if did_score and t_scoring is not None else t_current),
             cand_best_k=int(cand_k),
             cand_best_f1=float(cand_f1),
             cand_is_accepted=bool(accepted),
@@ -859,7 +990,9 @@ def run_monthly_pipeline(
 
         return {
             "run_id": run_id,
-            "window_end": int(t_current),
+            "window_end": int(t_scoring if did_score and t_scoring is not None else t_current),
+            "supervised_window_end": int(t_current),
+            "scoring_window_end": int(t_scoring) if t_scoring is not None else None,
             "candidate": cand_cfg,
             "accepted": bool(accepted),
             "did_retrain": bool(did_retrain),

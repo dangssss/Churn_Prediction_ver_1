@@ -51,6 +51,9 @@ def run_export_risk(
         raise ValueError("bundle_path is required (folder contains model.joblib + metadata.json)")
     bundle_path = Path(bundle_path)
     model, metadata = load_bundle(bundle_path)
+    bundle_cfg = (metadata or {}).get("cfg") or {}
+    if bundle_cfg:
+        cfg.update({k: v for k, v in bundle_cfg.items() if v is not None})
     print(f"? Loaded model from {bundle_path}")
     bundle_lifecycle = str(
         (metadata or {}).get("bundle_lifecycle")
@@ -177,12 +180,27 @@ def run_export_risk(
     }
     threshold_pct = float(risk_threshold) / 100.0
     score_cutoff = float(np.quantile(scores, threshold_pct)) if scores.size else None
+    operating_mode = (
+        str(df_pred["operating_decision_mode"].iloc[0])
+        if "operating_decision_mode" in df_pred.columns and not df_pred.empty
+        else "percentile"
+    )
+    operating_threshold = (
+        float(df_pred["operating_threshold_value"].iloc[0])
+        if "operating_threshold_value" in df_pred.columns and not df_pred.empty
+        else float(risk_threshold)
+    )
+    table_threshold = (
+        operating_threshold * 100.0
+        if operating_mode == "probability" and operating_threshold <= 1.0
+        else float(risk_threshold)
+    )
 
     # [6/6] Insert to risk table
     print("\n[6/6] Insert to risk table...")
-    table_name = ensure_risk_table_schema(engine, risk_threshold=risk_threshold)
+    table_name = ensure_risk_table_schema(engine, risk_threshold=table_threshold)
     num_customers = insert_predictions_to_risk_table(
-        engine, df_pred, risk_threshold=risk_threshold, horizon=horizon
+        engine, df_pred, risk_threshold=table_threshold, horizon=horizon
     )
 
     # Store the scoring origin and K used by scoring-only for drift monitoring.
@@ -204,7 +222,7 @@ def run_export_risk(
                 .sum()
             ),
             scores=scores,
-            risk_threshold_pct=int(risk_threshold),
+            risk_threshold_pct=int(table_threshold),
             risk_cnt=int(num_customers),
         )
     except Exception as score_drift_error:
@@ -212,7 +230,7 @@ def run_export_risk(
 
     # Training validation uses mixed actual/rule labels from recent origins.
 
-    df_ins = filter_risk_predictions(df_pred, risk_threshold)
+    df_ins = filter_risk_predictions(df_pred, table_threshold)
     num_with_reasons = int(df_ins['reason_1'].notna().sum()) if 'reason_1' in df_ins.columns else 0
 
     # CSV Export requirement
@@ -266,12 +284,15 @@ def run_export_risk(
     print("\nEXPORT RISK TABLE COMPLETED")
     print(f"Table:              data_static.{table_name}")
     print(f"Month scored:       {month_used}")
-    print(f"Risk threshold:     score percentile >= {risk_threshold}")
+    if operating_mode == "probability":
+        print(f"Risk threshold:     churn probability >= {operating_threshold:.2%}")
+    else:
+        print(f"Risk threshold:     score percentile >= {operating_threshold:.2f}")
     print(f"Active customers:   {len(df_active)}")
     print(f"Inserted:           {num_customers}")
     print(f"With reasons:       {num_with_reasons}")
     print(f"Score stats:        p50={score_stats['p50']:.2%}, p90={score_stats['p90']:.2%}, p99={score_stats['p99']:.2%}")
-    if score_cutoff is not None:
+    if score_cutoff is not None and operating_mode != "probability":
         print(f"Score cutoff:       p{int(risk_threshold)}={score_cutoff:.2%}")
     print("="*70 + "\n")
 
