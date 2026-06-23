@@ -76,6 +76,7 @@ def fit_xgb_with_early_stopping(
     X_va,
     y_va,
     es_rounds: int,
+    sample_weight=None,
 ):
     """Compatible old/new xgboost early stopping usage."""
     fit_sig = inspect.signature(model.fit)
@@ -85,6 +86,8 @@ def fit_xgb_with_early_stopping(
         kwargs["eval_set"] = [(X_va, y_va)]
     if "verbose" in fit_sig.parameters:
         kwargs["verbose"] = False
+    if sample_weight is not None and "sample_weight" in fit_sig.parameters:
+        kwargs["sample_weight"] = sample_weight
     # Old versions: early_stopping_rounds is a fit kwarg
     if "early_stopping_rounds" in fit_sig.parameters:
         kwargs["early_stopping_rounds"] = int(es_rounds)

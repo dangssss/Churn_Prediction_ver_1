@@ -22,6 +22,11 @@ from preprocess.dataset import build_dataset_for_k, preflight_purged_train_val_f
 from preprocess.eligibility import filter_churn_eligible
 from preprocess.feature_columns import split_numeric_categorical_features
 from preprocess.static_features import attach_static
+from common.sample_weighting import (
+    build_label_sample_weights,
+    non_uncertain_label_mask,
+    sample_weight_summary,
+)
 from infra.yymm import shift_yymm
 from logging_config import get_logger
 
@@ -220,6 +225,8 @@ def eval_one_k_train_val(
         y_tr = df_tr[label_col].astype(int)
         X_va = df_va[num_cols + cat_cols]
         y_va = df_va[label_col].astype(int)
+        sample_weight_tr = build_label_sample_weights(df_tr, label_col=label_col)
+        weight_summary = sample_weight_summary(df_tr, label_col=label_col, weights=sample_weight_tr)
 
         n_pos = int((y_tr == 1).sum())
         n_neg = int((y_tr == 0).sum())
@@ -265,6 +272,21 @@ def eval_one_k_train_val(
             val_churn_ratio * 100,
             class_weight_reason,
         )
+        logger.info(
+            "[BASELINE SAMPLE WEIGHT] K=%d use_static=%s fold=%d/%d mean=%.4f min=%.4f max=%.4f "
+            "positive_rate=%.4f%% weighted_positive_rate=%.4f%% audit_only_rows=%d audit_weight_mean=%.4f",
+            k,
+            use_static,
+            fold_idx,
+            len(folds),
+            float(weight_summary["mean"]),
+            float(weight_summary["min"]),
+            float(weight_summary["max"]),
+            100.0 * float(weight_summary["positive_rate"]),
+            100.0 * float(weight_summary["weighted_positive_rate"]),
+            int(weight_summary["audit_only_rows"]),
+            float(weight_summary["audit_only_weight_mean"]),
+        )
 
         pre = make_preprocess(num_cols, cat_cols)
         clf = LogisticRegression(
@@ -276,7 +298,7 @@ def eval_one_k_train_val(
             C=0.1,
         )
         pipe = Pipeline(steps=[("pre", pre), ("clf", clf)])
-        pipe.fit(X_tr, y_tr)
+        pipe.fit(X_tr, y_tr, clf__sample_weight=sample_weight_tr.to_numpy(dtype=float))
 
         va_prob = pipe.predict_proba(X_va)[:, 1]
         pr_auc = average_precision_score(y_va, va_prob)
@@ -320,6 +342,41 @@ def eval_one_k_train_val(
             100.0 * predicted_positive_rate,
             float(dummy_f1),
         )
+        clean_mask = non_uncertain_label_mask(df_va).reindex(df_va.index, fill_value=True).to_numpy(dtype=bool)
+        clean_f1 = None
+        clean_precision = None
+        clean_recall = None
+        clean_pr_auc = None
+        clean_roc_auc = None
+        if int(clean_mask.sum()) > 0:
+            y_clean = y_va.to_numpy()[clean_mask]
+            p_clean = va_prob[clean_mask]
+            yhat_clean = (p_clean >= thr).astype(int)
+            clean_f1 = float(f1_score(y_clean, yhat_clean, zero_division=0))
+            clean_precision = float(precision_score(y_clean, yhat_clean, zero_division=0))
+            clean_recall = float(recall_score(y_clean, yhat_clean, zero_division=0))
+            clean_pr_auc = float(average_precision_score(y_clean, p_clean)) if np.any(y_clean == 1) else 0.0
+            clean_roc_auc = float(roc_auc_score(y_clean, p_clean)) if len(np.unique(y_clean)) == 2 else None
+            logger.info(
+                "[CLASSIFICATION METRICS CLEAN] K=%d use_static=%s fold=%d/%d val=%s "
+                "rows=%d dropped_audit_only=%d F1=%.4f precision=%.4f recall=%.4f "
+                "PR_AUC=%.4f ROC_AUC=%s prevalence=%.4f%% threshold=%.6f predicted_positive_rate=%.4f%%",
+                k,
+                use_static,
+                fold_idx,
+                len(folds),
+                val_month,
+                int(clean_mask.sum()),
+                int(len(clean_mask) - clean_mask.sum()),
+                clean_f1,
+                clean_precision,
+                clean_recall,
+                clean_pr_auc,
+                f"{clean_roc_auc:.4f}" if clean_roc_auc is not None else "n/a",
+                100.0 * float(np.mean(y_clean)),
+                float(thr),
+                100.0 * float(np.mean(yhat_clean == 1)),
+            )
         fold_reports.append({
             "val_month": val_month,
             "spw_used": float(class_weight_used.get(1, 1.0)),
@@ -334,6 +391,14 @@ def eval_one_k_train_val(
             "precision": precision_val,
             "recall": recall_val,
             "f1": f1_val,
+            "clean_precision": clean_precision,
+            "clean_recall": clean_recall,
+            "clean_f1": clean_f1,
+            "clean_PR_AUC_val": clean_pr_auc,
+            "clean_ROC_AUC_val": clean_roc_auc,
+            "sample_weight_mean": float(weight_summary["mean"]),
+            "weighted_positive_rate_train": float(weight_summary["weighted_positive_rate"]),
+            "audit_only_rows_train": int(weight_summary["audit_only_rows"]),
             "degenerate": is_degenerate,
         })
         last_class_weight_used = class_weight_used

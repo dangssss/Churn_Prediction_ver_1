@@ -21,6 +21,12 @@ from common.metrics import (
     best_threshold_by_f1_np,
     prf1_at_threshold,
 )
+from common.sample_weighting import (
+    build_label_sample_weights,
+    format_sample_weight_breakdown,
+    non_uncertain_label_mask,
+    sample_weight_summary,
+)
 from preprocess.feature_columns import feature_columns
 
 from monitoring.drift import compute_feature_profile
@@ -65,6 +71,46 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _cfg_bool_value(cfg: dict, key: str, env_name: str, default: bool) -> bool:
+    value = cfg.get(key)
+    if value is not None:
+        if isinstance(value, bool):
+            return bool(value)
+        return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+    return _env_bool(env_name, default)
+
+
+def _env_float_choices(name: str, default: str) -> list[float]:
+    raw = os.getenv(name)
+    text = str(raw if raw is not None and str(raw).strip() != "" else default)
+    choices: list[float] = []
+    for part in text.split(","):
+        try:
+            value = float(part.strip())
+        except ValueError:
+            continue
+        if np.isfinite(value) and value not in choices:
+            choices.append(value)
+    return choices or [float(x.strip()) for x in default.split(",") if x.strip()]
+
+
+def _env_bool_choices(name: str, default: str) -> list[bool]:
+    raw = os.getenv(name)
+    text = str(raw if raw is not None and str(raw).strip() != "" else default)
+    choices: list[bool] = []
+    for part in text.split(","):
+        value = part.strip().lower()
+        if value in {"1", "true", "yes", "y", "on"}:
+            parsed = True
+        elif value in {"0", "false", "no", "n", "off"}:
+            parsed = False
+        else:
+            continue
+        if parsed not in choices:
+            choices.append(parsed)
+    return choices or [False]
+
+
 def _score_stats(prob: np.ndarray) -> dict:
     if len(prob) == 0:
         return {}
@@ -80,6 +126,167 @@ def _score_stats(prob: np.ndarray) -> dict:
         "score_range": float(np.max(prob) - np.min(prob)),
         "score_unique_rounded_6": int(len(np.unique(np.round(prob, 6)))),
     }
+
+
+def _sample_weight_config_for_report(cfg: dict) -> dict[str, Any]:
+    return {
+        "audit_only": _cfg_float(
+            cfg,
+            "churn_label_audit_only_sample_weight",
+            "CHURN_LABEL_AUDIT_ONLY_SAMPLE_WEIGHT",
+            1.0,
+        ),
+        "rule_positive": _cfg_float(
+            cfg,
+            "churn_label_rule_positive_sample_weight",
+            "CHURN_LABEL_RULE_POSITIVE_SAMPLE_WEIGHT",
+            1.0,
+        ),
+        "rule_negative": _cfg_float(
+            cfg,
+            "churn_label_rule_negative_sample_weight",
+            "CHURN_LABEL_RULE_NEGATIVE_SAMPLE_WEIGHT",
+            1.0,
+        ),
+        "actual_positive": _cfg_float(
+            cfg,
+            "churn_label_actual_positive_sample_weight",
+            "CHURN_LABEL_ACTUAL_POSITIVE_SAMPLE_WEIGHT",
+            1.0,
+        ),
+        "actual_and_rule_positive": _cfg_float(
+            cfg,
+            "churn_label_actual_and_rule_positive_sample_weight",
+            "CHURN_LABEL_ACTUAL_AND_RULE_POSITIVE_SAMPLE_WEIGHT",
+            1.0,
+        ),
+        "recency_enabled": _cfg_bool_value(
+            cfg,
+            "churn_recency_weight_enabled",
+            "CHURN_RECENCY_WEIGHT_ENABLED",
+            False,
+        ),
+        "recency_halflife_months": _cfg_float(
+            cfg,
+            "churn_recency_weight_halflife_months",
+            "CHURN_RECENCY_WEIGHT_HALFLIFE_MONTHS",
+            6.0,
+        ),
+        "recency_min": _cfg_float(cfg, "churn_recency_weight_min", "CHURN_RECENCY_WEIGHT_MIN", 0.35),
+        "recency_max": _cfg_float(cfg, "churn_recency_weight_max", "CHURN_RECENCY_WEIGHT_MAX", 2.50),
+        "normalize": _cfg_bool_value(cfg, "churn_sample_weight_normalize", "CHURN_SAMPLE_WEIGHT_NORMALIZE", True),
+    }
+
+
+def _log_training_sample_weights(
+    prefix: str,
+    df: pd.DataFrame,
+    label_col: str,
+    weights: pd.Series,
+    *,
+    detailed: bool,
+    sample_weight_config: dict[str, Any] | None = None,
+) -> None:
+    summary = sample_weight_summary(df, label_col=label_col, weights=weights)
+    logger.info(
+        "[%s SAMPLE WEIGHT] rows=%d mean=%.4f min=%.4f max=%.4f "
+        "positive_rate=%.4f%% weighted_positive_rate=%.4f%% "
+        "pos_weight_mean=%.4f neg_weight_mean=%.4f audit_only_rows=%d audit_weight_mean=%.4f config=%s",
+        prefix,
+        int(summary["rows"]),
+        summary["mean"],
+        summary["min"],
+        summary["max"],
+        100.0 * summary["positive_rate"],
+        100.0 * summary["weighted_positive_rate"],
+        summary["positive_weight_mean"],
+        summary["negative_weight_mean"],
+        int(summary["audit_only_rows"]),
+        summary["audit_only_weight_mean"],
+        sample_weight_config or {},
+    )
+    if detailed:
+        breakdown = format_sample_weight_breakdown(df, label_col=label_col, weights=weights)
+        if breakdown:
+            logger.info("[%s SAMPLE WEIGHT DETAIL]\n%s", prefix, breakdown)
+
+
+def _log_clean_label_metrics(
+    prefix: str,
+    df_va: pd.DataFrame,
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    threshold: float,
+) -> None:
+    clean_mask = non_uncertain_label_mask(df_va).reindex(df_va.index, fill_value=True).to_numpy(dtype=bool)
+    clean_rows = int(clean_mask.sum())
+    dropped_rows = int(len(clean_mask) - clean_rows)
+    if clean_rows <= 0:
+        logger.info("[%s CLEAN LABEL METRICS] skipped: no non-audit validation rows", prefix)
+        return
+
+    y_clean = y_true[clean_mask].astype(int)
+    p_clean = y_prob[clean_mask]
+    precision, recall, f1 = prf1_at_threshold(y_clean, p_clean, threshold)
+    ap = average_precision_np(y_clean, p_clean) if np.any(y_clean == 1) else 0.0
+    roc_auc = float(roc_auc_score(y_clean, p_clean)) if len(np.unique(y_clean)) == 2 else None
+    logger.info(
+        "[%s CLEAN LABEL METRICS] rows=%d dropped_audit_only=%d F1=%.4f "
+        "precision=%.4f recall=%.4f AP=%.4f ROC_AUC=%s prevalence=%.4f%% "
+        "threshold=%.6f predicted_positive_rate=%.4f%%",
+        prefix,
+        clean_rows,
+        dropped_rows,
+        f1,
+        precision,
+        recall,
+        ap,
+        f"{roc_auc:.4f}" if roc_auc is not None else "n/a",
+        100.0 * float(y_clean.mean()) if clean_rows else 0.0,
+        threshold,
+        100.0 * float(np.mean(p_clean >= threshold)) if clean_rows else 0.0,
+    )
+
+
+def _log_validation_score_breakdown(
+    prefix: str,
+    df_va: pd.DataFrame,
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    threshold: float,
+    *,
+    group_col: str = "label_rule_reason",
+) -> None:
+    if group_col not in df_va.columns:
+        return
+    tmp = pd.DataFrame({
+        group_col: df_va[group_col].astype(str).fillna(""),
+        "label": y_true.astype(int),
+        "score": y_prob.astype(float),
+        "pred": (y_prob >= threshold).astype(int),
+    })
+    summary = (
+        tmp.groupby(group_col, dropna=False)
+        .agg(
+            rows=("label", "size"),
+            positives=("label", "sum"),
+            score_mean=("score", "mean"),
+            score_p90=("score", lambda s: float(np.quantile(s, 0.90))),
+            pred_pos_rate=("pred", "mean"),
+        )
+        .reset_index()
+        .sort_values(["rows", group_col], ascending=[False, True])
+    )
+    summary["positive_rate_pct"] = 100.0 * summary["positives"] / summary["rows"].clip(lower=1)
+    summary["pred_pos_rate_pct"] = 100.0 * summary["pred_pos_rate"]
+    for col in ("score_mean", "score_p90", "positive_rate_pct", "pred_pos_rate_pct"):
+        summary[col] = summary[col].astype(float).round(4)
+    logger.info(
+        "[%s SCORE BREAKDOWN BY %s]\n%s",
+        prefix,
+        group_col,
+        summary.head(12).to_string(index=False),
+    )
 
 
 def _top_percentile_metrics(y_true: np.ndarray, y_prob: np.ndarray, pct: float) -> dict[str, float]:
@@ -545,6 +752,18 @@ def train_main_xgb_option_B(
     X_va = df_va[feat_cols].copy()
     y_tr = df_tr[label_col].astype(int).to_numpy()
     y_va = df_va[label_col].astype(int).to_numpy()
+    sample_weight_tr = build_label_sample_weights(df_tr, label_col=label_col, cfg=cfg)
+    sample_weight_config = _sample_weight_config_for_report(cfg)
+    detailed_weight_log = cfg.get("hyperparameter_search_phase") is None
+    _log_training_sample_weights(
+        "MAIN XGB TRAIN",
+        df_tr,
+        label_col,
+        sample_weight_tr,
+        detailed=detailed_weight_log,
+        sample_weight_config=sample_weight_config,
+    )
+    weight_summary = sample_weight_summary(df_tr, label_col=label_col, weights=sample_weight_tr)
 
     baseline_spw = float(cfg["best_spw"])
     spw, weighted_spw_raw, spw_cap = _xgb_scale_pos_weight(y_tr, baseline_spw)
@@ -616,6 +835,7 @@ def train_main_xgb_option_B(
             X_va_s,
             y_va,
             es_rounds=es_rounds,
+            sample_weight=sample_weight_tr.to_numpy(dtype=float),
         )
 
         used_mode = "native_categorical"
@@ -635,6 +855,7 @@ def train_main_xgb_option_B(
             X_va_oh,
             y_va,
             es_rounds=es_rounds,
+            sample_weight=sample_weight_tr.to_numpy(dtype=float),
         )
 
         used_mode = "one_hot"
@@ -726,6 +947,9 @@ def train_main_xgb_option_B(
         tp / (tp + fp + 1e-9), tp / (tp + fn + 1e-9), f1_opt,
         100.0 * pred_pos_rate, 100.0 * float(y_va.mean()),
     )
+    _log_clean_label_metrics("MAIN", df_va, y_va, va_prob, float(thr_opt))
+    if detailed_weight_log:
+        _log_validation_score_breakdown("MAIN", df_va, y_va, va_prob, float(thr_opt))
 
     # Degenerate guard: predict-all-positive → vô dụng cho production
     if tn + fn == 0:
@@ -792,6 +1016,13 @@ def train_main_xgb_option_B(
         "spw_baseline": float(baseline_spw),
         "spw_weighted_raw": float(weighted_spw_raw),
         "spw_cap": float(spw_cap),
+        "sample_weight_mean": float(weight_summary["mean"]),
+        "sample_weight_min": float(weight_summary["min"]),
+        "sample_weight_max": float(weight_summary["max"]),
+        "weighted_positive_rate_train": float(weight_summary["weighted_positive_rate"]),
+        "audit_only_rows_train": int(weight_summary["audit_only_rows"]),
+        "audit_only_weight_mean_train": float(weight_summary["audit_only_weight_mean"]),
+        "sample_weight_config": sample_weight_config,
         "used_mode": used_mode,
 
         "AP_val": float(ap),
@@ -888,6 +1119,32 @@ def _wide_xgb_tuning_space() -> dict[str, dict[str, Any]]:
             0.5,
         )
         space["scale_pos_weight"] = {"type": "float", "low": 0.5, "high": max_spw, "log": True}
+    if _env_bool("MAIN_XGB_OPTUNA_TUNE_SAMPLE_WEIGHTS", True):
+        space["churn_label_audit_only_sample_weight"] = {
+            "type": "categorical",
+            "choices": _env_float_choices("MAIN_XGB_OPTUNA_AUDIT_WEIGHT_CHOICES", "0,0.1,0.2,0.5,1.0"),
+        }
+        space["churn_label_actual_positive_sample_weight"] = {
+            "type": "categorical",
+            "choices": _env_float_choices("MAIN_XGB_OPTUNA_ACTUAL_POSITIVE_WEIGHT_CHOICES", "1.0,1.25,1.5"),
+        }
+        space["churn_label_actual_and_rule_positive_sample_weight"] = {
+            "type": "categorical",
+            "choices": _env_float_choices("MAIN_XGB_OPTUNA_ACTUAL_AND_RULE_WEIGHT_CHOICES", "1.0,1.25,1.5"),
+        }
+        space["churn_sample_weight_normalize"] = {
+            "type": "categorical",
+            "choices": _env_bool_choices("MAIN_XGB_OPTUNA_NORMALIZE_SAMPLE_WEIGHT_CHOICES", "true"),
+        }
+        if _env_bool("MAIN_XGB_OPTUNA_TUNE_RECENCY_WEIGHT", True):
+            space["churn_recency_weight_enabled"] = {
+                "type": "categorical",
+                "choices": _env_bool_choices("MAIN_XGB_OPTUNA_RECENCY_ENABLED_CHOICES", "false,true"),
+            }
+            space["churn_recency_weight_halflife_months"] = {
+                "type": "categorical",
+                "choices": _env_float_choices("MAIN_XGB_OPTUNA_RECENCY_HALFLIFE_CHOICES", "3,6,9,12"),
+            }
     return space
 
 
@@ -943,6 +1200,16 @@ def _build_tuning_trial_cfg(base_cfg: dict, trial, space: dict[str, dict[str, An
     tuned_cfg["main_es_rounds"] = int(sampled["early_stopping_rounds"])
     tuned_cfg["main_max_predicted_positive_rate"] = float(sampled["max_predicted_positive_rate"])
     tuned_cfg["main_threshold_min"] = _env_float("MAIN_XGB_THRESHOLD_MIN", 0.005)
+    for key in (
+        "churn_label_audit_only_sample_weight",
+        "churn_label_actual_positive_sample_weight",
+        "churn_label_actual_and_rule_positive_sample_weight",
+        "churn_sample_weight_normalize",
+        "churn_recency_weight_enabled",
+        "churn_recency_weight_halflife_months",
+    ):
+        if key in sampled:
+            tuned_cfg[key] = sampled[key]
     return tuned_cfg
 
 
@@ -1249,6 +1516,7 @@ def tune_xgb_hyperparams_for_folds(
 
     best = max(complete_trials, key=lambda t: float(t.value))
     tuned_cfg = dict(best.user_attrs.get("candidate_cfg") or cfg)
+    best_sample_weight_config = _sample_weight_config_for_report(tuned_cfg)
     tuning_meta = {
         "enabled": True,
         "status": "completed",
@@ -1264,6 +1532,7 @@ def tune_xgb_hyperparams_for_folds(
         "best_phase": best.user_attrs.get("phase"),
         "best_value": float(best.value),
         "best_params": dict(best.params),
+        "best_sample_weight_config": best_sample_weight_config,
         "fold_f1": best.user_attrs.get("fold_f1", []),
         "fold_operating_f1": best.user_attrs.get("fold_operating_f1", best.user_attrs.get("fold_f1", [])),
         "fold_ap": best.user_attrs.get("fold_ap", []),
@@ -1277,11 +1546,13 @@ def tune_xgb_hyperparams_for_folds(
     }
     tuned_cfg["optuna_tuning"] = tuning_meta
     logger.info(
-        "[HYPERPARAM TUNING] Best K=%s use_static=%s phase=%s operating_F1_mean=%.4f params=%s",
+        "[HYPERPARAM TUNING] Best K=%s use_static=%s phase=%s operating_F1_mean=%.4f "
+        "sample_weight=%s params=%s",
         cfg.get("best_k"),
         cfg.get("use_static"),
         best.user_attrs.get("phase"),
         float(best.value),
+        best_sample_weight_config,
         dict(best.params),
     )
     return tuned_cfg, tuning_meta

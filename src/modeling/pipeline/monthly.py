@@ -502,6 +502,20 @@ def _train_main_inline(
     if best["report"].get("operating_mode") == "probability":
         cfg["operating_probability_threshold"] = float(best["report"]["operating_threshold"])
     cfg["main_threshold_min"] = float(best["report"].get("thr_main_min", cfg.get("main_threshold_min", 0.005)))
+    sample_weight_config = best["report"].get("sample_weight_config") or {}
+    if sample_weight_config:
+        cfg["churn_label_audit_only_sample_weight"] = float(sample_weight_config.get("audit_only", 1.0))
+        cfg["churn_label_rule_positive_sample_weight"] = float(sample_weight_config.get("rule_positive", 1.0))
+        cfg["churn_label_rule_negative_sample_weight"] = float(sample_weight_config.get("rule_negative", 1.0))
+        cfg["churn_label_actual_positive_sample_weight"] = float(sample_weight_config.get("actual_positive", 1.0))
+        cfg["churn_label_actual_and_rule_positive_sample_weight"] = float(
+            sample_weight_config.get("actual_and_rule_positive", 1.0)
+        )
+        cfg["churn_recency_weight_enabled"] = bool(sample_weight_config.get("recency_enabled", False))
+        cfg["churn_recency_weight_halflife_months"] = float(sample_weight_config.get("recency_halflife_months", 6.0))
+        cfg["churn_recency_weight_min"] = float(sample_weight_config.get("recency_min", 0.35))
+        cfg["churn_recency_weight_max"] = float(sample_weight_config.get("recency_max", 2.50))
+        cfg["churn_sample_weight_normalize"] = bool(sample_weight_config.get("normalize", True))
     cfg["notes"] = (
         f"{cfg.get('notes') or ''}; "
         f"XGBoost selected final K={cfg['best_k']} use_static={cfg['use_static']} "
@@ -536,7 +550,8 @@ def _train_main_inline(
         "[XGB SELECTED DETAIL] selection_folds=%d total_folds=%d holdout_excluded_from_selection=%s "
         "latest_operating_F1=%.4f latest_AP=%.4f latest_ROC_AUC=%s operating_predicted_positive_rate=%.2f%% final_holdout_status=%s "
         "final_holdout_main_F1=%s final_holdout_operating_F1=%s final_holdout_AP=%s "
-        "final_holdout_ROC_AUC=%s final_holdout_passed=%s final_holdout_failures=%s threshold_source=%s",
+        "final_holdout_ROC_AUC=%s final_holdout_passed=%s final_holdout_failures=%s threshold_source=%s "
+        "sample_weight=%s",
         int(best["report"].get("walk_forward_folds", 0)),
         int(best["report"].get("walk_forward_total_folds", 0)),
         bool(best["report"].get("walk_forward_holdout_excluded_from_selection", False)),
@@ -553,6 +568,7 @@ def _train_main_inline(
         "n/a" if final_holdout_passed is None else bool(final_holdout_passed),
         final_holdout_failures,
         best["report"].get("threshold_source"),
+        sample_weight_config or "n/a",
     )
     meta = {
         "cfg": cfg,
