@@ -511,9 +511,12 @@ def _train_main_inline(
     cfg.pop("xgb_candidate_ks", None)
     final_holdout = best["report"].get("final_holdout") or {}
     final_holdout_status = str(final_holdout.get("status") or "disabled_or_unavailable")
-    final_holdout_f1 = final_holdout.get("f1")
+    final_holdout_main_f1 = final_holdout.get("main_f1", final_holdout.get("f1"))
+    final_holdout_operating_f1 = final_holdout.get("operating_f1")
     final_holdout_ap = final_holdout.get("ap")
     final_holdout_roc = final_holdout.get("roc_auc")
+    final_holdout_passed = final_holdout.get("passed")
+    final_holdout_failures = "; ".join(str(x) for x in (final_holdout.get("failures") or [])) or "none"
     logger.info(
         "[XGB SELECTED] K=%d use_static=%s operating_mode=%s operating_F1=%.4f "
         "operating_precision=%.4f operating_recall=%.4f AP=%.4f ROC_AUC=%s "
@@ -532,7 +535,8 @@ def _train_main_inline(
     logger.info(
         "[XGB SELECTED DETAIL] selection_folds=%d total_folds=%d holdout_excluded_from_selection=%s "
         "latest_operating_F1=%.4f latest_AP=%.4f latest_ROC_AUC=%s operating_predicted_positive_rate=%.2f%% final_holdout_status=%s "
-        "final_holdout_F1=%s final_holdout_AP=%s final_holdout_ROC_AUC=%s threshold_source=%s",
+        "final_holdout_main_F1=%s final_holdout_operating_F1=%s final_holdout_AP=%s "
+        "final_holdout_ROC_AUC=%s final_holdout_passed=%s final_holdout_failures=%s threshold_source=%s",
         int(best["report"].get("walk_forward_folds", 0)),
         int(best["report"].get("walk_forward_total_folds", 0)),
         bool(best["report"].get("walk_forward_holdout_excluded_from_selection", False)),
@@ -542,9 +546,12 @@ def _train_main_inline(
         if best["report"].get("ROC_AUC_val_latest") is not None else "n/a",
         100.0 * float(best["report"].get("predicted_positive_rate@operating", best["report"].get("predicted_positive_rate@main_thr", 0.0))),
         final_holdout_status,
-        f"{float(final_holdout_f1):.4f}" if final_holdout_f1 is not None else "n/a",
+        f"{float(final_holdout_main_f1):.4f}" if final_holdout_main_f1 is not None else "n/a",
+        f"{float(final_holdout_operating_f1):.4f}" if final_holdout_operating_f1 is not None else "n/a",
         f"{float(final_holdout_ap):.4f}" if final_holdout_ap is not None else "n/a",
         f"{float(final_holdout_roc):.4f}" if final_holdout_roc is not None else "n/a",
+        "n/a" if final_holdout_passed is None else bool(final_holdout_passed),
+        final_holdout_failures,
         best["report"].get("threshold_source"),
     )
     meta = {

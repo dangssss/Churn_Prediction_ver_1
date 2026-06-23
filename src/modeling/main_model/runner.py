@@ -1654,6 +1654,7 @@ def run_main_variant(
     report["val_month"] = int(latest["report"]["val_month"])
     if final_holdout_fold is not None:
         holdout_report = holdout_outputs[-1]["report"] if holdout_outputs else None
+        require_final_holdout_quality = _env_bool("MAIN_XGB_REQUIRE_FINAL_HOLDOUT_QUALITY", True)
         report["final_holdout"] = {
             "enabled": True,
             "status": "completed" if holdout_report is not None else "rejected_or_unavailable",
@@ -1662,95 +1663,144 @@ def run_main_variant(
             "train_max_month": final_holdout_fold["train_max_month"],
             "validation_months": list(final_holdout_fold["validation_months"]),
         }
+        if holdout_report is None and require_final_holdout_quality:
+            warning = "final_holdout_status=rejected_or_unavailable"
+            report["final_holdout"]["passed"] = False
+            report["final_holdout"]["failures"] = [warning]
+            report["guardrail_warning"] = warning
+            logger.warning(
+                "[MAIN WALK FORWARD REJECT] K=%d use_static=%s rejected variant: %s",
+                cfg["best_k"],
+                use_static_flag,
+                warning,
+            )
+            return {
+                "use_static": bool(use_static_flag),
+                "guardrail_warning": warning,
+                "F1_val": 0.0,
+                "AP_val": 0.0,
+                "ROC_AUC_val": 0.0,
+                "report": report,
+            }
         if holdout_report is not None:
+            holdout_main_f1 = float(holdout_report["f1@main_thr"])
+            holdout_main_precision = float(holdout_report["precision@main_thr"])
+            holdout_main_recall = float(holdout_report["recall@main_thr"])
+            holdout_main_pred_pos_rate = float(holdout_report["predicted_positive_rate@main_thr"])
+            holdout_operating_f1 = float(holdout_report.get("f1@operating", holdout_report["f1@main_thr"]))
+            holdout_operating_precision = float(
+                holdout_report.get("precision@operating", holdout_report["precision@main_thr"])
+            )
+            holdout_operating_recall = float(
+                holdout_report.get("recall@operating", holdout_report["recall@main_thr"])
+            )
+            holdout_operating_pred_pos_rate = float(
+                holdout_report.get(
+                    "predicted_positive_rate@operating",
+                    holdout_report["predicted_positive_rate@main_thr"],
+                )
+            )
             report["final_holdout"].update({
-                "f1": float(holdout_report["f1@main_thr"]),
-                "precision": float(holdout_report["precision@main_thr"]),
-                "recall": float(holdout_report["recall@main_thr"]),
+                "f1": holdout_main_f1,
+                "precision": holdout_main_precision,
+                "recall": holdout_main_recall,
+                "main_f1": holdout_main_f1,
+                "main_precision": holdout_main_precision,
+                "main_recall": holdout_main_recall,
                 "ap": float(holdout_report["AP_val"]),
                 "roc_auc": holdout_report.get("ROC_AUC_val"),
                 "threshold": float(holdout_report["thr_main_opt"]),
                 "search_opt_threshold": float(holdout_report.get("thr_main_search_opt", holdout_report["thr_main_opt"])),
                 "threshold_source": holdout_report.get("threshold_source"),
                 "val_prevalence": float(holdout_report["val_prevalence"]),
-                "predicted_positive_rate": float(holdout_report["predicted_positive_rate@main_thr"]),
+                "predicted_positive_rate": holdout_main_pred_pos_rate,
+                "main_predicted_positive_rate": holdout_main_pred_pos_rate,
                 "operating_mode": holdout_report.get("operating_mode"),
-                "operating_f1": float(holdout_report.get("f1@operating", holdout_report["f1@main_thr"])),
-                "operating_precision": float(holdout_report.get("precision@operating", holdout_report["precision@main_thr"])),
-                "operating_recall": float(holdout_report.get("recall@operating", holdout_report["recall@main_thr"])),
+                "operating_f1": holdout_operating_f1,
+                "operating_precision": holdout_operating_precision,
+                "operating_recall": holdout_operating_recall,
                 "operating_threshold": float(holdout_report.get("operating_threshold", holdout_report["thr_main_opt"])),
-                "operating_predicted_positive_rate": float(
-                    holdout_report.get(
-                        "predicted_positive_rate@operating",
-                        holdout_report["predicted_positive_rate@main_thr"],
-                    )
-                ),
+                "operating_predicted_positive_rate": holdout_operating_pred_pos_rate,
             })
-            logger.info(
-                "[FINAL HOLDOUT] K=%d use_static=%s val=%s F1=%.4f precision=%.4f "
-                "recall=%.4f AP=%.4f ROC_AUC=%s threshold=%.6f predicted_positive_rate=%.2f%% "
-                "threshold_source=%s operating_mode=%s operating_F1=%.4f operating_predicted_positive_rate=%.2f%%",
-                cfg["best_k"],
-                use_static_flag,
-                ",".join(str(m) for m in final_holdout_fold["validation_months"]),
-                float(holdout_report["f1@main_thr"]),
-                float(holdout_report["precision@main_thr"]),
-                float(holdout_report["recall@main_thr"]),
-                float(holdout_report["AP_val"]),
-                f"{holdout_report.get('ROC_AUC_val'):.4f}" if holdout_report.get("ROC_AUC_val") is not None else "n/a",
-                float(holdout_report["thr_main_opt"]),
-                100.0 * float(holdout_report["predicted_positive_rate@main_thr"]),
-                holdout_report.get("threshold_source"),
-                holdout_report.get("operating_mode"),
-                float(holdout_report.get("f1@operating", holdout_report["f1@main_thr"])),
-                100.0 * float(
-                    holdout_report.get(
-                        "predicted_positive_rate@operating",
-                        holdout_report["predicted_positive_rate@main_thr"],
-                    )
-                ),
-            )
 
-            if _env_bool("MAIN_XGB_REQUIRE_FINAL_HOLDOUT_QUALITY", True):
-                min_holdout_f1 = _env_float("MAIN_XGB_MIN_FINAL_HOLDOUT_F1", 0.01)
-                min_holdout_pred_pos_rate = _env_float(
+            holdout_failures = []
+            if require_final_holdout_quality:
+                default_min_holdout_f1 = _env_float("MAIN_XGB_MIN_FINAL_HOLDOUT_F1", 0.01)
+                min_holdout_main_f1 = _env_float(
+                    "MAIN_XGB_MIN_FINAL_HOLDOUT_MAIN_F1",
+                    default_min_holdout_f1,
+                )
+                min_holdout_operating_f1 = _env_float(
+                    "MAIN_XGB_MIN_FINAL_HOLDOUT_OPERATING_F1",
+                    default_min_holdout_f1,
+                )
+                min_holdout_operating_pred_pos_rate = _env_float(
                     "MAIN_XGB_MIN_FINAL_HOLDOUT_PRED_POSITIVE_RATE",
                     0.001,
                 )
-                holdout_f1 = float(holdout_report.get("f1@operating", holdout_report["f1@main_thr"]))
-                holdout_pred_pos_rate = float(
-                    holdout_report.get(
-                        "predicted_positive_rate@operating",
-                        holdout_report["predicted_positive_rate@main_thr"],
+                report["final_holdout"].update({
+                    "min_main_f1": float(min_holdout_main_f1),
+                    "min_operating_f1": float(min_holdout_operating_f1),
+                    "min_operating_predicted_positive_rate": float(min_holdout_operating_pred_pos_rate),
+                })
+                if holdout_main_f1 < min_holdout_main_f1:
+                    holdout_failures.append(
+                        f"final_holdout_main_F1={holdout_main_f1:.4f} < {min_holdout_main_f1:.4f}"
                     )
+                if holdout_operating_f1 < min_holdout_operating_f1:
+                    holdout_failures.append(
+                        f"final_holdout_operating_F1={holdout_operating_f1:.4f} < {min_holdout_operating_f1:.4f}"
+                    )
+                if holdout_operating_pred_pos_rate < min_holdout_operating_pred_pos_rate:
+                    holdout_failures.append(
+                        "final_holdout_operating_predicted_positive_rate="
+                        f"{holdout_operating_pred_pos_rate:.4%} < {min_holdout_operating_pred_pos_rate:.4%}"
+                    )
+            report["final_holdout"]["passed"] = not holdout_failures
+            report["final_holdout"]["failures"] = holdout_failures
+            logger.info(
+                "[FINAL HOLDOUT] K=%d use_static=%s val=%s main_F1=%.4f main_precision=%.4f "
+                "main_recall=%.4f AP=%.4f ROC_AUC=%s main_threshold=%.6f main_predicted_positive_rate=%.2f%% "
+                "threshold_source=%s operating_mode=%s operating_F1=%.4f operating_precision=%.4f "
+                "operating_recall=%.4f operating_threshold=%.6f operating_predicted_positive_rate=%.2f%% "
+                "passed=%s failures=%s",
+                cfg["best_k"],
+                use_static_flag,
+                ",".join(str(m) for m in final_holdout_fold["validation_months"]),
+                holdout_main_f1,
+                holdout_main_precision,
+                holdout_main_recall,
+                float(holdout_report["AP_val"]),
+                f"{holdout_report.get('ROC_AUC_val'):.4f}" if holdout_report.get("ROC_AUC_val") is not None else "n/a",
+                float(holdout_report["thr_main_opt"]),
+                100.0 * holdout_main_pred_pos_rate,
+                holdout_report.get("threshold_source"),
+                holdout_report.get("operating_mode"),
+                holdout_operating_f1,
+                holdout_operating_precision,
+                holdout_operating_recall,
+                float(holdout_report.get("operating_threshold", holdout_report["thr_main_opt"])),
+                100.0 * holdout_operating_pred_pos_rate,
+                not holdout_failures,
+                "; ".join(holdout_failures) or "none",
+            )
+            if holdout_failures:
+                warning = "; ".join(holdout_failures)
+                report["guardrail_warning"] = warning
+                logger.warning(
+                    "[MAIN WALK FORWARD REJECT] K=%d use_static=%s rejected variant: %s",
+                    cfg["best_k"],
+                    use_static_flag,
+                    warning,
                 )
-                holdout_failures = []
-                if holdout_f1 < min_holdout_f1:
-                    holdout_failures.append(
-                        f"final_holdout_F1={holdout_f1:.4f} < {min_holdout_f1:.4f}"
-                    )
-                if holdout_pred_pos_rate < min_holdout_pred_pos_rate:
-                    holdout_failures.append(
-                        "final_holdout_predicted_positive_rate="
-                        f"{holdout_pred_pos_rate:.4%} < {min_holdout_pred_pos_rate:.4%}"
-                    )
-                if holdout_failures:
-                    warning = "; ".join(holdout_failures)
-                    report["guardrail_warning"] = warning
-                    logger.warning(
-                        "[MAIN WALK FORWARD REJECT] K=%d use_static=%s rejected variant: %s",
-                        cfg["best_k"],
-                        use_static_flag,
-                        warning,
-                    )
-                    return {
-                        "use_static": bool(use_static_flag),
-                        "guardrail_warning": warning,
-                        "F1_val": 0.0,
-                        "AP_val": 0.0,
-                        "ROC_AUC_val": 0.0,
-                        "report": report,
-                    }
+                return {
+                    "use_static": bool(use_static_flag),
+                    "guardrail_warning": warning,
+                    "F1_val": 0.0,
+                    "AP_val": 0.0,
+                    "ROC_AUC_val": 0.0,
+                    "report": report,
+                }
 
     logger.info(
         "[MAIN WALK FORWARD METRICS] K=%d use_static=%s selection_folds=%d total_folds=%d "
