@@ -142,7 +142,7 @@ def _operating_probability_threshold(cfg: dict, default: float | None = None) ->
         or cfg.get("operating_probability_threshold")
     )
     if raw is None:
-        raw = cfg.get("best_threshold", cfg.get("main_threshold", default if default is not None else 0.5))
+        raw = default if default is not None else cfg.get("main_threshold", cfg.get("best_threshold", 0.5))
     try:
         value = float(raw)
     except (TypeError, ValueError):
@@ -1093,6 +1093,7 @@ def tune_xgb_hyperparams_for_folds(
     seed = int(cfg.get("seed", 42))
     pruning_enabled = _env_bool("MAIN_XGB_OPTUNA_PRUNING_ENABLED", True)
     prune_after_seconds = max(_env_int("MAIN_XGB_OPTUNA_PRUNE_AFTER_SECONDS", 60), 0)
+    objective_name = "walk_forward_operating_f1_mean"
 
     def make_pruner():
         if not pruning_enabled:
@@ -1124,7 +1125,7 @@ def tune_xgb_hyperparams_for_folds(
                 trial.set_user_attr("duration_seconds", float(time.monotonic() - started_at))
                 return 0.0
 
-            fold_f1.append(float(report["f1@main_thr"]))
+            fold_f1.append(float(report.get("f1@operating", report["f1@main_thr"])))
             fold_ap.append(float(report["AP_val"]))
             if report.get("ROC_AUC_val") is not None:
                 fold_roc.append(float(report["ROC_AUC_val"]))
@@ -1136,10 +1137,12 @@ def tune_xgb_hyperparams_for_folds(
                 trial.set_user_attr("duration_seconds", elapsed)
                 raise optuna.TrialPruned()
 
-        trial_cfg["optuna_objective"] = "walk_forward_f1_mean"
+        trial_cfg["optuna_objective"] = objective_name
         trial.set_user_attr("phase", phase)
         trial.set_user_attr("candidate_cfg", trial_cfg)
+        trial.set_user_attr("objective_metric", "f1@operating")
         trial.set_user_attr("fold_f1", fold_f1)
+        trial.set_user_attr("fold_operating_f1", fold_f1)
         trial.set_user_attr("fold_ap", fold_ap)
         trial.set_user_attr("fold_roc", fold_roc)
         trial.set_user_attr("ap_mean", float(np.mean(fold_ap)) if fold_ap else 0.0)
@@ -1151,7 +1154,7 @@ def tune_xgb_hyperparams_for_folds(
     wide_space = _wide_xgb_tuning_space()
     logger.info(
         "[HYPERPARAM TUNING] Strategy=random_search_then_narrowed_optuna_tpe "
-        "K=%s use_static=%s random_trials=%d optuna_trials=%d pruning=%s prune_after=%ss folds=%d",
+        "K=%s use_static=%s random_trials=%d optuna_trials=%d pruning=%s prune_after=%ss folds=%d objective=%s",
         cfg.get("best_k"),
         cfg.get("use_static"),
         random_trials,
@@ -1159,6 +1162,7 @@ def tune_xgb_hyperparams_for_folds(
         pruning_enabled,
         prune_after_seconds,
         len(folds),
+        objective_name,
     )
 
     random_study = None
@@ -1171,11 +1175,12 @@ def tune_xgb_hyperparams_for_folds(
             pruner=make_pruner(),
         )
         logger.info(
-            "[RANDOM SEARCH] Start XGBoost exploration K=%s use_static=%s trials=%d timeout=%s objective=walk_forward_f1_mean",
+            "[RANDOM SEARCH] Start XGBoost exploration K=%s use_static=%s trials=%d timeout=%s objective=%s",
             cfg.get("best_k"),
             cfg.get("use_static"),
             random_trials,
             random_timeout_seconds or "none",
+            objective_name,
         )
         random_study.optimize(
             lambda trial: objective(trial, phase="random_search", space=wide_space),
@@ -1188,7 +1193,7 @@ def tune_xgb_hyperparams_for_folds(
         random_complete = _complete_trials(random_study, optuna)
         if random_complete:
             logger.info(
-                "[RANDOM SEARCH] Completed=%d/%d best_F1=%.4f best_params=%s",
+                "[RANDOM SEARCH] Completed=%d/%d best_operating_F1=%.4f best_params=%s",
                 len(random_complete),
                 len(random_study.trials),
                 float(max(t.value for t in random_complete)),
@@ -1210,11 +1215,12 @@ def tune_xgb_hyperparams_for_folds(
             pruner=make_pruner(),
         )
         logger.info(
-            "[OPTUNA] Start narrowed TPE tuning K=%s use_static=%s trials=%d timeout=%s objective=walk_forward_f1_mean",
+            "[OPTUNA] Start narrowed TPE tuning K=%s use_static=%s trials=%d timeout=%s objective=%s",
             cfg.get("best_k"),
             cfg.get("use_static"),
             tpe_trials,
             timeout_seconds or "none",
+            objective_name,
         )
         tpe_study.optimize(
             lambda trial: objective(trial, phase="optuna_tpe", space=narrowed_space),
@@ -1227,7 +1233,7 @@ def tune_xgb_hyperparams_for_folds(
         tpe_complete = _complete_trials(tpe_study, optuna)
         if tpe_complete:
             logger.info(
-                "[OPTUNA] Completed=%d/%d best_F1=%.4f best_params=%s",
+                "[OPTUNA] Completed=%d/%d best_operating_F1=%.4f best_params=%s",
                 len(tpe_complete),
                 len(tpe_study.trials),
                 float(max(t.value for t in tpe_complete)),
@@ -1247,7 +1253,8 @@ def tune_xgb_hyperparams_for_folds(
         "enabled": True,
         "status": "completed",
         "strategy": "random_search_then_narrowed_optuna_tpe",
-        "objective": "walk_forward_f1_mean",
+        "objective": objective_name,
+        "objective_metric": "f1@operating",
         "random_search_trials": len(random_study.trials) if random_study is not None else 0,
         "random_search_completed_trials": len(random_complete),
         "optuna_tpe_trials": len(tpe_study.trials) if tpe_study is not None else 0,
@@ -1258,6 +1265,7 @@ def tune_xgb_hyperparams_for_folds(
         "best_value": float(best.value),
         "best_params": dict(best.params),
         "fold_f1": best.user_attrs.get("fold_f1", []),
+        "fold_operating_f1": best.user_attrs.get("fold_operating_f1", best.user_attrs.get("fold_f1", [])),
         "fold_ap": best.user_attrs.get("fold_ap", []),
         "fold_roc": best.user_attrs.get("fold_roc", []),
         "ap_mean": best.user_attrs.get("ap_mean"),
@@ -1269,7 +1277,7 @@ def tune_xgb_hyperparams_for_folds(
     }
     tuned_cfg["optuna_tuning"] = tuning_meta
     logger.info(
-        "[HYPERPARAM TUNING] Best K=%s use_static=%s phase=%s F1_mean=%.4f params=%s",
+        "[HYPERPARAM TUNING] Best K=%s use_static=%s phase=%s operating_F1_mean=%.4f params=%s",
         cfg.get("best_k"),
         cfg.get("use_static"),
         best.user_attrs.get("phase"),
