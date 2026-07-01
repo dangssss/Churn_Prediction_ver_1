@@ -111,6 +111,17 @@ def _env_bool_choices(name: str, default: str) -> list[bool]:
     return choices or [False]
 
 
+def _env_str_choices(name: str, default: str) -> list[str]:
+    raw = os.getenv(name)
+    text = str(raw if raw is not None and str(raw).strip() != "" else default)
+    choices: list[str] = []
+    for part in text.split(","):
+        value = part.strip().lower().replace("-", "_")
+        if value and value not in choices:
+            choices.append(value)
+    return choices or [x.strip().lower().replace("-", "_") for x in default.split(",") if x.strip()]
+
+
 def _score_stats(prob: np.ndarray) -> dict:
     if len(prob) == 0:
         return {}
@@ -546,10 +557,12 @@ def _xgb_training_params(cfg: dict, spw: float) -> tuple[dict[str, Any], int]:
         reg_alpha=_env_float("MAIN_XGB_REG_ALPHA", 0.1),
         min_child_weight=_env_float("MAIN_XGB_MIN_CHILD_WEIGHT", 2.0),
         gamma=_env_float("MAIN_XGB_GAMMA", 0.0),
+        max_delta_step=_env_float("MAIN_XGB_MAX_DELTA_STEP", 0.0),
         tree_method=os.getenv("MAIN_XGB_TREE_METHOD", "hist"),
         random_state=int(cfg.get("seed", 42)),
         scale_pos_weight=float(spw),
-        eval_metric=["aucpr", "logloss"],
+        # XGBoost early stopping uses the last metric; keep Optuna selecting by f1@operating.
+        eval_metric=["logloss", "aucpr"],
     )
     n_jobs = _env_int("MAIN_XGB_N_JOBS", 0)
     if n_jobs > 0:
@@ -559,8 +572,96 @@ def _xgb_training_params(cfg: dict, spw: float) -> tuple[dict[str, Any], int]:
     params["scale_pos_weight"] = float(params.get("scale_pos_weight", spw))
     params["random_state"] = int(params.get("random_state", cfg.get("seed", 42)))
     if "eval_metric" not in params or params["eval_metric"] in (None, ""):
-        params["eval_metric"] = ["aucpr", "logloss"]
+        params["eval_metric"] = ["logloss", "aucpr"]
     return params, max(int(es_rounds), 1)
+
+
+def _normalize_lr_schedule(value) -> str:
+    raw = str(value or "cosine_decay").strip().lower().replace("-", "_")
+    aliases = {
+        "off": "constant",
+        "none": "constant",
+        "false": "constant",
+        "0": "constant",
+        "fixed": "constant",
+        "constant": "constant",
+        "cosine": "cosine_decay",
+        "cosine_decay": "cosine_decay",
+        "exponential": "exponential_decay",
+        "exp": "exponential_decay",
+        "exponential_decay": "exponential_decay",
+        "linear": "linear_decay",
+        "linear_decay": "linear_decay",
+    }
+    mode = aliases.get(raw)
+    if mode is None:
+        logger.warning("Invalid learning-rate schedule %r. Falling back to cosine_decay.", value)
+        return "cosine_decay"
+    return mode
+
+
+def _cfg_str_value(cfg: dict, key: str, env_name: str, default: str) -> str:
+    value = cfg.get(key)
+    if value is None or str(value).strip() == "":
+        value = os.getenv(env_name, default)
+    return str(value).strip()
+
+
+def _xgb_lr_schedule_config(cfg: dict, params: dict[str, Any]) -> dict[str, Any]:
+    base_lr = float(params.get("learning_rate", _env_float("MAIN_XGB_LEARNING_RATE", 0.03)))
+    n_estimators = max(int(params.get("n_estimators", _env_int("MAIN_XGB_N_ESTIMATORS", 5000))), 1)
+    mode = _normalize_lr_schedule(
+        _cfg_str_value(cfg, "main_xgb_lr_schedule", "MAIN_XGB_LR_SCHEDULE", "cosine_decay")
+    )
+    final_fraction = _cfg_float(
+        cfg,
+        "main_xgb_lr_schedule_final_fraction",
+        "MAIN_XGB_LR_SCHEDULE_FINAL_FRACTION",
+        0.10,
+    )
+    final_fraction = min(max(float(final_fraction), 1e-4), 1.0)
+    min_rate = max(
+        _cfg_float(cfg, "main_xgb_lr_schedule_min_rate", "MAIN_XGB_LR_SCHEDULE_MIN_RATE", 0.0005),
+        0.0,
+    )
+    enabled = bool(mode != "constant" and base_lr > 0 and n_estimators > 1)
+    return {
+        "enabled": enabled,
+        "mode": mode,
+        "base_learning_rate": float(base_lr),
+        "final_fraction": float(final_fraction),
+        "min_learning_rate": float(min_rate),
+        "n_estimators": int(n_estimators),
+        "callback_applied": False,
+    }
+
+
+def _xgb_lr_for_round(schedule: dict[str, Any], iteration: int) -> float:
+    base_lr = float(schedule["base_learning_rate"])
+    n_estimators = max(int(schedule["n_estimators"]), 1)
+    final_fraction = float(schedule["final_fraction"])
+    progress = min(max(float(iteration) / max(n_estimators - 1, 1), 0.0), 1.0)
+    mode = str(schedule["mode"])
+
+    if mode == "cosine_decay":
+        factor = final_fraction + 0.5 * (1.0 - final_fraction) * (1.0 + np.cos(np.pi * progress))
+    elif mode == "exponential_decay":
+        factor = final_fraction ** progress
+    elif mode == "linear_decay":
+        factor = 1.0 - (1.0 - final_fraction) * progress
+    else:
+        factor = 1.0
+    return float(max(base_lr * float(factor), float(schedule["min_learning_rate"])))
+
+
+def _xgb_lr_schedule_callbacks(schedule: dict[str, Any]) -> list:
+    if not schedule.get("enabled"):
+        return []
+    callback_factory = getattr(getattr(xgb, "callback", None), "LearningRateScheduler", None)
+    if callback_factory is None:
+        logger.warning("xgboost.callback.LearningRateScheduler is unavailable; learning-rate schedule is disabled.")
+        return []
+    return [callback_factory(lambda iteration: _xgb_lr_for_round(schedule, int(iteration)))]
 
 
 def _cfg_float(cfg: dict, key: str, env_name: str, default: float) -> float:
@@ -770,6 +871,19 @@ def train_main_xgb_option_B(
     thr_baseline = float(cfg["best_threshold"])
     params, es_rounds = _xgb_training_params(cfg, spw)
     effective_spw = float(params.get("scale_pos_weight", spw))
+    lr_schedule = _xgb_lr_schedule_config(cfg, params)
+    if detailed_weight_log:
+        logger.info(
+            "[MAIN MODEL][LR SCHEDULE] mode=%s enabled=%s base_lr=%.6f final_lr=%.6f "
+            "final_fraction=%.4f min_lr=%.6f n_estimators=%d",
+            lr_schedule["mode"],
+            lr_schedule["enabled"],
+            lr_schedule["base_learning_rate"],
+            _xgb_lr_for_round(lr_schedule, int(lr_schedule["n_estimators"]) - 1),
+            lr_schedule["final_fraction"],
+            lr_schedule["min_learning_rate"],
+            lr_schedule["n_estimators"],
+        )
 
     n_churn_train = int(y_tr.sum())
     n_active_train = len(y_tr) - n_churn_train
@@ -836,6 +950,7 @@ def train_main_xgb_option_B(
             y_va,
             es_rounds=es_rounds,
             sample_weight=sample_weight_tr.to_numpy(dtype=float),
+            callbacks=_xgb_lr_schedule_callbacks(lr_schedule),
         )
 
         used_mode = "native_categorical"
@@ -856,6 +971,7 @@ def train_main_xgb_option_B(
             y_va,
             es_rounds=es_rounds,
             sample_weight=sample_weight_tr.to_numpy(dtype=float),
+            callbacks=_xgb_lr_schedule_callbacks(lr_schedule),
         )
 
         used_mode = "one_hot"
@@ -972,6 +1088,8 @@ def train_main_xgb_option_B(
     # --- early stop meta
     best_it = getattr(model, "best_iteration", None)
     best_score = getattr(model, "best_score", None)
+    lr_schedule = dict(lr_schedule)
+    lr_schedule["callback_applied"] = bool(getattr(model, "_churn_lr_callbacks_applied", False))
 
     # --- sanity guardrail
     sanity = guardrail_sanity(
@@ -1033,6 +1151,7 @@ def train_main_xgb_option_B(
         "xgb_best_iteration": int(best_it) if best_it is not None else None,
         "xgb_best_score": float(best_score) if best_score is not None else None,
         "xgb_params": dict(params),
+        "xgb_lr_schedule": lr_schedule,
 
         "val_prevalence": float(sanity["val_prevalence"]),
         "dummy_ap_const0": float(sanity["dummy_const0"]["AP"]),
@@ -1110,6 +1229,23 @@ def _wide_xgb_tuning_space() -> dict[str, dict[str, Any]]:
         "early_stopping_rounds": {"type": "int", "low": 50, "high": 350, "step": 50},
         "max_predicted_positive_rate": {"type": "float", "low": pred_min, "high": pred_max, "log": False},
     }
+    if _env_bool("MAIN_XGB_OPTUNA_TUNE_LR_SCHEDULE", True):
+        space["lr_schedule"] = {
+            "type": "categorical",
+            "choices": _env_str_choices(
+                "MAIN_XGB_OPTUNA_LR_SCHEDULE_CHOICES",
+                "cosine_decay,exponential_decay,linear_decay",
+            ),
+        }
+        space["lr_schedule_final_fraction"] = {
+            "type": "categorical",
+            "choices": _env_float_choices("MAIN_XGB_OPTUNA_LR_FINAL_FRACTION_CHOICES", "0.05,0.10,0.20,0.35"),
+        }
+    if _env_bool("MAIN_XGB_OPTUNA_TUNE_MAX_DELTA_STEP", True):
+        space["max_delta_step"] = {
+            "type": "categorical",
+            "choices": _env_float_choices("MAIN_XGB_OPTUNA_MAX_DELTA_STEP_CHOICES", "0,1,3,5,7,10"),
+        }
     if _env_bool("MAIN_XGB_OPTUNA_TUNE_SCALE_POS_WEIGHT", True):
         max_spw = max(
             _env_float(
@@ -1184,9 +1320,10 @@ def _build_tuning_trial_cfg(base_cfg: dict, trial, space: dict[str, dict[str, An
         "colsample_bylevel": float(sampled["colsample_bylevel"]),
         "reg_alpha": float(sampled["reg_alpha"]),
         "reg_lambda": float(sampled["reg_lambda"]),
+        "max_delta_step": float(sampled.get("max_delta_step", _env_float("MAIN_XGB_MAX_DELTA_STEP", 0.0))),
         "tree_method": os.getenv("MAIN_XGB_TREE_METHOD", "hist"),
         "random_state": int(base_cfg.get("seed", 42)),
-        "eval_metric": ["aucpr", "logloss"],
+        "eval_metric": ["logloss", "aucpr"],
     }
     n_jobs = _env_int("MAIN_XGB_N_JOBS", 0)
     if n_jobs > 0:
@@ -1200,6 +1337,10 @@ def _build_tuning_trial_cfg(base_cfg: dict, trial, space: dict[str, dict[str, An
     tuned_cfg["main_es_rounds"] = int(sampled["early_stopping_rounds"])
     tuned_cfg["main_max_predicted_positive_rate"] = float(sampled["max_predicted_positive_rate"])
     tuned_cfg["main_threshold_min"] = _env_float("MAIN_XGB_THRESHOLD_MIN", 0.005)
+    if "lr_schedule" in sampled:
+        tuned_cfg["main_xgb_lr_schedule"] = _normalize_lr_schedule(sampled["lr_schedule"])
+    if "lr_schedule_final_fraction" in sampled:
+        tuned_cfg["main_xgb_lr_schedule_final_fraction"] = float(sampled["lr_schedule_final_fraction"])
     for key in (
         "churn_label_audit_only_sample_weight",
         "churn_label_actual_positive_sample_weight",
@@ -1709,8 +1850,41 @@ def run_main_variant(
     final_holdout_fold = None
     tuning_folds = folds
 
+    require_final_holdout_quality = _env_bool("MAIN_XGB_REQUIRE_FINAL_HOLDOUT_QUALITY", True)
+    tuning_folds, final_holdout_fold, min_tuning_folds = _split_tuning_and_holdout_folds(folds)
+    if final_holdout_fold is None and require_final_holdout_quality:
+        warning = "final_holdout_status=disabled_or_unavailable"
+        final_holdout_enabled = _env_bool("MAIN_XGB_FINAL_HOLDOUT_ENABLED", True)
+        logger.warning(
+            "[MAIN WALK FORWARD REJECT] K=%d use_static=%s rejected variant: %s",
+            cfg["best_k"],
+            use_static_flag,
+            warning,
+        )
+        return {
+            "use_static": bool(use_static_flag),
+            "guardrail_warning": warning,
+            "F1_val": 0.0,
+            "AP_val": 0.0,
+            "ROC_AUC_val": 0.0,
+            "report": {
+                "K": int(cfg["best_k"]),
+                "H": int(cfg["horizon"]),
+                "use_static": bool(use_static_flag),
+                "walk_forward_total_folds_requested": len(folds),
+                "final_holdout": {
+                    "enabled": bool(final_holdout_enabled),
+                    "status": "disabled_or_unavailable",
+                    "used_for_hyperparameter_search": False,
+                    "used_for_model_selection": False,
+                    "passed": False,
+                    "failures": [warning],
+                },
+                "guardrail_warning": warning,
+            },
+        }
+
     if tune_hyperparams:
-        tuning_folds, final_holdout_fold, min_tuning_folds = _split_tuning_and_holdout_folds(folds)
         if len(tuning_folds) < min_tuning_folds:
             logger.warning(
                 "[HYPERPARAM TUNING] Skipping tuning because tuning_folds=%d < min_tuning_folds=%d. "

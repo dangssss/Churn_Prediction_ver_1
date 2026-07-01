@@ -20,6 +20,7 @@ from .gating import apply_gate
 from .feature_columns import non_feature_columns
 from .label_tables import LABEL_SCHEMA, label_tables_for_horizon, load_label_keys
 from .eligibility import filter_churn_eligible
+from common.business_churn_score import add_business_churn_score_features
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -32,6 +33,28 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None or str(raw).strip() == "":
         return bool(default)
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid float env %s=%r. Using default %.4f.", name, raw, default)
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid int env %s=%r. Using default %d.", name, raw, default)
+        return int(default)
 
 
 def _positive_quantile(values: pd.Series, q: float) -> float:
@@ -54,6 +77,117 @@ def _safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     num = pd.to_numeric(numerator, errors="coerce").fillna(0.0)
     den = pd.to_numeric(denominator, errors="coerce").replace(0, np.nan)
     return (num / den).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def _coalesce_numeric(df: pd.DataFrame, columns: list[str], default: float = 0.0) -> pd.Series:
+    out = pd.Series(np.nan, index=df.index, dtype="float64")
+    for col in columns:
+        if col in df.columns:
+            values = pd.to_numeric(df[col], errors="coerce")
+            out = out.combine_first(values)
+    return out.fillna(float(default))
+
+
+def _pl1_baseline_3_periods(df: pd.DataFrame, base: str, fallback: pd.Series) -> pd.Series:
+    """Return PL1 baseline: mean of the three immediately preceding periods."""
+    cols = [f"{base}_last", f"{base}_1m_ago", f"{base}_2m_ago"]
+    available = [col for col in cols if col in df.columns]
+    if available:
+        baseline = df[available].apply(pd.to_numeric, errors="coerce").mean(axis=1, skipna=True)
+    elif f"{base}_avg" in df.columns:
+        baseline = pd.to_numeric(df[f"{base}_avg"], errors="coerce")
+    else:
+        baseline = pd.Series(np.nan, index=df.index, dtype="float64")
+    return baseline.combine_first(pd.to_numeric(fallback, errors="coerce")).fillna(0.0)
+
+
+_PL1_SERVICE_CODES = ("c", "e", "m", "p", "r", "u", "l", "q")
+_PL1_SERVICE_FAMILY_DEFAULTS = {
+    "C": "postal_traditional",
+    "E": "domestic_logistics",
+    "M": "unknown",
+    "P": "domestic_logistics",
+    "R": "postal_traditional",
+    "U": "international_logistics",
+    "L": "international_logistics",
+    "Q": "unknown",
+}
+_PL1_VALID_SERVICE_FAMILIES = {
+    "postal_traditional",
+    "domestic_logistics",
+    "international_logistics",
+    "value_added",
+    "unknown",
+}
+
+
+def _normalize_pl1_service_family(value: str | None) -> str:
+    family = str(value or "unknown").strip().lower()
+    if family in _PL1_VALID_SERVICE_FAMILIES:
+        return family
+    logger.warning("Invalid PL1 service family %r. Falling back to unknown.", value)
+    return "unknown"
+
+
+def _pl1_service_family_for_code(service_code: str | None) -> str:
+    code = str(service_code or "").strip().upper()
+    default = _PL1_SERVICE_FAMILY_DEFAULTS.get(code, "unknown")
+    override = os.getenv(f"CHURN_PL1_SERVICE_FAMILY_{code}") if code else None
+    return _normalize_pl1_service_family(override or default)
+
+
+def _pl1_recency_threshold_days_for_family(family: str) -> int:
+    defaults = {
+        "postal_traditional": 90,
+        "domestic_logistics": 45,
+        "international_logistics": 60,
+        "value_added": 120,
+        "unknown": 60,
+    }
+    env_names = {
+        "postal_traditional": "CHURN_PL1_RECENCY_POSTAL_DAYS",
+        "domestic_logistics": "CHURN_PL1_RECENCY_DOMESTIC_LOGISTICS_DAYS",
+        "international_logistics": "CHURN_PL1_RECENCY_INTERNATIONAL_LOGISTICS_DAYS",
+        "value_added": "CHURN_PL1_RECENCY_VALUE_ADDED_DAYS",
+        "unknown": "CHURN_PL1_RECENCY_UNKNOWN_DAYS",
+    }
+    normalized = _normalize_pl1_service_family(family)
+    return max(_env_int(env_names[normalized], defaults[normalized]), 1)
+
+
+def _dominant_service_from_window(df: pd.DataFrame) -> pd.Series:
+    if "dominant_service" in df.columns:
+        dominant = df["dominant_service"].astype(str).str.strip().str.upper()
+        valid_codes = {code.upper() for code in _PL1_SERVICE_CODES}
+        dominant = dominant.where(dominant.isin(valid_codes), "")
+    else:
+        dominant = pd.Series("", index=df.index, dtype="object")
+
+    unresolved = dominant.eq("")
+    service_values: dict[str, pd.Series] = {}
+    for code in _PL1_SERVICE_CODES:
+        service_values[code.upper()] = _coalesce_numeric(df, [f"ser_{code}_sum", f"ser_{code}"], default=0.0)
+
+    if unresolved.any():
+        service_frame = pd.DataFrame(service_values, index=df.index)
+        max_service = service_frame.max(axis=1)
+        computed = service_frame.idxmax(axis=1).where(max_service.gt(0), "U")
+        dominant = dominant.mask(unresolved, computed)
+
+    return dominant.astype(str).str.upper()
+
+
+def _end_of_yymm(yymm: str | int) -> pd.Timestamp:
+    yymm_str = str(yymm).zfill(4)
+    yy = int(yymm_str[:2])
+    mm = int(yymm_str[2:])
+    return pd.Timestamp(year=2000 + yy, month=mm, day=1) + pd.offsets.MonthEnd(0)
+
+
+def _post_origin_observation_days(origin_yymm: str | int, horizon: int) -> int:
+    origin_end = _end_of_yymm(origin_yymm)
+    future_end = _end_of_yymm(shift_yymm(origin_yymm, int(horizon)))
+    return max(int((future_end - origin_end).days), 0)
 
 
 def _month_index_yymm(yymm: str | int) -> int:
@@ -190,6 +324,23 @@ def _load_post_origin_activity(
     origin["origin_revenue"] = pd.to_numeric(
         df_origin[origin_cols["rev_now"]], errors="coerce"
     ).fillna(0)
+    origin["origin_item_baseline_3m"] = _pl1_baseline_3_periods(
+        df_origin,
+        "item",
+        origin["origin_item"],
+    )
+    origin["origin_revenue_baseline_3m"] = _pl1_baseline_3_periods(
+        df_origin,
+        "revenue",
+        origin["origin_revenue"],
+    )
+    origin["origin_recency_days"] = _coalesce_numeric(df_origin, ["recency", "recency_days"], default=0.0)
+    dominant_service = _dominant_service_from_window(df_origin)
+    origin["origin_dominant_service"] = dominant_service
+    origin["origin_service_family"] = dominant_service.map(_pl1_service_family_for_code)
+    origin["origin_service_recency_threshold_days"] = origin["origin_service_family"].map(
+        _pl1_recency_threshold_days_for_family
+    )
     if "active_months" in df_origin.columns:
         origin["origin_active_months"] = pd.to_numeric(
             df_origin["active_months"], errors="coerce"
@@ -453,6 +604,7 @@ def build_labeled_pair(
         raise ValueError("table_t does not belong to K")
 
     df_t = load_feature_table(engine, table_t, limit=limit)
+    df_t = add_business_churn_score_features(df_t)
     before_scope = len(df_t)
     df_t = apply_gate(df_t)
     df_t = df_t[df_t["is_active_now"].astype(int).eq(1)].copy()
@@ -570,82 +722,48 @@ def build_labeled_pair(
     if "cms_code_enc" not in df_t.columns or "cms_code_enc" not in df_tp.columns:
         raise KeyError("Missing cms_code_enc to join label")
 
-    # ---------- Adaptive business rule labels ----------
-    # All signals are computed from post-origin activity only; no leakage from df_t.
-
+    # ---------- PL1 business rule labels ----------
+    # PL1 section I/II thresholds are fixed business rules, not adaptive window quantiles.
     from .gating import resolve_now_cols
     cols_tp = resolve_now_cols(df_tp)
     item_tp_col = cols_tp["item_now"]
-    rev_tp_col  = cols_tp["rev_now"]
+    rev_tp_col = cols_tp["rev_now"]
 
-    item_tp = pd.to_numeric(df_tp[item_tp_col], errors="coerce").fillna(0)
-    rev_tp  = pd.to_numeric(df_tp[rev_tp_col],  errors="coerce").fillna(0)
+    item_tp = pd.to_numeric(df_tp[item_tp_col], errors="coerce").fillna(0.0)
+    rev_tp = pd.to_numeric(df_tp[rev_tp_col], errors="coerce").fillna(0.0)
 
-    # Precomputed feature-engineering columns.
-    freq_tp = pd.to_numeric(df_tp.get("frequency", 0), errors="coerce").fillna(0)
-    monetary_tp = pd.to_numeric(df_tp.get("monetary", 0), errors="coerce").fillna(0)
-    rev_slope_tp = pd.to_numeric(df_tp.get("revenue_slope", 0), errors="coerce").fillna(0)
+    baseline_item = pd.to_numeric(
+        df_tp.get("origin_item_baseline_3m", df_tp.get("origin_item", 0)),
+        errors="coerce",
+    ).fillna(0.0)
+    baseline_rev = pd.to_numeric(
+        df_tp.get("origin_revenue_baseline_3m", df_tp.get("origin_revenue", 0)),
+        errors="coerce",
+    ).fillna(0.0)
 
-    rev_1m = pd.to_numeric(df_tp.get("revenue_1m_ago", 0), errors="coerce").fillna(0)
-    item_1m = pd.to_numeric(df_tp.get("item_1m_ago", 0), errors="coerce").fillna(0)
+    min_base_item = _env_float("CHURN_PL1_MIN_BASE_ITEM", 1.0)
+    min_base_revenue = _env_float("CHURN_PL1_MIN_BASE_REVENUE", 0.0)
+    has_meaningful_item_base = baseline_item.ge(float(min_base_item))
+    has_meaningful_revenue_base = baseline_rev.gt(float(min_base_revenue))
+    has_meaningful_base = has_meaningful_item_base | has_meaningful_revenue_base
 
-    baseline_item = pd.concat([freq_tp, item_1m], axis=1).max(axis=1)
-    baseline_rev = pd.concat([monetary_tp, rev_1m], axis=1).max(axis=1)
-    baseline_aov = (
-        baseline_rev / baseline_item.replace(0, np.nan)
-    ).replace([np.inf, -np.inf], np.nan).fillna(0)
-    current_aov = (
-        rev_tp / item_tp.replace(0, np.nan)
-    ).replace([np.inf, -np.inf], np.nan).fillna(0)
     item_drop_ratio = (
         1.0 - item_tp / baseline_item.replace(0, np.nan)
-    ).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0, upper=1)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0, upper=1.0)
     rev_drop_ratio = (
         1.0 - rev_tp / baseline_rev.replace(0, np.nan)
-    ).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0, upper=1)
-    aov_drop_ratio = (
-        1.0 - current_aov / baseline_aov.replace(0, np.nan)
-    ).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0, upper=1)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0, upper=1.0)
 
-    min_base_item = _positive_quantile(baseline_item, 0.50)
-    min_base_revenue = _positive_quantile(baseline_rev, 0.50)
-    has_meaningful_item_base = (
-        baseline_item.ge(min_base_item) if min_base_item > 0 else baseline_item.gt(0)
-    )
-    has_meaningful_revenue_base = (
-        baseline_rev.ge(min_base_revenue) if min_base_revenue > 0 else baseline_rev.gt(0)
-    )
-    has_meaningful_value_base = (
-        has_meaningful_item_base & has_meaningful_revenue_base & baseline_aov.gt(0)
-    )
+    freq_drop_warning_min = _env_float("CHURN_PL1_FREQUENCY_DROP_WARNING", 0.20)
+    freq_drop_high_min = _env_float("CHURN_PL1_FREQUENCY_DROP_HIGH", 0.40)
+    revenue_drop_warning_min = _env_float("CHURN_PL1_REVENUE_DROP_WARNING", 0.15)
+    revenue_drop_high_min = _env_float("CHURN_PL1_REVENUE_DROP_HIGH", 0.35)
 
-    item_drop_ratio_min = _positive_quantile(item_drop_ratio[has_meaningful_item_base], 0.75)
-    revenue_drop_ratio_min = _positive_quantile(rev_drop_ratio[has_meaningful_revenue_base], 0.75)
-    aov_drop_ratio_min = _positive_quantile(aov_drop_ratio[has_meaningful_value_base], 0.75)
-    item_drop_confirm_min = _positive_quantile(item_drop_ratio[has_meaningful_item_base], 0.50)
-    revenue_drop_confirm_min = _positive_quantile(rev_drop_ratio[has_meaningful_revenue_base], 0.50)
-    if item_drop_ratio_min <= 0:
-        item_drop_ratio_min = _positive_quantile(item_drop_ratio, 0.75) or 1.0
-    if revenue_drop_ratio_min <= 0:
-        revenue_drop_ratio_min = _positive_quantile(rev_drop_ratio, 0.75) or 1.0
-    if aov_drop_ratio_min <= 0:
-        aov_drop_ratio_min = _positive_quantile(aov_drop_ratio, 0.75) or 1.0
-    if item_drop_confirm_min <= 0:
-        item_drop_confirm_min = _positive_quantile(item_drop_ratio, 0.50) or item_drop_ratio_min
-    if revenue_drop_confirm_min <= 0:
-        revenue_drop_confirm_min = _positive_quantile(rev_drop_ratio, 0.50) or revenue_drop_ratio_min
-
-    low_current_item = _quantile_or_default(item_tp[has_meaningful_item_base], 0.25)
-    low_current_revenue = _quantile_or_default(rev_tp[has_meaningful_revenue_base], 0.25)
-    low_current_aov = _quantile_or_default(
-        current_aov[has_meaningful_value_base & current_aov.gt(0)],
-        0.25,
-    )
-    negative_slope_cutoff = _quantile_or_default(
-        rev_slope_tp[has_meaningful_revenue_base & rev_slope_tp.lt(0)],
-        0.25,
-        default=0.0,
-    )
+    freq_drop_warning = has_meaningful_item_base & item_drop_ratio.ge(freq_drop_warning_min)
+    freq_drop_high = has_meaningful_item_base & item_drop_ratio.ge(freq_drop_high_min)
+    revenue_drop_warning = has_meaningful_revenue_base & rev_drop_ratio.ge(revenue_drop_warning_min)
+    revenue_drop_high = has_meaningful_revenue_base & rev_drop_ratio.ge(revenue_drop_high_min)
+    joint_warning_drop = freq_drop_warning & revenue_drop_warning
 
     future_active_months = pd.to_numeric(
         df_tp.get("future_active_months", 0), errors="coerce"
@@ -659,91 +777,51 @@ def build_labeled_pair(
     )
     persistent_activity_drop = future_active_months.lt(expected_future_active_months)
 
-    # C0: no future activity from a customer that had a meaningful prior base.
-    c0 = (item_tp == 0) & (rev_tp == 0) & (has_meaningful_item_base | has_meaningful_revenue_base)
+    no_future_activity = item_tp.eq(0) & rev_tp.eq(0) & has_meaningful_base
+    observed_gap_days = (
+        pd.to_numeric(df_tp.get("origin_recency_days", 0), errors="coerce").fillna(0.0)
+        + float(_post_origin_observation_days(end, int(horizon)))
+    )
+    service_recency_threshold_days = pd.to_numeric(
+        df_tp.get("origin_service_recency_threshold_days", 60),
+        errors="coerce",
+    ).fillna(60).clip(lower=1)
+    recency_churn = no_future_activity & observed_gap_days.ge(service_recency_threshold_days)
+    recency_audit_only = no_future_activity & ~recency_churn
 
-    # C1: severe order contraction, not just a small relative movement.
-    c1 = (
-        has_meaningful_item_base
-        & item_drop_ratio.ge(item_drop_ratio_min)
-        & (item_tp.le(low_current_item) | persistent_activity_drop)
-    )
-
-    # C2: severe revenue contraction from a meaningful revenue base.
-    c2 = (
-        has_meaningful_revenue_base
-        & rev_drop_ratio.ge(revenue_drop_ratio_min)
-        & (rev_tp.le(low_current_revenue) | persistent_activity_drop)
-    )
-
-    # C3: trend deterioration is an audit signal, not a standalone churn label.
-    c3 = (
-        has_meaningful_revenue_base
-        & rev_slope_tp.le(negative_slope_cutoff)
-        & rev_drop_ratio.ge(revenue_drop_ratio_min)
-    )
-
-    # C4: value collapse catches customers whose average order value falls sharply.
-    c4 = (
-        has_meaningful_value_base
-        & aov_drop_ratio.ge(aov_drop_ratio_min)
-        & (current_aov.le(low_current_aov) | persistent_activity_drop)
-    )
-
-    # Joint volume/revenue contraction is the strongest business signal.
-    # Severe single-signal drops become churn only when confirmed by continuity,
-    # trend, value, or a moderate companion drop.
-    item_drop_confirmed = (
-        c1
-        & persistent_activity_drop
-        & (
-            rev_drop_ratio.ge(revenue_drop_confirm_min)
-            | c3
-            | c4
-        )
-    )
-    revenue_drop_confirmed = (
-        c2
-        & persistent_activity_drop
-        & (
-            item_drop_ratio.ge(item_drop_confirm_min)
-            | c3
-            | c4
-        )
-    )
-    value_drop_confirmed = (
-        c4
-        & persistent_activity_drop
-        & (
-            item_drop_ratio.ge(item_drop_confirm_min)
-            | rev_drop_ratio.ge(revenue_drop_confirm_min)
-        )
-    )
+    warning_drop = freq_drop_warning | revenue_drop_warning
+    persistent_warning_drop = warning_drop & persistent_activity_drop
+    single_warning_as_positive = _env_bool("CHURN_PL1_SINGLE_WARNING_AS_POSITIVE", True)
     business_drop = (
-        (c1 & c2)
-        | item_drop_confirmed
-        | revenue_drop_confirmed
-        | value_drop_confirmed
+        freq_drop_high
+        | revenue_drop_high
+        | joint_warning_drop
+        | persistent_warning_drop
+        | (single_warning_as_positive & warning_drop)
     )
-    rule_y = (c0 | business_drop).astype(int)
+    rule_y = (recency_churn | business_drop).astype(int)
+
     label_rule_reason = pd.Series("stable_or_active", index=df_tp.index, dtype="object")
-    label_rule_reason.loc[c1 & ~c2 & ~c0] = "item_drop_audit_only"
-    label_rule_reason.loc[c2 & ~c1 & ~c0] = "revenue_drop_audit_only"
-    label_rule_reason.loc[c3 & ~business_drop & ~c0] = "revenue_slope_audit_only"
-    label_rule_reason.loc[c4 & ~business_drop & ~c0] = "aov_drop_audit_only"
-    label_rule_reason.loc[business_drop & c1 & c2] = "order_and_revenue_drop"
-    label_rule_reason.loc[item_drop_confirmed & ~(c1 & c2)] = "confirmed_item_drop"
-    label_rule_reason.loc[revenue_drop_confirmed & ~(c1 & c2)] = "confirmed_revenue_drop"
-    label_rule_reason.loc[value_drop_confirmed & ~(c1 & c2)] = "confirmed_value_drop"
-    label_rule_reason.loc[c0] = "no_future_activity"
+    label_rule_reason.loc[recency_audit_only] = "pl1_no_future_activity_below_recency_threshold_audit_only"
+    label_rule_reason.loc[freq_drop_warning & ~business_drop & ~recency_churn] = "pl1_frequency_drop_audit_only"
+    label_rule_reason.loc[revenue_drop_warning & ~business_drop & ~recency_churn] = "pl1_revenue_drop_audit_only"
+    label_rule_reason.loc[freq_drop_high & ~revenue_drop_high] = "pl1_frequency_drop_high"
+    label_rule_reason.loc[revenue_drop_high & ~freq_drop_high] = "pl1_revenue_drop_high"
+    label_rule_reason.loc[freq_drop_high & revenue_drop_high] = "pl1_frequency_and_revenue_drop_high"
+    label_rule_reason.loc[joint_warning_drop & ~(freq_drop_high | revenue_drop_high)] = (
+        "pl1_frequency_and_revenue_drop_warning"
+    )
+    label_rule_reason.loc[
+        persistent_warning_drop & ~(freq_drop_high | revenue_drop_high | joint_warning_drop)
+    ] = "pl1_warning_drop_persistent_activity_drop"
+    label_rule_reason.loc[recency_churn] = "pl1_recency_churn"
 
     y = rule_y.astype(float)
     audit_only_mask = label_rule_reason.isin(
         {
-            "item_drop_audit_only",
-            "revenue_drop_audit_only",
-            "revenue_slope_audit_only",
-            "aov_drop_audit_only",
+            "pl1_frequency_drop_audit_only",
+            "pl1_revenue_drop_audit_only",
+            "pl1_no_future_activity_below_recency_threshold_audit_only",
         }
     )
     if _env_bool("CHURN_LABEL_DROP_AUDIT_ONLY", False):
@@ -751,72 +829,58 @@ def build_labeled_pair(
 
     churn_label_type = pd.Series("active_or_stable", index=df_tp.index, dtype="object")
     churn_label_type.loc[audit_only_mask] = "uncertain_audit_only"
-    churn_label_type.loc[business_drop] = "business_drop"
-    churn_label_type.loc[item_drop_confirmed | revenue_drop_confirmed | value_drop_confirmed] = "confirmed_single_signal_drop"
-    churn_label_type.loc[business_drop & c1 & c2] = "joint_item_revenue_drop"
-    churn_label_type.loc[c0] = "no_future_activity"
+    churn_label_type.loc[business_drop] = "pl1_business_drop"
+    churn_label_type.loc[freq_drop_high | revenue_drop_high] = "pl1_high_drop"
+    churn_label_type.loc[joint_warning_drop & ~(freq_drop_high | revenue_drop_high)] = "pl1_joint_warning_drop"
+    churn_label_type.loc[recency_churn] = "pl1_recency_churn"
     label_source = pd.Series("rule_negative", index=df_tp.index, dtype="object")
     label_source.loc[rule_y.eq(1)] = "rule_positive"
     label_source.loc[y.isna()] = "excluded_uncertain"
 
-    n_c0 = int(c0.sum())
-    n_c1 = int(c1.sum())
-    n_c2 = int(c2.sum())
-    n_c3 = int(c3.sum())
-    n_c4 = int(c4.sum())
-    n_c1_c2 = int((c1 & c2).sum())
-    n_item_confirmed = int(item_drop_confirmed.sum())
-    n_revenue_confirmed = int(revenue_drop_confirmed.sum())
-    n_value_confirmed = int(value_drop_confirmed.sum())
-    n_c1_only = int((c1 & ~c2 & ~c3 & ~c4 & ~c0).sum())
-    n_c2_only = int((c2 & ~c1 & ~c3 & ~c4 & ~c0).sum())
-    n_c3_only = int((c3 & ~c1 & ~c2 & ~c0).sum())
-    n_c4_only = int((c4 & ~c1 & ~c2 & ~c0).sum())
+    n_no_future = int(no_future_activity.sum())
+    n_recency_churn = int(recency_churn.sum())
+    n_recency_audit = int(recency_audit_only.sum())
+    n_freq_warning = int(freq_drop_warning.sum())
+    n_freq_high = int(freq_drop_high.sum())
+    n_revenue_warning = int(revenue_drop_warning.sum())
+    n_revenue_high = int(revenue_drop_high.sum())
+    n_joint_warning = int(joint_warning_drop.sum())
+    n_persistent_warning = int(persistent_warning_drop.sum())
+    n_business_drop = int(business_drop.sum())
     n_pos = int((y == 1).sum())
     n_neg = int((y == 0).sum())
     n_uncertain = int(y.isna().sum())
     logger.info(
-        "Generated rule-base labels y_churn_t_plus_%d from %s: "
+        "Generated PL1 rule-base labels y_churn_t_plus_%d from %s: "
         "positive=%d (%.1f%% of labeled) | negative=%d | unlabeled=%d | total=%d | "
-        "C0(no activity)=%d | C1(item drop)=%d | C2(revenue drop)=%d | "
-        "C3(slope audit)=%d | C4(aov audit)=%d | C1&C2=%d | "
-        "confirmed_item=%d | confirmed_revenue=%d | confirmed_value=%d | "
-        "C1_only=%d | C2_only=%d | C3_only=%d | C4_only=%d | "
-        "adaptive_min_base_item=%.2f adaptive_min_base_revenue=%.2f "
-        "adaptive_item_drop_q75=%.2f adaptive_revenue_drop_q75=%.2f "
-        "adaptive_aov_drop_q75=%.2f item_confirm_q50=%.2f revenue_confirm_q50=%.2f "
-        "low_current_item_q25=%.2f low_current_revenue_q25=%.2f "
-        "low_current_aov_q25=%.2f negative_slope_q25=%.2f",
+        "no_future_activity=%d | recency_churn=%d | recency_audit_only=%d | "
+        "frequency_warning=%d | frequency_high=%d | revenue_warning=%d | revenue_high=%d | "
+        "joint_warning=%d | persistent_warning=%d | business_drop=%d | "
+        "thresholds: freq_warning=%.2f freq_high=%.2f revenue_warning=%.2f revenue_high=%.2f "
+        "min_base_item=%.2f min_base_revenue=%.2f single_warning_as_positive=%s",
         horizon,
         table_tp,
         n_pos, 100.0 * n_pos / max(n_pos + n_neg, 1),
         n_neg,
         n_uncertain,
         len(y),
-        n_c0,
-        n_c1,
-        n_c2,
-        n_c3,
-        n_c4,
-        n_c1_c2,
-        n_item_confirmed,
-        n_revenue_confirmed,
-        n_value_confirmed,
-        n_c1_only,
-        n_c2_only,
-        n_c3_only,
-        n_c4_only,
+        n_no_future,
+        n_recency_churn,
+        n_recency_audit,
+        n_freq_warning,
+        n_freq_high,
+        n_revenue_warning,
+        n_revenue_high,
+        n_joint_warning,
+        n_persistent_warning,
+        n_business_drop,
+        freq_drop_warning_min,
+        freq_drop_high_min,
+        revenue_drop_warning_min,
+        revenue_drop_high_min,
         min_base_item,
         min_base_revenue,
-        item_drop_ratio_min,
-        revenue_drop_ratio_min,
-        aov_drop_ratio_min,
-        item_drop_confirm_min,
-        revenue_drop_confirm_min,
-        low_current_item,
-        low_current_revenue,
-        low_current_aov,
-        negative_slope_cutoff,
+        single_warning_as_positive,
     )
     reason_audit = (
         pd.DataFrame({"label_rule_reason": label_rule_reason, "label": y})
@@ -1016,6 +1080,7 @@ def load_scoring_table_for_k(
     table_t = cands[0][2]
 
     df = load_feature_table(engine, table_t, limit=limit_rows)
+    df = add_business_churn_score_features(df)
     kk, start, end = parse_feature_table_name(table_t)
 
     # ensure window columns exist

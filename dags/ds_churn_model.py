@@ -8,7 +8,9 @@ with DAG(
     dag_id="ds_churn_model_retrain",
     description="Retrain evaluation: train a fresh candidate and promote only if it beats the accepted bundle",
     start_date=datetime(2026, 1, 1, tz="Asia/Ho_Chi_Minh"),
-    schedule="0 1 * * 1",
+    # First Monday at 01:00 for the fixed 3-month retrain cycle.
+    # Months 03/06/09/12 match the mandatory retrain anchor 2603.
+    schedule="0 1 * 3,6,9,12 MON#1",
     catchup=False,
     max_active_runs=1,
     default_args={"retries": 0},
@@ -18,7 +20,7 @@ with DAG(
         task_id="run_retrain_if_due",
         bash_command=(
             "python /churn_source/modeling/ops_lock.py --skip-if-busy -- "
-            "bash -lc 'cd /churn_source && python modeling/main.py retrain-if-due --horizon 2 --force-evaluate --tune-hyperparams'"
+            "bash -lc 'cd /churn_source && python modeling/main.py retrain-if-due --horizon 2 --interval-months 3 --force-evaluate --tune-hyperparams'"
         ),
         env={
             "TZ": "Asia/Ho_Chi_Minh",

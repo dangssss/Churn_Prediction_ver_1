@@ -360,6 +360,79 @@ def _train_main_inline(
         if tune_hyperparams is None
         else bool(tune_hyperparams)
     )
+
+    def usable_xgb_variant(variant: dict) -> bool:
+        return (
+            "F1_val" in variant
+            and float(variant.get("F1_val") or 0.0) > 0.0
+            and "f1@main_thr" in (variant.get("report") or {})
+        )
+
+    def variant_score_key(variant: dict) -> tuple[float, float, float]:
+        return (
+            float(variant.get("F1_val") or 0.0),
+            float(variant.get("AP_val") or 0.0),
+            float(variant.get("ROC_AUC_val") or 0.0),
+        )
+
+    def variant_passed_final_holdout(variant: dict) -> bool:
+        final_holdout = ((variant.get("report") or {}).get("final_holdout") or {})
+        return final_holdout.get("passed") is True
+
+    def require_final_holdout_quality() -> bool:
+        raw = os.getenv("MAIN_XGB_REQUIRE_FINAL_HOLDOUT_QUALITY")
+        if raw is None or str(raw).strip() == "":
+            return True
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def rejected_xgb_output(source_variants: list[dict], reason: str) -> dict:
+        rejected = [v for v in source_variants if "F1_val" in v]
+        if not rejected:
+            raise RuntimeError("No trainable XGBoost variants produced validation metrics.")
+
+        best_rejected = sorted(rejected, key=variant_score_key, reverse=True)[0]
+        rejected_cfg = dict(best_rejected.get("candidate_cfg") or cfg)
+        rejected_report = dict(best_rejected.get("report") or {})
+        rejected_cfg["use_static"] = bool(best_rejected.get("use_static", rejected_cfg.get("use_static", False)))
+        rejected_cfg["best_k"] = int(rejected_report.get("K", rejected_cfg.get("best_k")))
+        rejected_as_of = _supervised_as_of_from_report(rejected_report)
+        if rejected_as_of is None:
+            rejected_as_of = int(max_window_end_for_k(engine, int(rejected_cfg["best_k"])))
+        rejected_cfg["as_of_month"] = int(rejected_as_of)
+        rejected_cfg["target_month"] = int(shift_yymm(str(rejected_cfg["as_of_month"]), int(horizon)))
+        rejected_cfg["metric_f1_val"] = 0.0
+        rejected_cfg["metric_pr_auc_val"] = 0.0
+        rejected_cfg["metric_roc_auc_val"] = 0.0
+        rejected_cfg["metric_val_prevalence"] = float(rejected_report.get("val_prevalence", 0.0) or 0.0)
+        rejected_cfg["best_threshold"] = float(rejected_cfg.get("best_threshold", 0.5))
+        rejected_reason = (
+            rejected_report.get("guardrail_warning")
+            or best_rejected.get("guardrail_warning")
+            or reason
+            or "unknown"
+        )
+        rejected_report.setdefault("guardrail_warning", rejected_reason)
+        rejected_cfg["notes"] = (
+            f"{rejected_cfg.get('notes') or ''}; "
+            f"XGBoost candidate rejected: {reason}"
+        ).strip("; ")
+        logger.warning(
+            "[XGB SELECTED] No usable XGBoost variant; returning rejected candidate K=%d use_static=%s reason=%s",
+            int(rejected_cfg["best_k"]),
+            bool(rejected_cfg["use_static"]),
+            rejected_reason,
+        )
+        return {
+            "cfg": rejected_cfg,
+            "main_report": rejected_report,
+            "model": None,
+            "metadata": {
+                "cfg": rejected_cfg,
+                "bundle_lifecycle": _bundle_lifecycle(rejected_cfg),
+                "main_report": rejected_report,
+            },
+        }
+
     for cand in candidates:
         cand = dict(cand)
         for use_static_flag in [False, True]:
@@ -376,51 +449,9 @@ def _train_main_inline(
             variant["candidate_cfg"] = dict(variant.get("cfg") or cand)
             variants.append(variant)
 
-    ok = [
-        v for v in variants
-        if "F1_val" in v
-        and float(v.get("F1_val") or 0.0) > 0.0
-        and "f1@main_thr" in (v.get("report") or {})
-    ]
+    ok = [v for v in variants if usable_xgb_variant(v)]
     if not ok:
-        rejected = [v for v in variants if "F1_val" in v]
-        if rejected:
-            best_rejected = rejected[0]
-            rejected_cfg = dict(best_rejected.get("candidate_cfg") or cfg)
-            rejected_report = dict(best_rejected.get("report") or {})
-            rejected_cfg["use_static"] = bool(best_rejected.get("use_static", rejected_cfg.get("use_static", False)))
-            rejected_cfg["best_k"] = int(rejected_report.get("K", rejected_cfg.get("best_k")))
-            rejected_as_of = _supervised_as_of_from_report(rejected_report)
-            if rejected_as_of is None:
-                rejected_as_of = int(max_window_end_for_k(engine, int(rejected_cfg["best_k"])))
-            rejected_cfg["as_of_month"] = int(rejected_as_of)
-            rejected_cfg["target_month"] = int(shift_yymm(str(rejected_cfg["as_of_month"]), int(horizon)))
-            rejected_cfg["metric_f1_val"] = 0.0
-            rejected_cfg["metric_pr_auc_val"] = 0.0
-            rejected_cfg["metric_roc_auc_val"] = 0.0
-            rejected_cfg["metric_val_prevalence"] = float(rejected_report.get("val_prevalence", 0.0) or 0.0)
-            rejected_cfg["best_threshold"] = float(rejected_cfg.get("best_threshold", 0.5))
-            rejected_cfg["notes"] = (
-                f"{rejected_cfg.get('notes') or ''}; "
-                "XGBoost candidate rejected by walk-forward guard"
-            ).strip("; ")
-            logger.warning(
-                "[XGB SELECTED] No usable XGBoost variant; returning rejected candidate K=%d use_static=%s reason=%s",
-                int(rejected_cfg["best_k"]),
-                bool(rejected_cfg["use_static"]),
-                rejected_report.get("guardrail_warning") or best_rejected.get("guardrail_warning") or "unknown",
-            )
-            return {
-                "cfg": rejected_cfg,
-                "main_report": rejected_report,
-                "model": None,
-                "metadata": {
-                    "cfg": rejected_cfg,
-                    "bundle_lifecycle": _bundle_lifecycle(rejected_cfg),
-                    "main_report": rejected_report,
-                },
-            }
-        raise RuntimeError("No trainable XGBoost variants produced validation metrics.")
+        return rejected_xgb_output(variants, "walk_forward_guard")
     for variant in ok:
         if variant.get("guardrail_warning"):
             logger.warning(
@@ -463,12 +494,7 @@ def _train_main_inline(
             tuned["is_optuna_tuned"] = True
             tuned_variants.append(tuned)
 
-        tuned_ok = [
-            v for v in tuned_variants
-            if "F1_val" in v
-            and float(v.get("F1_val") or 0.0) > 0.0
-            and "f1@main_thr" in (v.get("report") or {})
-        ]
+        tuned_ok = [v for v in tuned_variants if usable_xgb_variant(v)]
         ok.extend(tuned_ok)
         if tuned_ok:
             logger.info(
@@ -476,6 +502,17 @@ def _train_main_inline(
                 len(tuned_ok),
                 max(float(v["F1_val"]) for v in tuned_ok),
             )
+    if require_final_holdout_quality():
+        holdout_ok = [v for v in ok if variant_passed_final_holdout(v)]
+        rejected_count = len(ok) - len(holdout_ok)
+        if rejected_count:
+            logger.warning(
+                "[XGB SELECTION GUARD] Removed %d candidate(s) without passing final holdout before final selection.",
+                rejected_count,
+            )
+        if not holdout_ok:
+            return rejected_xgb_output(ok, "no_xgb_variant_passed_final_holdout")
+        ok = holdout_ok
     ok.sort(key=lambda r: (r["F1_val"], r["AP_val"], r["ROC_AUC_val"]), reverse=True)
     best = ok[0]
     if len(ok) == 2:

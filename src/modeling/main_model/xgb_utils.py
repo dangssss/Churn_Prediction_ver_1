@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import re
 import inspect
+import logging
 from typing import Tuple, Dict, List
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 _DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
@@ -69,6 +72,21 @@ def onehot_align_train_val(X_tr: pd.DataFrame, X_va: pd.DataFrame, cat_cols: lis
     X_va_oh = X_va_oh.rename(columns=map_tr)
     return X_tr_oh, X_va_oh, map_tr
 
+
+def _clear_training_callbacks(model) -> None:
+    """Callbacks are train-time only; remove them before model serialization."""
+    try:
+        model_params = model.get_params(deep=False)
+    except Exception:
+        return
+    if "callbacks" not in model_params or model_params.get("callbacks") is None:
+        return
+    try:
+        model.set_params(callbacks=None)
+    except Exception:
+        logger.debug("Could not clear XGBoost callbacks after fit.", exc_info=True)
+
+
 def fit_xgb_with_early_stopping(
     model,
     X_tr,
@@ -77,10 +95,12 @@ def fit_xgb_with_early_stopping(
     y_va,
     es_rounds: int,
     sample_weight=None,
+    callbacks=None,
 ):
     """Compatible old/new xgboost early stopping usage."""
     fit_sig = inspect.signature(model.fit)
     kwargs = {}
+    callbacks_used = False
 
     if "eval_set" in fit_sig.parameters:
         kwargs["eval_set"] = [(X_va, y_va)]
@@ -88,15 +108,35 @@ def fit_xgb_with_early_stopping(
         kwargs["verbose"] = False
     if sample_weight is not None and "sample_weight" in fit_sig.parameters:
         kwargs["sample_weight"] = sample_weight
+    if callbacks:
+        if "callbacks" in fit_sig.parameters:
+            kwargs["callbacks"] = list(callbacks)
+            callbacks_used = True
+        else:
+            try:
+                model_params = model.get_params(deep=False)
+            except Exception:
+                model_params = {}
+            if "callbacks" in model_params:
+                model.set_params(callbacks=list(callbacks))
+                callbacks_used = True
+            else:
+                logger.warning("XGBoost wrapper does not expose callbacks; learning-rate schedule is disabled.")
+
+    setattr(model, "_churn_lr_callbacks_requested", bool(callbacks))
+    setattr(model, "_churn_lr_callbacks_applied", bool(callbacks_used))
+
     # Old versions: early_stopping_rounds is a fit kwarg
     if "early_stopping_rounds" in fit_sig.parameters:
         kwargs["early_stopping_rounds"] = int(es_rounds)
         model.fit(X_tr, y_tr, **kwargs)
+        _clear_training_callbacks(model)
         return model
 
     # Newer versions (e.g. xgboost 3.x): set early_stopping_rounds on estimator
     model.set_params(early_stopping_rounds=int(es_rounds))
     model.fit(X_tr, y_tr, **kwargs)
+    _clear_training_callbacks(model)
     return model
 
 def predict_proba_best_iteration(model, X):
